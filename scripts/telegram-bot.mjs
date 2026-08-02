@@ -4,18 +4,28 @@
  *
  *   npm run bot
  *
+ * The owner (TELEGRAM_OWNER_USERNAME) gets full admin access: file ops, shell,
+ * git, build, snapshots, rollback, and LLM-autonomy approval. Allowed users
+ * (TELEGRAM_ALLOWED_USERNAMES / /adduser) can only chat with the assistant.
+ *
  * Config (env):
- *   TELEGRAM_BOT_TOKEN   — from @BotFather
- *   TELEGRAM_ALLOWED_IDS — comma-separated Telegram user IDs allowed to talk
- *                          to the bot (empty = anyone with the token).
- *   ULTRON_SERVER        — base URL of the web app (default http://localhost:3000)
+ *   TELEGRAM_BOT_TOKEN       — from @BotFather
+ *   TELEGRAM_OWNER_USERNAME  — Telegram username of the owner (admin)
+ *   TELEGRAM_ALLOWED_USERNAMES — comma-separated additional allowed users
+ *   ULTRON_SERVER            — base URL of the web app (default :3000)
+ *   GITHUB_TOKEN             — used to authenticate `git` operations
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, appendFileSync, openSync, readdirSync, statSync, existsSync } from "node:fs";
+import { spawn, execFile } from "node:child_process";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, "..");
+const DATA_DIR = path.join(ROOT, "data");
+const TMP_LOG = path.join(os.tmpdir(), "opencode");
 
 function loadDotEnv(file) {
   try {
@@ -32,11 +42,13 @@ loadDotEnv(path.join(__dirname, "..", ".env"));
 loadDotEnv(path.join(__dirname, "..", ".env.local"));
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ALLOWED_IDS = (process.env.TELEGRAM_ALLOWED_IDS ?? "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
 const SERVER = process.env.ULTRON_SERVER ?? "http://localhost:3000";
+const OWNER_USERNAME = (process.env.TELEGRAM_OWNER_USERNAME ?? "").trim().toLowerCase();
+const ALLOWED_USERNAMES = (process.env.TELEGRAM_ALLOWED_USERNAMES ?? "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN ?? "";
 
 if (!TOKEN) {
   console.error("[bot] TELEGRAM_BOT_TOKEN не задан. Добавьте его в .env");
@@ -44,19 +56,101 @@ if (!TOKEN) {
 }
 
 const API = `https://api.telegram.org/bot${TOKEN}`;
-const POLL_TIMEOUT = 25; // seconds
+const POLL_TIMEOUT = 25;
 
-// Per-chat conversation memory (in-process). The server /api/assistant core
-// is stateless, so the bot owns the dialog history and forwards it as context
-// on every message. Capped to the last 16 turns.
-const histories = new Map();
+const REGISTRY_FILE = path.join(DATA_DIR, "telegram-users.json");
+const AUDIT_FILE = path.join(DATA_DIR, "admin-log.jsonl");
+const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
+const SNAPSHOT_FILE = path.join(DATA_DIR, "snapshots.json");
+const STOP_FILE = path.join(DATA_DIR, "stop-ai");
+
+function loadJson(file, fallback) {
+  try {
+    return { ...fallback, ...JSON.parse(readFileSync(file, "utf8")) };
+  } catch {
+    return fallback;
+  }
+}
+
+let registry = loadJson(REGISTRY_FILE, {
+  owner: { username: OWNER_USERNAME || null, id: null },
+  allowed: [],
+});
+let settings = loadJson(SETTINGS_FILE, { autonomy: true, maxChangesPerSession: 3, approvalTtlMs: 600_000, protectedFiles: [] });
+
+function saveRegistry() {
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(REGISTRY_FILE, JSON.stringify(registry, null, 2));
+}
+function saveSettings() {
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+}
+function audit(entry) {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    appendFileSync(AUDIT_FILE, `${JSON.stringify({ ts: Date.now(), ...entry })}\n`);
+  } catch {
+    // audit must never crash the bot
+  }
+}
+function isStopped() {
+  return existsSync(STOP_FILE);
+}
+
+// ---------------------------------------------------------------------------
+// Auth: owner / allowed
+// ---------------------------------------------------------------------------
+
+function isOwner(from) {
+  const name = (from?.username ?? "").toLowerCase();
+  const id = from?.id;
+  if (registry.owner.username && name === registry.owner.username) return true;
+  if (registry.owner.id !== null && registry.owner.id === id) return true;
+  if (OWNER_USERNAME && name === OWNER_USERNAME) return true;
+  return false;
+}
+
+function isAllowed(from) {
+  if (isOwner(from)) return true;
+  const name = (from?.username ?? "").toLowerCase();
+  const id = from?.id;
+  return registry.allowed.some((u) => (u.username && u.username === name) || (u.id !== null && u.id === id));
+}
+
+/** Fix numeric ids on first contact; auto-admit env-listed usernames. */
+function registerUser(from) {
+  const name = (from?.username ?? "").toLowerCase();
+  const id = from?.id;
+  if (!name && id === undefined) return;
+  let changed = false;
+  if (registry.owner.username && name === registry.owner.username && registry.owner.id !== id) {
+    registry.owner.id = id;
+    changed = true;
+  }
+  for (const u of registry.allowed) {
+    if (u.username && name === u.username && u.id !== id) {
+      u.id = id;
+      changed = true;
+    }
+  }
+  if (ALLOWED_USERNAMES.includes(name) && !registry.allowed.some((u) => u.username === name)) {
+    registry.allowed.push({ username: name, id: id ?? null, addedAt: Date.now() });
+    changed = true;
+  }
+  if (changed) saveRegistry();
+}
+
+// ---------------------------------------------------------------------------
+// Telegram API helpers
+// ---------------------------------------------------------------------------
 
 async function apiCall(method, payload) {
   const res = await fetch(`${API}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(POLL_TIMEOUT * 1000 + 10_000),
+    signal: AbortSignal.timeout(POLL_TIMEOUT * 1000 + 15_000),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -66,8 +160,7 @@ async function apiCall(method, payload) {
 }
 
 async function sendText(chatId, text) {
-  const chunks = splitText(text, 4096);
-  for (const chunk of chunks) {
+  for (const chunk of splitText(String(text ?? ""), 4096)) {
     await apiCall("sendMessage", { chat_id: chatId, text: chunk });
   }
 }
@@ -81,7 +174,6 @@ async function sendPhoto(chatId, b64, mime) {
   await fetch(`${API}/sendPhoto`, { method: "POST", body: fd });
 }
 
-/** Telegram caps messages at 4096 chars — split on line boundaries. */
 function splitText(text, max) {
   if (text.length <= max) return [text];
   const out = [];
@@ -97,103 +189,980 @@ function splitText(text, max) {
   return out;
 }
 
-function allowed(chatId) {
-  return ALLOWED_IDS.length === 0 || ALLOWED_IDS.includes(String(chatId));
+async function removeButtons(chatId, messageId) {
+  await apiCall("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Local exec / files
+// ---------------------------------------------------------------------------
+
+function runCmd(cmd, opts = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, { cwd: opts.cwd ?? ROOT, shell: true, windowsHide: true });
+    let out = "";
+    const push = (d) => {
+      out += String(d);
+      if (out.length > 80_000) out = out.slice(-80_000);
+    };
+    child.stdout.on("data", push);
+    child.stderr.on("data", push);
+    const t = setTimeout(() => {
+      child.kill();
+      resolve({ ok: false, out: `${out}\n[timeout]` });
+    }, opts.timeout ?? 240_000);
+    child.on("error", (e) => {
+      clearTimeout(t);
+      resolve({ ok: false, out: `${out}\n[error] ${e.message}` });
+    });
+    child.on("close", (code) => {
+      clearTimeout(t);
+      resolve({ ok: code === 0, out });
+    });
+  });
+}
+
+function resolvePath(rel) {
+  const target = path.resolve(ROOT, rel);
+  const relCheck = path.relative(ROOT, target);
+  if (relCheck.startsWith("..") || path.isAbsolute(relCheck)) return null;
+  if (target.toLowerCase() === ROOT.toLowerCase()) return null;
+  return target;
+}
+
+function gitArgs(args) {
+  if (!GITHUB_TOKEN) return args;
+  const auth = Buffer.from(`x-access-token:${GITHUB_TOKEN}`).toString("base64");
+  return ["-c", `http.extraheader=Authorization: Basic ${auth}`, ...args];
+}
+
+function git(args) {
+  return new Promise((resolve) => {
+    execFile("git", gitArgs(args), { cwd: ROOT, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, out: `${stdout ?? ""}${stderr ?? ""}` });
+    });
+  });
+}
+
+async function waitForServer(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://localhost:${port}`, { signal: AbortSignal.timeout(2000) });
+      if (res.ok || res.status < 500) return true;
+    } catch {
+      // not up yet
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return false;
+}
+
+async function killPort(port) {
+  await runCmd(
+    `powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | Sort-Object -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }"`,
+    { timeout: 30_000 },
+  );
+}
+
+function readTail(file, n) {
+  try {
+    const lines = readFileSync(file, "utf8").split(/\r?\n/);
+    return lines.slice(-n).join("\n");
+  } catch {
+    return "(файл не найден)";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots / rollback (git-based, data/ excluded by .gitignore)
+// ---------------------------------------------------------------------------
+
+function loadSnapshots() {
+  try {
+    return JSON.parse(readFileSync(SNAPSHOT_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+function saveSnapshots(s) {
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(SNAPSHOT_FILE, JSON.stringify(s, null, 2));
+}
+
+async function makeSnapshot(name) {
+  const res = await runCmd(`git add -A && git stash create "autosnapshot ${name}"`, { timeout: 60_000 });
+  if (!res.ok) return { ok: false, out: res.out };
+  const hash = res.out.trim().split(/\r?\n/).pop().trim();
+  await runCmd("git reset -q");
+  if (!hash || !/^[0-9a-f]{40}$/.test(hash)) return { ok: false, out: "Нет незакоммиченных изменений для снимка." };
+  const snaps = loadSnapshots();
+  const key = name || String(Date.now());
+  snaps[key] = { hash, at: Date.now() };
+  saveSnapshots(snaps);
+  audit({ action: "snapshot", name: key, hash });
+  return { ok: true, out: `Снимок «${key}»: ${hash.slice(0, 10)}` };
+}
+
+async function rollbackSnapshot(name) {
+  const snaps = loadSnapshots();
+  const keys = Object.keys(snaps);
+  const key = name || keys[keys.length - 1];
+  const entry = key ? snaps[key] : null;
+  if (!entry) return { ok: false, out: `Снимок «${name ?? "последний"}» не найден.` };
+  const res = await runCmd(`git reset -q && git checkout ${entry.hash} -- . && git reset -q`, { timeout: 120_000 });
+  audit({ action: "rollback", name: key, hash: entry.hash, ok: res.ok });
+  return { ok: res.ok, out: res.ok ? `Откат к «${key}» (${entry.hash.slice(0, 10)}) выполнен.` : res.out };
+}
+
+// ---------------------------------------------------------------------------
+// Approvals (LLM-autonomy)
+// ---------------------------------------------------------------------------
+
+/** Local shadow of server-side pending approvals: id → {id, chatId, createdAt}. */
+const pendings = new Map();
+
+function pendingFor(chatId) {
+  for (const p of pendings.values()) if (p.chatId === chatId) return p;
+  return null;
+}
+
+async function serverControl(payload) {
+  const res = await fetch(`${SERVER}/api/assistant`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(600_000),
+  });
+  return res.json().catch(() => null);
+}
+
+async function handleApprove(chatId, id) {
+  const data = await serverControl({ action: "approve", id });
+  await sendText(chatId, data?.reply ?? "Ошибка одобрения.");
+}
+
+async function handleReject(chatId, id) {
+  const data = await serverControl({ action: "reject", id });
+  await sendText(chatId, data?.reply ?? "Заявка отклонена.");
+}
+
+// ---------------------------------------------------------------------------
+// Assistant chat
+// ---------------------------------------------------------------------------
+
+const histories = new Map();
+
+async function chatWithAssistant(chatId, msg, text) {
+  const hist = histories.get(String(chatId)) ?? [];
+  hist.push({ role: "user", content: text });
+  let res;
+  try {
+    res = await fetch(`${SERVER}/api/assistant`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, history: hist.slice(0, -1).slice(-12), chatId: String(chatId) }),
+      signal: AbortSignal.timeout(180_000),
+    });
+  } catch (err) {
+    await sendText(chatId, `Сбой обработки: ${err.message}. Сервер запущен?`).catch(() => {});
+    return;
+  }
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data) {
+    await sendText(chatId, `Ошибка сервера: ${data?.error ?? res.status}.`);
+    return;
+  }
+
+  if (data.needsApproval && isOwner(msg?.from)) {
+    const id = data.needsApproval.id;
+    const desc = data.needsApproval.description;
+    pendings.set(id, { id, chatId: String(chatId), createdAt: Date.now() });
+    const kb = {
+      inline_keyboard: [
+        [
+          { text: "✅ Да", callback_data: `approve:${id}` },
+          { text: "❌ Нет", callback_data: `reject:${id}` },
+        ],
+      ],
+    };
+    await apiCall("sendMessage", {
+      chat_id: chatId,
+      text: `🔐 Одобрение: ${desc}\n\n⏱ ${Math.round((settings.approvalTtlMs ?? 600_000) / 60_000)} минут на решение.`,
+      reply_markup: kb,
+    });
+    audit({ action: "approval-prompt", id, description: desc });
+    return;
+  }
+
+  const parts = [];
+  if (data.reply) parts.push(data.reply);
+  if (data.generate) parts.push(data.generate);
+  if (data.image) await sendPhoto(chatId, data.image.b64, data.image.mime);
+  if (parts.length === 0) parts.push("Выполнено.");
+  const joined = parts.join("\n\n");
+  await sendText(chatId, joined);
+  hist.push({ role: "assistant", content: joined });
+  if (hist.length > 16) hist.splice(0, hist.length - 16);
+  histories.set(String(chatId), hist);
+}
+
+// ---------------------------------------------------------------------------
+// Command parsing / help
+// ---------------------------------------------------------------------------
+
+function parseCommand(text) {
+  const m = text.trim().match(/^(\/[a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/);
+  if (!m) return null;
+  return { name: m[1].toLowerCase(), rest: (m[2] ?? "").trim() };
 }
 
 const HELP_TEXT = [
-  "Команды бота:",
-  "• /start — приветствие",
-  "• /help — эта справка",
-  "• /id — ваш числовой id",
+  "УЛЬТРОН — команды бота:",
   "",
-  "А ещё вы можете просто общаться:",
-  "• «найди <запрос>» — поищу в интернете и отвечу со ссылками",
-  "• «изучи <тема>» — найду информацию и запомню",
-  "• «навыки» — мои способности и проценты",
-  "• «навык <имя>» — что умею и чего не хватает",
-  "• «чего тебе не хватает» — какие знания дать",
-  "• «изучи <ссылка>» — прочитаю и запомню",
-  "• «чему ты научился» — что я знаю",
-  "• «напиши статью про …» — сгенерирую текст",
-  "• «нарисуй …» — сгенерирую изображение",
+  "Общение:",
+  "• просто пишите — я отвечаю",
+  "• «найди <запрос>» / «изучи <тема>» — поиск в интернете",
+  "• «навыки» / «навык <имя>» / «чего тебе не хватает»",
+  "• «изучи <ссылка>» — прочитать и запомнить",
+  "• «напиши статью про …» — текст",
+  "• «нарисуй …» — изображение",
+  "",
+  "Команды:",
+  "• /start — приветствие",
+  "• /help — справка",
+  "• /id — ваш числовой id",
 ].join("\n");
 
-async function handleMessage(chatId, text, firstName) {
-  console.log(`[bot] ← ${chatId}: ${text.slice(0, 120)}`);
-  const cmd = text.trim().toLowerCase();
-  const name = firstName || "Арыч";
+const ADMIN_HELP = [
+  "УЛЬТРОН — админ-команды владельца:",
+  "",
+  "Доступ:",
+  "• /users — список допущенных",
+  "• /adduser <username|id> — допустить",
+  "• /rmuser <username|id> — убрать",
+  "",
+  "Файлы (относительно корня проекта):",
+  "• /ls [папка] — список",
+  "• /tree [папка] — дерево",
+  "• /cat <файл> — показать",
+  "• /find <имя> — поиск файлов",
+  "• /write <файл> [--no-build] + перевод строки + содержимое",
+  "• /replace <файл> <старое> <новое> [--no-build]",
+  "• /append <файл> + перевод строки + текст",
+  "• /rm <файл|папка> • /mkdir <папка>",
+  "• /mv <откуда> <куда> • /cp <откуда> <куда>",
+  "",
+  "Система:",
+  "• /run <команда> — выполнить в корне проекта",
+  "• /node <файл.js> — запустить node",
+  "• /build — npm run build",
+  "• /restart — перезапустить бота",
+  "• /restart-server — перезапустить веб-сервер",
+  "• /log [n] — хвост логов (next/bot)",
+  "• /sysinfo — CPU/RAM/диск/GPU",
+  "",
+  "Git и снимки:",
+  "• /git <аргументы> — git (авторизация через GITHUB_TOKEN)",
+  "• /snapshot [имя] — снимок состояния",
+  "• /snapshots — список снимков",
+  "• /rollback [имя] — откат к снимку",
+  "",
+  "Автономия ИИ:",
+  "• /autonomy on|off|status",
+  "• /veto <id> — отклонить заявку",
+  "• /stop-ai — аварийный стоп автономии",
+].join("\n");
 
-  if (cmd === "/start") {
-    await sendText(
-      chatId,
-      `Привет, ${name}! Я УЛЬТРОН — твой голосовой помощник. Я помню, что меня учили, и могу генерировать тексты и картинки.\n\n${HELP_TEXT}`,
-    );
-    return;
-  }
-  if (cmd === "/help") {
-    await sendText(chatId, HELP_TEXT);
-    return;
-  }
-  if (cmd === "/id") {
-    await sendText(chatId, `Ваш id: ${chatId}`);
-    return;
-  }
+// ---------------------------------------------------------------------------
+// Owner admin commands
+// ---------------------------------------------------------------------------
 
+function requireOwner(chatId, owner) {
+  if (owner) return true;
+  sendText(chatId, "Команда доступна только владельцу.");
+  return false;
+}
+
+function splitPathContent(rest) {
+  const nl = rest.indexOf("\n");
+  if (nl === -1) return [rest, ""];
+  return [rest.slice(0, nl).trim(), rest.slice(nl + 1)];
+}
+
+async function applyFileWrite(chatId, fileArg, content, action) {
+  let noBuild = false;
+  let rel = fileArg;
+  if (rel.startsWith("--no-build")) {
+    noBuild = true;
+    rel = rel.replace(/^--no-build\s*/, "").trim();
+  }
+  const abs = resolvePath(rel);
+  if (!abs) {
+    await sendText(chatId, "Путь вне проекта.");
+    return;
+  }
+  const backup = path.join(DATA_DIR, "backups", `${Date.now()}-${path.basename(abs)}.bak`);
+  mkdirSync(path.dirname(backup), { recursive: true });
+  const hadOriginal = existsSync(abs);
+  if (hadOriginal) writeFileSync(backup, readFileSync(abs));
   try {
-    const hist = histories.get(chatId) ?? [];
-    hist.push({ role: "user", content: text });
-    const res = await fetch(`${SERVER}/api/assistant`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, history: hist.slice(0, -1).slice(-12) }),
-      signal: AbortSignal.timeout(120_000),
-    });
-    const data = await res.json().catch(() => null);
-    if (!res.ok || !data) {
-      await sendText(chatId, `Ошибка сервера: ${data?.error ?? res.status}.`);
+    if (action === "write") writeFileSync(abs, content, "utf8");
+    else appendFileSync(abs, content, "utf8");
+  } catch (err) {
+    await sendText(chatId, `Ошибка записи: ${err.message}`);
+    return;
+  }
+  audit({ action, file: rel, by: "owner" });
+
+  if (!noBuild) {
+    const check = await runCmd(`node --check ${JSON.stringify(abs)}`, { timeout: 30_000 });
+    if (!check.ok) {
+      if (hadOriginal) writeFileSync(abs, readFileSync(backup));
+      await sendText(chatId, `Синтаксис не прошёл проверку — откат:\n${check.out.slice(0, 800)}`);
       return;
     }
-
-    const parts = [];
-    if (data.reply) parts.push(data.reply);
-    if (data.generate) parts.push(data.generate);
-    if (data.image) {
-      await sendPhoto(chatId, data.image.b64, data.image.mime);
+    const build = await runCmd("npm run build", { timeout: 360_000 });
+    if (!build.ok) {
+      if (hadOriginal) writeFileSync(abs, readFileSync(backup));
+      await sendText(chatId, `Сборка не прошла — откат:\n${build.out.slice(-1200)}`);
+      return;
     }
-    if (parts.length === 0) parts.push("Выполнено.");
-    await sendText(chatId, parts.join("\n\n"));
-
-    hist.push({ role: "assistant", content: parts.join("\n\n") });
-    if (hist.length > 16) hist.splice(0, hist.length - 16);
-    histories.set(chatId, hist);
-  } catch (err) {
-    console.error("[bot] обработка сообщения не удалась:", err);
-    await sendText(chatId, `Сбой обработки: ${err.message}. Сервер запущен?`).catch(() => {});
+    await sendText(chatId, `✅ ${action === "write" ? "Записан" : "Дополнен"} «${rel}» (проверено сборкой).`);
+  } else {
+    await sendText(chatId, `Записан «${rel}» (без сборки).`);
   }
 }
 
+function walk(root, maxDepth) {
+  const out = [];
+  function rec(dir, depth) {
+    if (depth > maxDepth || out.length > 200) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name === "node_modules" || e.name === ".next" || e.name === ".git" || e.name === "data") continue;
+      if (e.isDirectory()) rec(path.join(dir, e.name), depth + 1);
+      else out.push(path.relative(ROOT, path.join(dir, e.name)));
+    }
+  }
+  rec(root, 0);
+  return out;
+}
+
+async function handleCommand(chatId, msg, cmd) {
+  const { name, rest } = cmd;
+  const owner = isOwner(msg?.from);
+  const fromName = msg?.from?.username ?? String(msg?.from?.id ?? "?");
+
+  switch (name) {
+    case "/start": {
+      const who = owner ? "Владелец" : isAllowed(msg.from) ? "Гость" : "";
+      await sendText(chatId, `Привет! Я УЛЬТРОН.${who ? ` (${who})` : ""}\n\n${HELP_TEXT}`);
+      return;
+    }
+    case "/help": {
+      await sendText(chatId, owner ? `${HELP_TEXT}\n\n${ADMIN_HELP}` : HELP_TEXT);
+      return;
+    }
+    case "/id": {
+      await sendText(chatId, `Ваш id: ${chatId}`);
+      return;
+    }
+
+    // ---- access ----
+    case "/users": {
+      if (!requireOwner(chatId, owner)) return;
+      const lines = [`Владелец: ${registry.owner.username ?? "?"} (id: ${registry.owner.id ?? "не зарегистрирован"})`];
+      if (registry.allowed.length === 0) lines.push("Допущенных нет.");
+      for (const u of registry.allowed) lines.push(`• ${u.username ?? u.id} (id: ${u.id ?? "?"})`);
+      await sendText(chatId, lines.join("\n"));
+      return;
+    }
+    case "/adduser": {
+      if (!requireOwner(chatId, owner)) return;
+      const key = rest.trim().replace(/^@/, "").toLowerCase();
+      if (!key) {
+        await sendText(chatId, "Укажите username или id: /adduser <username|id>");
+        return;
+      }
+      if (/^\d+$/.test(key)) {
+        if (!registry.allowed.some((u) => u.id === Number(key))) {
+          registry.allowed.push({ username: null, id: Number(key), addedAt: Date.now() });
+          saveRegistry();
+          audit({ action: "adduser", by: fromName, key });
+          await sendText(chatId, `Допущен id ${key}.`);
+        } else {
+          await sendText(chatId, "Уже допущен.");
+        }
+      } else {
+        if (!registry.allowed.some((u) => u.username === key)) {
+          registry.allowed.push({ username: key, id: null, addedAt: Date.now() });
+          saveRegistry();
+          audit({ action: "adduser", by: fromName, key });
+          await sendText(chatId, `Допущен @${key} (id зафиксируется при первом сообщении).`);
+        } else {
+          await sendText(chatId, "Уже допущен.");
+        }
+      }
+      return;
+    }
+    case "/rmuser": {
+      if (!requireOwner(chatId, owner)) return;
+      const key = rest.trim().replace(/^@/, "").toLowerCase();
+      const before = registry.allowed.length;
+      registry.allowed = registry.allowed.filter((u) => u.username !== key && u.id !== Number(key));
+      if (registry.allowed.length !== before) {
+        saveRegistry();
+        audit({ action: "rmuser", by: fromName, key });
+        await sendText(chatId, `Убран ${key}.`);
+      } else {
+        await sendText(chatId, "Не найден.");
+      }
+      return;
+    }
+
+    // ---- files ----
+    case "/ls": {
+      if (!requireOwner(chatId, owner)) return;
+      const dir = rest || ".";
+      const abs = resolvePath(dir);
+      if (!abs) {
+        await sendText(chatId, "Путь вне проекта.");
+        return;
+      }
+      try {
+        const entries = readdirSync(abs, { withFileTypes: true });
+        if (entries.length === 0) {
+          await sendText(chatId, "(пусто)");
+          return;
+        }
+        const lines = await Promise.all(
+          entries.map(async (e) => {
+            const full = path.join(abs, e.name);
+            if (e.isDirectory()) return `[DIR]  ${e.name}`;
+            try {
+              const st = statSync(full);
+              return `${st.size >= 1024 ? `${(st.size / 1024).toFixed(1)}K` : `${st.size}B`}`.padStart(8) + `  ${e.name}`;
+            } catch {
+              return `      ?  ${e.name}`;
+            }
+          }),
+        );
+        await sendText(chatId, `${dir}:\n${lines.join("\n")}`);
+      } catch (err) {
+        await sendText(chatId, `Ошибка: ${err.message}`);
+      }
+      return;
+    }
+    case "/tree": {
+      if (!requireOwner(chatId, owner)) return;
+      const dir = rest || ".";
+      const abs = resolvePath(dir);
+      if (!abs) {
+        await sendText(chatId, "Путь вне проекта.");
+        return;
+      }
+      const out = [];
+      const walkTree = (dir2, indent, depth) => {
+        if (depth > 2 || out.length > 300) return;
+        let entries;
+        try {
+          entries = readdirSync(dir2, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const e of entries) {
+          if (e.name === "node_modules" || e.name === ".next" || e.name === ".git") continue;
+          if (e.isDirectory()) {
+            out.push(`${indent}[DIR] ${e.name}`);
+            walkTree(path.join(dir2, e.name), `${indent}  `, depth + 1);
+          } else {
+            out.push(`${indent}${e.name}`);
+          }
+        }
+      };
+      out.push(dir);
+      walkTree(abs, "  ", 0);
+      await sendText(chatId, out.join("\n"));
+      return;
+    }
+    case "/cat": {
+      if (!requireOwner(chatId, owner)) return;
+      const abs = resolvePath(rest);
+      if (!abs) {
+        await sendText(chatId, "Путь вне проекта.");
+        return;
+      }
+      try {
+        const content = readFileSync(abs, "utf8");
+        const capped = content.length > 20_000 ? `${content.slice(0, 20_000)}\n…[обрезано]` : content;
+        await sendText(chatId, `— ${rest} —\n${capped}`);
+      } catch (err) {
+        await sendText(chatId, `Не удалось прочитать: ${err.message}`);
+      }
+      return;
+    }
+    case "/find": {
+      if (!requireOwner(chatId, owner)) return;
+      const q = rest.toLowerCase();
+      if (!q) {
+        await sendText(chatId, "Укажите имя файла: /find <имя>");
+        return;
+      }
+      const matches = walk(ROOT, 5).filter((f) => path.basename(f).toLowerCase().includes(q));
+      await sendText(chatId, matches.length === 0 ? "Ничего не найдено." : `Найдено:\n${matches.slice(0, 50).join("\n")}`);
+      return;
+    }
+    case "/write": {
+      if (!requireOwner(chatId, owner)) return;
+      const [fileArg, content] = splitPathContent(rest);
+      if (!fileArg) {
+        await sendText(chatId, "Формат: /write <файл>\n<содержимое>");
+        return;
+      }
+      await applyFileWrite(chatId, fileArg, content, "write");
+      return;
+    }
+    case "/append": {
+      if (!requireOwner(chatId, owner)) return;
+      const [fileArg, content] = splitPathContent(rest);
+      if (!fileArg) {
+        await sendText(chatId, "Формат: /append <файл>\n<текст>");
+        return;
+      }
+      await applyFileWrite(chatId, fileArg, content, "append");
+      return;
+    }
+    case "/replace": {
+      if (!requireOwner(chatId, owner)) return;
+      const m = rest.match(/^(\S+)\s+([\s\S]+?)\s+([\s\S]+?)(?:\s+--no-build)?$/);
+      if (!m) {
+        await sendText(chatId, "Формат: /replace <файл> <старое> <новое> [--no-build]");
+        return;
+      }
+      let [, rel, oldText, newText] = m;
+      const noBuild = /--no-build\s*$/.test(rest);
+      const abs = resolvePath(rel);
+      if (!abs) {
+        await sendText(chatId, "Путь вне проекта.");
+        return;
+      }
+      try {
+        const content = readFileSync(abs, "utf8");
+        if (!content.includes(oldText)) {
+          await sendText(chatId, "Фрагмент не найден.");
+          return;
+        }
+        const backup = path.join(DATA_DIR, "backups", `${Date.now()}-${path.basename(abs)}.bak`);
+        mkdirSync(path.dirname(backup), { recursive: true });
+        writeFileSync(backup, content);
+        writeFileSync(abs, content.split(oldText).join(newText), "utf8");
+        audit({ action: "replace", file: rel, by: fromName });
+        if (!noBuild) {
+          const build = await runCmd("npm run build", { timeout: 360_000 });
+          if (!build.ok) {
+            writeFileSync(abs, readFileSync(backup));
+            await sendText(chatId, `Сборка не прошла — откат:\n${build.out.slice(-1200)}`);
+            return;
+          }
+        }
+        await sendText(chatId, `✅ Заменено в «${rel}».`);
+      } catch (err) {
+        await sendText(chatId, `Ошибка: ${err.message}`);
+      }
+      return;
+    }
+    case "/rm": {
+      if (!requireOwner(chatId, owner)) return;
+      const abs = resolvePath(rest);
+      if (!abs) {
+        await sendText(chatId, "Путь вне проекта.");
+        return;
+      }
+      const base = path.basename(abs);
+      if (base === "node_modules" || base === ".git") {
+        await sendText(chatId, "Этот каталог удалять нельзя.");
+        return;
+      }
+      audit({ action: "rm", file: rest, by: fromName });
+      await runCmd(`rm -rf ${JSON.stringify(abs)}`, { timeout: 60_000 });
+      await sendText(chatId, `Удалено: ${rest}`);
+      return;
+    }
+    case "/mkdir": {
+      if (!requireOwner(chatId, owner)) return;
+      const abs = resolvePath(rest);
+      if (!abs) {
+        await sendText(chatId, "Путь вне проекта.");
+        return;
+      }
+      try {
+        mkdirSync(abs, { recursive: true });
+        await sendText(chatId, `Создано: ${rest}`);
+      } catch (err) {
+        await sendText(chatId, `Ошибка: ${err.message}`);
+      }
+      return;
+    }
+    case "/mv":
+    case "/cp": {
+      if (!requireOwner(chatId, owner)) return;
+      const [a, b] = rest.split(/\s+/).filter(Boolean);
+      const absA = a ? resolvePath(a) : null;
+      const absB = b ? resolvePath(b) : null;
+      if (!absA || !absB) {
+        await sendText(chatId, "Оба пути должны быть внутри проекта.");
+        return;
+      }
+      audit({ action: name.slice(1), from: a, to: b, by: fromName });
+      const cmd = name === "/mv" ? `mv` : `cp -r`;
+      await runCmd(`${cmd} ${JSON.stringify(absA)} ${JSON.stringify(absB)}`, { timeout: 60_000 });
+      await sendText(chatId, "Готово.");
+      return;
+    }
+
+    // ---- system ----
+    case "/run": {
+      if (!requireOwner(chatId, owner)) return;
+      if (!rest) {
+        await sendText(chatId, "Укажите команду: /run <команда>");
+        return;
+      }
+      audit({ action: "run", cmd: rest.slice(0, 200), by: fromName });
+      await sendText(chatId, `⏳ Выполняю: ${rest}`);
+      const r = await runCmd(rest, { timeout: 300_000 });
+      const head = r.ok ? "" : "⚠️ Команда завершилась с ошибкой.\n";
+      await sendText(chatId, `${head}${r.out.slice(0, 3500) || "(без вывода)"}`);
+      return;
+    }
+    case "/node": {
+      if (!requireOwner(chatId, owner)) return;
+      const abs = resolvePath(rest);
+      if (!abs) {
+        await sendText(chatId, "Путь вне проекта.");
+        return;
+      }
+      audit({ action: "node", file: rest, by: fromName });
+      await sendText(chatId, `⏳ Запускаю: ${rest}`);
+      const r = await runCmd(`node ${JSON.stringify(abs)}`, { timeout: 300_000 });
+      await sendText(chatId, `${r.out.slice(0, 3500) || "(без вывода)"}${r.ok ? "" : "\n⚠️ exit != 0"}`);
+      return;
+    }
+    case "/build": {
+      if (!requireOwner(chatId, owner)) return;
+      audit({ action: "build", by: fromName });
+      await sendText(chatId, "⏳ Собираю (next build)…");
+      const r = await runCmd("npm run build", { timeout: 360_000 });
+      const last = r.out.split(/\r?\n/).slice(-25).join("\n");
+      await sendText(chatId, r.ok ? `✅ Сборка успешна.\n${last}` : `⚠️ Сборка не удалась:\n${last}`);
+      return;
+    }
+    case "/restart": {
+      if (!requireOwner(chatId, owner)) return;
+      audit({ action: "restart", by: fromName });
+      await sendText(chatId, "Перезапускаю бота…");
+      mkdirSync(TMP_LOG, { recursive: true });
+      const logFd = openSync(path.join(TMP_LOG, "bot.log"), "a");
+      const child = spawn(process.execPath, [__filename], { cwd: ROOT, detached: true, stdio: ["ignore", logFd, logFd], windowsHide: true });
+      child.unref();
+      setTimeout(() => process.exit(0), 1500);
+      return;
+    }
+    case "/restart-server": {
+      if (!requireOwner(chatId, owner)) return;
+      audit({ action: "restart-server", by: fromName });
+      await sendText(chatId, "⏳ Перезапускаю веб-сервер…");
+      await killPort(3000);
+      mkdirSync(TMP_LOG, { recursive: true });
+      const logFd = openSync(path.join(TMP_LOG, "next.log"), "a");
+      const child = spawn("npm.cmd", ["run", "start"], { cwd: ROOT, detached: true, stdio: ["ignore", logFd, logFd], windowsHide: true });
+      child.unref();
+      await sendText(chatId, "Запущен next start -p 3000. Проверяю доступность…");
+      const ok = await waitForServer(3000, 120_000);
+      await sendText(chatId, ok ? "✅ Сервер снова доступен." : "⚠️ Сервер не поднялся за 2 минуты. Смотрите /log.");
+      return;
+    }
+    case "/log": {
+      if (!requireOwner(chatId, owner)) return;
+      const n = Math.max(5, Math.min(200, Number(rest) || 50));
+      const next = readTail(path.join(TMP_LOG, "next.log"), n);
+      await sendText(chatId, `— next.log (последние ${n}) —\n${next}`);
+      return;
+    }
+    case "/sysinfo": {
+      if (!requireOwner(chatId, owner)) return;
+      const r = await runCmd(
+        `powershell -NoProfile -Command "$os=Get-CimInstance Win32_OperatingSystem; $cpu=Get-CimInstance Win32_Processor | Select-Object -First 1; $disk=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'; $gpu=Get-CimInstance Win32_VideoController | Select-Object -First 1; $up=(Get-Date)-$os.LastBootUpTime; Write-Output ('OS: '+$os.Caption); Write-Output ('Uptime: '+[math]::Round($up.TotalHours,1)+' h'); Write-Output ('CPU: '+$cpu.Name+' load '+$cpu.LoadPercentage+'%'); Write-Output ('RAM free: '+[math]::Round($os.FreePhysicalMemory/1MB,1)+' GB / '+[math]::Round($os.TotalVisibleMemorySize/1MB,1)+' GB'); $disk | ForEach-Object { Write-Output ('DISK '+$_.DeviceID+' free '+[math]::Round($_.FreeSpace/1GB,1)+' GB / '+[math]::Round($_.Size/1GB,1)+' GB') }; Write-Output ('GPU: '+$gpu.Name)"`,
+        { timeout: 60_000 },
+      );
+      await sendText(chatId, `📊 Система:\n${r.out}`);
+      return;
+    }
+
+    // ---- git / snapshots ----
+    case "/git": {
+      if (!requireOwner(chatId, owner)) return;
+      if (!rest) {
+        const s = await git(["status", "--short"]);
+        await sendText(chatId, `git status:\n${s.out.slice(0, 3000) || "(чисто)"}`);
+        return;
+      }
+      audit({ action: "git", cmd: rest.slice(0, 200), by: fromName });
+      const r = await git(rest.split(/\s+/).filter(Boolean));
+      await sendText(chatId, r.ok ? r.out.slice(0, 3500) : `⚠️ ${r.out.slice(0, 3500)}`);
+      return;
+    }
+    case "/snapshot": {
+      if (!requireOwner(chatId, owner)) return;
+      const name = (rest || "").replace(/\s+/g, "-") || undefined;
+      const r = await makeSnapshot(name);
+      await sendText(chatId, r.ok ? `✅ ${r.out}` : `⚠️ ${r.out}`);
+      return;
+    }
+    case "/snapshots": {
+      if (!requireOwner(chatId, owner)) return;
+      const snaps = loadSnapshots();
+      const keys = Object.keys(snaps);
+      await sendText(chatId, keys.length === 0 ? "Снимков нет." : `Снимки:\n${keys.map((k) => `• ${k} (${new Date(snaps[k].at).toLocaleString("ru-RU")}, ${snaps[k].hash.slice(0, 10)})`).join("\n")}`);
+      return;
+    }
+    case "/rollback": {
+      if (!requireOwner(chatId, owner)) return;
+      const r = await rollbackSnapshot(rest || undefined);
+      await sendText(chatId, r.ok ? `✅ ${r.out}` : `⚠️ ${r.out}`);
+      return;
+    }
+
+    // ---- autonomy ----
+    case "/autonomy": {
+      if (!requireOwner(chatId, owner)) return;
+      const arg = rest.split(/\s+/)[0];
+      if (arg === "on") {
+        settings.autonomy = true;
+        saveSettings();
+        await import("node:fs").then((fs) => fs.rmSync(STOP_FILE, { force: true }));
+        audit({ action: "autonomy-on", by: fromName });
+        await sendText(chatId, "✅ Автономия ИИ включена.");
+      } else if (arg === "off") {
+        settings.autonomy = false;
+        saveSettings();
+        audit({ action: "autonomy-off", by: fromName });
+        await sendText(chatId, "Автономия ИИ выключена.");
+      } else {
+        const stopped = isStopped();
+        const changesUsed = (() => {
+          try {
+            const st = JSON.parse(readFileSync(path.join(DATA_DIR, "autonomy-state.json"), "utf8"));
+            return st.changes ?? 0;
+          } catch {
+            return 0;
+          }
+        })();
+        await sendText(
+          chatId,
+          `Автономия: ${settings.autonomy ? "ВКЛ" : "ВЫКЛ"}\nСтоп-флаг: ${stopped ? "установлен (/stop-ai)" : "нет"}\nИзменений за сессию: ${changesUsed}/${settings.maxChangesPerSession ?? 3}`,
+        );
+      }
+      return;
+    }
+    case "/veto": {
+      if (!requireOwner(chatId, owner)) return;
+      const id = rest.trim();
+      if (!id) {
+        await sendText(chatId, "Укажите id заявки (см. сообщение с кнопками).");
+        return;
+      }
+      pendings.delete(id);
+      await handleReject(chatId, id);
+      return;
+    }
+    case "/stop-ai": {
+      if (!requireOwner(chatId, owner)) return;
+      writeFileSync(STOP_FILE, String(Date.now()));
+      audit({ action: "stop-ai", by: fromName });
+      await sendText(chatId, "🛑 Автономия остановлена. Включить: /autonomy on.");
+      return;
+    }
+
+    default:
+      await sendText(chatId, "Неизвестная команда. /help");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Natural-language admin intents (owner only)
+// ---------------------------------------------------------------------------
+
+async function tryNlAdmin(chatId, msg, text) {
+  const lower = text.toLowerCase();
+  if (/свободное место|место на диске|сколько места|диск заполнен/.test(lower)) {
+    const r = await runCmd(
+      `powershell -NoProfile -Command "$disk=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'; $disk | ForEach-Object { Write-Output ($_.DeviceID+' free '+[math]::Round($_.FreeSpace/1GB,1)+' GB / '+[math]::Round($_.Size/1GB,1)+' GB') }"`,
+      { timeout: 60_000 },
+    );
+    await sendText(chatId, `💾 Место на диске:\n${r.out}`);
+    return true;
+  }
+  if (/статус системы|состояние системы|загрузка системы|статус пк|состояние пк/.test(lower)) {
+    const fake = { name: "/sysinfo", rest: "" };
+    await handleCommand(chatId, msg, fake);
+    return true;
+  }
+  if (/покажи файл|покажи содержимое|выведи файл|прочитай файл/.test(lower)) {
+    const m = text.match(/(?:покажи файл|покажи содержимое|выведи файл|прочитай файл)\s+(.+)/);
+    const rel = m?.[1]?.trim();
+    const abs = rel ? resolvePath(rel) : null;
+    if (!abs) {
+      await sendText(chatId, "Не понял, какой файл. Укажите путь.");
+      return true;
+    }
+    try {
+      const content = readFileSync(abs, "utf8");
+      const capped = content.length > 20_000 ? `${content.slice(0, 20_000)}\n…[обрезано]` : content;
+      await sendText(chatId, `— ${rel} —\n${capped}`);
+    } catch (err) {
+      await sendText(chatId, `Не удалось прочитать: ${err.message}`);
+    }
+    return true;
+  }
+  if (/список файлов|что в (папке|каталоге)|покажи (папку|каталог|директорию)/.test(lower)) {
+    const m = text.match(/(?:папке|каталоге|папку|каталог|директорию)\s+(.+)/);
+    const dir = m?.[1]?.trim() || ".";
+    const abs = resolvePath(dir);
+    if (!abs) {
+      await sendText(chatId, "Не понял, какую папку показать.");
+      return true;
+    }
+    const fake = { name: "/ls", rest: dir };
+    await handleCommand(chatId, msg, fake);
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Callback (approve / reject buttons)
+// ---------------------------------------------------------------------------
+
+async function handleCallback(query) {
+  const data = query.data ?? "";
+  const chatId = query.message?.chat?.id;
+  if (chatId === undefined) return;
+  const fakeFrom = { username: query.from?.username, id: query.from?.id };
+  const msg = { chat: { id: chatId }, text: "", from: query.from };
+  if (!isOwner(fakeFrom)) {
+    await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: "Только владелец может одобрять." }).catch(() => {});
+    return;
+  }
+  const [verb, id] = data.split(":");
+  if (!id) return;
+  await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: verb === "approve" ? "Одобрено" : "Отклонено" }).catch(() => {});
+  await removeButtons(chatId, query.message?.message_id);
+  const p = pendings.get(id);
+  if (verb === "approve") {
+    if (!p) {
+      await sendText(chatId, "Заявка не найдена (возможно, уже обработана).");
+      return;
+    }
+    if (Date.now() - p.createdAt > (settings.approvalTtlMs ?? 600_000)) {
+      pendings.delete(id);
+      await sendText(chatId, "Заявка истекла (более 10 минут). Запросите заново.");
+      return;
+    }
+    pendings.delete(id);
+    audit({ action: "approve", id, by: fakeFrom.username ?? fakeFrom.id });
+    await handleApprove(chatId, id);
+  } else {
+    pendings.delete(id);
+    audit({ action: "reject", id, by: fakeFrom.username ?? fakeFrom.id });
+    await handleReject(chatId, id);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Message dispatch
+// ---------------------------------------------------------------------------
+
+async function handleMessage(msg) {
+  const chatId = msg.chat?.id;
+  const text = (msg.text ?? "").trim();
+  if (chatId === undefined || !text) return;
+  registerUser(msg.from);
+  if (!isAllowed(msg.from)) {
+    console.log(`[bot] заблокирован id=${chatId}`);
+    return;
+  }
+  console.log(`[bot] ← ${chatId}: ${text.slice(0, 120)}`);
+
+  const cmd = parseCommand(text);
+  if (cmd) {
+    await handleCommand(chatId, msg, cmd);
+    return;
+  }
+
+  // Text answer to a pending approval (owner only).
+  const pending = pendingFor(String(chatId));
+  if (pending && isOwner(msg.from)) {
+    const t = text.toLowerCase();
+    if (/^(да|давай|ок|окей|подтверждаю|давай)([.!]|$)/.test(t)) {
+      pendings.delete(pending.id);
+      audit({ action: "approve-text", id: pending.id, by: msg.from?.username ?? msg.from?.id });
+      await handleApprove(chatId, pending.id);
+      return;
+    }
+    if (/^(нет|отмена|не надо|стоп|veto)([.!]|$)/.test(t)) {
+      pendings.delete(pending.id);
+      audit({ action: "reject-text", id: pending.id, by: msg.from?.username ?? msg.from?.id });
+      await handleReject(chatId, pending.id);
+      return;
+    }
+  }
+
+  // Owner natural-language admin intents.
+  if (isOwner(msg.from)) {
+    const handled = await tryNlAdmin(chatId, msg, text);
+    if (handled) return;
+  }
+
+  await chatWithAssistant(chatId, msg, text);
+}
+
+// ---------------------------------------------------------------------------
+// Polling loop
+// ---------------------------------------------------------------------------
+
 async function main() {
   let offset = 0;
-  console.log(`[bot] запущен. Сервер: ${SERVER}. Разрешённые id: ${ALLOWED_IDS.join(", ") || "все"}`);
+  console.log(`[bot] запущен. Сервер: ${SERVER}. Владелец: @${OWNER_USERNAME || "?"}.`);
+  if (registry.owner.id !== null) {
+    // Startup greeting so the owner knows the bot is alive after a restart.
+    try {
+      await sendText(registry.owner.id, "🟢 Бот запущен.");
+    } catch {
+      // owner chat may be blocked — ignore
+    }
+  }
   while (true) {
     try {
       const data = await apiCall("getUpdates", {
         offset,
         timeout: POLL_TIMEOUT,
-        allowed_updates: ["message"],
+        allowed_updates: ["message", "callback_query"],
       });
       for (const update of data.result ?? []) {
         offset = update.update_id + 1;
-        const msg = update.message;
-        if (!msg || !msg.text) continue;
-        const chatId = msg.chat?.id;
-        if (chatId === undefined) continue;
-        if (!allowed(chatId)) {
-          console.log(`[bot] заблокирован id=${chatId}`);
+        if (update.callback_query) {
+          handleCallback(update.callback_query).catch((e) => console.error("[bot] callback error:", e.message));
           continue;
         }
-        await handleMessage(chatId, msg.text, msg.from?.first_name);
+        const msg = update.message;
+        if (!msg || !msg.text) continue;
+        await handleMessage(msg);
       }
     } catch (err) {
       console.error("[bot] polling error:", err.message ?? err);

@@ -19,6 +19,13 @@ export interface GeneratedImage {
   mime: string;
 }
 
+export interface GenerateImageOptions {
+  /** Caption text drawn on the image (local tier only). */
+  text?: string;
+  /** Hidden EN tags injected ONLY into the local ComfyUI prompt. */
+  localTags?: string[];
+}
+
 async function generateGemini(prompt: string, key: string): Promise<GeneratedImage> {
   const res = await fetch(`${GEMINI_URL}/${IMAGE_MODEL}:generateContent`, {
     method: "POST",
@@ -67,7 +74,7 @@ async function generatePollinations(prompt: string): Promise<GeneratedImage> {
   return { b64: buf.toString("base64"), mime };
 }
 
-export async function generateImage(prompt: string): Promise<GeneratedImage> {
+export async function generateImage(prompt: string, opts?: GenerateImageOptions): Promise<GeneratedImage> {
   const key = process.env.GEMINI_API_KEY;
   if (key) {
     try {
@@ -80,7 +87,10 @@ export async function generateImage(prompt: string): Promise<GeneratedImage> {
   }
   try {
     if (await isLocalImageAvailable()) {
-      return await generateImageLocal(prompt);
+      return await generateImageLocal(prompt, {
+        text: opts?.text,
+        inject: opts?.localTags,
+      });
     }
   } catch (err) {
     console.warn("[image] local comfy failed, falling back to pollinations:", (err as Error).message);

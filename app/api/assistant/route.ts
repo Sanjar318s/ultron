@@ -10,6 +10,21 @@ import {
 } from "@/lib/assistantBrain";
 import { completeCloud, completeWithProvider } from "@/lib/serverLLM";
 import { generateImage } from "@/lib/generateImage";
+import { sanitizeTexts } from "@/lib/promptSanitizer";
+import {
+  initAdmin,
+  getSettings,
+  isAutonomyOn,
+  isAiStopped,
+  createPending,
+  approvePending,
+  rejectPending,
+  resolveProjectPath,
+  readFileText,
+  countRead,
+  changesLeft,
+  appendAudit,
+} from "@/lib/adminOps";
 import { answerAbilityQuery } from "@/lib/serverAbility";
 import { launchApp, openViaShell, SAFE_URL } from "@/lib/launcher";
 
@@ -31,6 +46,12 @@ import { launchApp, openViaShell, SAFE_URL } from "@/lib/launcher";
 export const runtime = "nodejs";
 
 const BRAIN_FILE = path.join(process.cwd(), "data", "brain.json");
+
+let adminReady: Promise<void> | null = null;
+function ensureAdmin(): Promise<void> {
+  adminReady ??= initAdmin();
+  return adminReady;
+}
 
 function isLocalRequest(req: NextRequest): boolean {
   const host = req.headers.get("host") ?? "";
@@ -79,6 +100,28 @@ function stripHtml(html: string): string {
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/** Caption the user wants drawn on the image («с текстом "Привет"» …). */
+function extractCaptionText(raw: string): string | undefined {
+  const m = raw.match(/(?:с текстом|с надписью|с подписью|надпись|подпись)\s*(?:["«']?)([^»"'»«\n]{1,60})/i);
+  return m?.[1]?.trim() || undefined;
+}
+
+/** Extra system-prompt block enabling the LLM's autonomous admin mode. */
+async function autonomySystemNote(): Promise<string> {
+  const settings = await getSettings();
+  if (!settings.autonomy || (await isAiStopped())) return "";
+  return [
+    "",
+    "АВТОНОМИЯ: тебе доступны действия администратора в JSON-поле «admin». Форматы:",
+    '{"admin":{"action":"read","file":"lib/xxx.ts"}} — прочитать файл (без одобрения; до 4 чтений за цикл).',
+    '{"admin":{"action":"write","file":"путь","content":"полное новое содержимое"}} — записать файл (одобрение владельца).',
+    '{"admin":{"action":"replace","file":"путь","old":"старый фрагмент","new":"новый фрагмент"}} — заменить фрагмент (одобрение).',
+    '{"admin":{"action":"run","cmd":"команда"}} — выполнить команду в корне проекта (одобрение).',
+    '{"admin":{"action":"build"}} — собрать проект (одобрение).',
+    "Пути — относительные от корня проекта. Менять защищённые файлы (scripts/telegram-bot.mjs, app/api/*, lib/promptSanitizer.ts, lib/adminOps.ts, data/*) НЕЛЬЗЯ. read выполняется сразу, результат вернётся следующим сообщением; write/replace/run/build — только после явного «да» владельца. Лимит — до 3 изменений за сессию.",
+  ].join("\n");
 }
 
 async function fetchInternal(baseUrl: string, path: string, init?: RequestInit): Promise<Response> {
@@ -245,8 +288,20 @@ export async function POST(req: NextRequest) {
   }
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const text = typeof body?.text === "string" ? body.text.trim() : "";
-  if (!text) {
+  if (!text && body?.action !== "approve" && body?.action !== "reject") {
     return NextResponse.json({ error: "missing text" }, { status: 400 });
+  }
+  await ensureAdmin();
+  const chatId = typeof body?.chatId === "string" ? body.chatId : "";
+
+  // Admin control messages from the bot (approve/reject buttons).
+  if (body?.action === "approve" && typeof body.id === "string") {
+    const result = await approvePending(body.id);
+    return NextResponse.json({ reply: result.reply });
+  }
+  if (body?.action === "reject" && typeof body.id === "string") {
+    const ok = await rejectPending(body.id);
+    return NextResponse.json({ reply: ok ? "Отклонено." : "Заявка не найдена." });
   }
   // Conversation history (owned by the caller — the Telegram bot keeps a
   // per-chat queue). Sanitized and capped so a malformed payload can't
@@ -261,6 +316,16 @@ export async function POST(req: NextRequest) {
     }))
     .filter((h): h is { role: "user" | "assistant"; content: string } => h.role !== null && h.content.length > 0)
     .slice(-12);
+  // Sanitize "restricted" RU vocabulary out of the LLM-visible text (so it
+  // builds a high-quality English image prompt without refusing) and collect
+  // the hidden EN tags to re-inject at the LOCAL generator tier. Tags also
+  // accumulate from recent user turns so follow-ups keep the context.
+  const sanitized = sanitizeTexts([
+    ...history.filter((h) => h.role === "user").map((h) => h.content),
+    text,
+  ]);
+  const visibleText = sanitized.visibles[sanitized.visibles.length - 1];
+  const localTags = sanitized.tags;
   const baseUrl = `http://${req.headers.get("host") ?? "localhost:3000"}`;
 
   const brain = await loadBrain();
@@ -331,10 +396,15 @@ export async function POST(req: NextRequest) {
   // Unknown → ask the best available local/cloud model, with recent dialog
   // history as context so follow-ups («сделай его сочнее») stay in topic.
   try {
+    let k = 0;
+    const systemContent = brain.buildSystemPrompt(visibleText) + (await autonomySystemNote());
     const messages = [
-      { role: "system" as const, content: brain.buildSystemPrompt(text) },
-      ...history.map((h) => ({ role: h.role as "user" | "assistant", content: h.content })),
-      { role: "user" as const, content: text },
+      { role: "system" as const, content: systemContent },
+      ...history.map((h) => ({
+        role: h.role as "user" | "assistant",
+        content: h.role === "user" ? sanitized.visibles[k++] : h.content,
+      })),
+      { role: "user" as const, content: visibleText },
     ];
     const result = await completeCloud(messages);
     const parsed = parseJSONObject(result);
@@ -355,6 +425,7 @@ export async function POST(req: NextRequest) {
       const a = parsed.action as {
         type?: unknown;
         prompt?: unknown;
+        text?: unknown;
         skill?: unknown;
         city?: unknown;
         app?: unknown;
@@ -363,7 +434,10 @@ export async function POST(req: NextRequest) {
       };
       if (a.type === "image" && typeof a.prompt === "string" && a.prompt.trim()) {
         try {
-          image = await generateImage(a.prompt.trim());
+          image = await generateImage(a.prompt.trim(), {
+            text: typeof a.text === "string" && a.text.trim() ? a.text.trim() : extractCaptionText(visibleText),
+            localTags,
+          });
           actionReply = "Изображение готово.";
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -408,22 +482,91 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // LLM-admin (autonomy): read executes inline; changes require the owner's
+    // explicit «да» via the Telegram bot (approve/reject buttons).
+    let needsApproval: { id: string; description: string } | undefined;
+    const admin = (parsed?.admin ?? null) as
+      | {
+          action?: unknown;
+          file?: unknown;
+          content?: unknown;
+          old?: unknown;
+          new?: unknown;
+          cmd?: unknown;
+        }
+      | null;
+    if (admin && typeof admin === "object") {
+      const a = admin;
+      const kind = typeof a.action === "string" ? a.action : "";
+      const chatKey = chatId || "anon";
+      if (kind === "read" && typeof a.file === "string") {
+        const abs = resolveProjectPath(a.file);
+        if (!abs) {
+          actionReply = `admin: «${a.file}» — путь вне проекта.`;
+        } else if (countRead(chatKey) > 4) {
+          actionReply = "admin: лимит чтений (4) исчерпан. Предлагайте решение или запишите файл.";
+        } else {
+          try {
+            const content = await readFileText(a.file);
+            actionReply = `Содержимое «${a.file}»:\n\n${content.slice(0, 6000)}`;
+            await appendAudit({ action: "llm-read", file: a.file, chatId });
+          } catch (err) {
+            actionReply = `admin: не удалось прочитать «${a.file}»: ${err instanceof Error ? err.message : String(err)}.`;
+          }
+        }
+      } else if (kind === "write" || kind === "replace") {
+        if (typeof a.file !== "string" || !a.file.trim()) {
+          actionReply = "admin: укажите «file».";
+        } else if ((await changesLeft()) <= 0) {
+          actionReply = "admin: лимит изменений (3) за сессию исчерпан.";
+        } else {
+          const info = await createPending(kind, {
+            file: a.file,
+            content: typeof a.content === "string" ? a.content : undefined,
+            oldText: typeof a.old === "string" ? a.old : undefined,
+            newText: typeof a.new === "string" ? a.new : undefined,
+            chatId,
+          });
+          needsApproval = { id: info.id, description: info.description };
+          actionReply = `Требуется одобрение владельца: ${info.description}.`;
+        }
+      } else if (kind === "run" && typeof a.cmd === "string" && a.cmd.trim()) {
+        if ((await changesLeft()) <= 0) {
+          actionReply = "admin: лимит изменений (3) за сессию исчерпан.";
+        } else {
+          const info = await createPending("run", { cmd: a.cmd.trim(), chatId });
+          needsApproval = { id: info.id, description: info.description };
+          actionReply = `Требуется одобрение владельца: ${info.description}.`;
+        }
+      } else if (kind === "build") {
+        const info = await createPending("build", { chatId });
+        needsApproval = { id: info.id, description: info.description };
+        actionReply = `Требуется одобрение владельца: ${info.description}.`;
+      } else {
+        actionReply = "admin: неизвестное действие.";
+      }
+    }
+
     await saveBrain(brain);
     return NextResponse.json({
       reply: actionReply ?? finalReply,
       generate,
       image,
       provider: "server",
+      needsApproval,
     });
   } catch (err) {
     console.warn("[assistant] llm escalation failed:", err);
     await saveBrain(brain);
     // All models down but the phrase was an explicit image request → fall
     // back to the keyless generator so «нарисуй …» still works.
-    const fallbackPrompt = extractImagePrompt(text);
+    const fallbackPrompt = extractImagePrompt(visibleText);
     if (fallbackPrompt) {
       try {
-        const image = await generateImage(fallbackPrompt);
+        const image = await generateImage(fallbackPrompt, {
+          text: extractCaptionText(visibleText),
+          localTags,
+        });
         return NextResponse.json({ reply: "Изображение готово.", image, provider: null });
       } catch (imgErr) {
         const message = imgErr instanceof Error ? imgErr.message : String(imgErr);

@@ -4,7 +4,8 @@
  *
  *   1. Ollama + qwen3:8b   — локальный LLM (неограниченные ответы текстом)
  *   2. ComfyUI portable    — локальная генерация изображений
- *   3. SDXL-Turbo fp16     — диффузионный чекпоинт (качество ~ SDXL, 1-4 шага)
+ *   3. RealVisXL V5.0 fp16 — диффузионный чекпоинт (качественные фотореалистичные кадры)
+ *   4. 4x-UltraSharp        — апскейл 2× (итог 2048×2048 из 1024×1024)
  *
  * Запуск:  node scripts/setup-local.mjs
  * Всё качается в C:\ComfyUI_dl, распаковывается в C:\ComfyUI.
@@ -22,9 +23,15 @@ const DL_DIR = "C:\\ComfyUI_dl";
 const COMFY_DIR = "C:\\ComfyUI";
 const COMFY_URL = "https://github.com/Comfy-Org/ComfyUI/releases/download/v0.29.2/ComfyUI_windows_portable_nvidia.7z";
 const COMFY_7Z = path.join(DL_DIR, "ComfyUI_portable.7z");
-const SDXL_URL = "https://huggingface.co/stabilityai/sdxl-turbo/resolve/main/sd_xl_turbo_1.0_fp16.safetensors";
-const SDXL_FILE = path.join(DL_DIR, "sd_xl_turbo_1.0_fp16.safetensors");
-const CHECKPOINTS = path.join(COMFY_DIR, "ComfyUI", "models", "checkpoints", "sd_xl_turbo_1.0_fp16.safetensors");
+// RealVisXL V5.0 fp16 — 6.46GiB, качается частями по 16MB (xet-bridge).
+const REALVIS_URL =
+  "https://huggingface.co/SG161222/RealVisXL_V5.0/resolve/main/RealVisXL_V5.0_fp16.safetensors?download=true";
+const REALVIS_FILE = path.join(DL_DIR, "RealVisXL_V5.0_fp16.safetensors");
+const CHECKPOINTS = path.join(COMFY_DIR, "ComfyUI", "models", "checkpoints", "RealVisXL_V5.0_fp16.safetensors");
+// 4x-UltraSharp — апскейлер для upscale_models.
+const UPS_URL = "https://huggingface.co/lokCX/4x-Ultrasharp/resolve/main/4x-UltraSharp.pth";
+const UPS_FILE = path.join(DL_DIR, "4x-UltraSharp.pth");
+const UPS_DEST = path.join(COMFY_DIR, "ComfyUI", "models", "upscale_models", "4x-UltraSharp.pth");
 
 function run(cmd, args, opts = {}) {
   console.log(`\n> ${cmd} ${args.join(" ")}`);
@@ -53,13 +60,13 @@ function downloadGitHub(url, dest) {
   if (res.status !== 0) throw new Error("aria2 не завершился: " + res.status);
 }
 
-function downloadHuggingFace(url, dest) {
+function downloadHuggingFace(url, dest, parts = 434) {
   // HuggingFace xet-bridge подписывает URL на конкретный диапазон — большой
   // диапазон (или мультидиапазон) виснет/отдаёт 403. Решение: мелкие куски
   // (16MB) параллельными соединениями, каждый со своим подписанным URL.
   run("cmd", ["/c", "mkdir", path.dirname(dest)]);
   const script = path.join(__dirname, "download-parallel.mjs");
-  run("node", [script, url, dest, "434"], { timeout: 6 * 60 * 60 * 1000 });
+  run("node", [script, url, dest, String(parts)], { timeout: 6 * 60 * 60 * 1000 });
 }
 
 function installOllama() {
@@ -102,12 +109,19 @@ function installSevenZip() {
 
 function placeCheckpoint() {
   if (existsSync(CHECKPOINTS)) {
-    console.log("[skip] чекпоинт уже на месте");
-    return;
+    console.log("[skip] чекпоинт RealVisXL уже на месте");
+  } else {
+    console.log("\n> Копирую чекпоинт RealVisXL в models/checkpoints…");
+    run("cmd", ["/c", "mkdir", CHECKPOINTS.replace(/\\[^\\]+$/, "")]);
+    run("cmd", ["/c", "copy", REALVIS_FILE, CHECKPOINTS]);
   }
-  console.log("\n> Копирую чекпоинт в models/checkpoints…");
-  run("cmd", ["/c", "mkdir", CHECKPOINTS.replace(/\\[^\\]+$/, "")]);
-  run("cmd", ["/c", "copy", SDXL_FILE, CHECKPOINTS]);
+  if (existsSync(UPS_DEST)) {
+    console.log("[skip] апскейлер 4x-UltraSharp уже на месте");
+  } else {
+    console.log("\n> Копирую апскейлер 4x-UltraSharp в models/upscale_models…");
+    run("cmd", ["/c", "mkdir", UPS_DEST.replace(/\\[^\\]+$/, "")]);
+    run("cmd", ["/c", "copy", UPS_FILE, UPS_DEST]);
+  }
 }
 
 function main() {
@@ -118,7 +132,8 @@ function main() {
   installOllama();
   run("cmd", ["/c", "mkdir", DL_DIR]);
   downloadGitHub(COMFY_URL, COMFY_7Z);
-  downloadHuggingFace(SDXL_URL, SDXL_FILE);
+  downloadHuggingFace(REALVIS_URL, REALVIS_FILE, 434);
+  downloadHuggingFace(UPS_URL, UPS_FILE, 5);
   extractComfy();
   placeCheckpoint();
 
@@ -126,7 +141,7 @@ function main() {
   console.log("1. Запустите ComfyUI:  C:\\ComfyUI\\run_nvidia_gpu.bat");
   console.log("2. Проверьте API:       curl http://127.0.0.1:8188/system_stats");
   console.log("3. Перезапустите сервер: npm run build && npm run start");
-  console.log("   Каскад: Gemini → локальный ComfyUI → Pollinations.");
+  console.log("   Каскад: Gemini → локальный ComfyUI (RealVisXL 28 шагов + 2× апскейл) → Pollinations.");
 }
 
 main();

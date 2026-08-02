@@ -3,9 +3,9 @@
     "class_type": "KSampler",
     "inputs": {
       "seed": __SEED__,
-      "steps": 1,
-      "cfg": 1.0,
-      "sampler_name": "dpmpp_sde",
+      "steps": 28,
+      "cfg": 6.0,
+      "sampler_name": "dpmpp_2m",
       "scheduler": "karras",
       "denoise": 1.0,
       "model": ["4", 0],
@@ -49,11 +49,34 @@
       "vae": ["4", 2]
     }
   },
+  "10": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "__UPSCALE_MODEL__"
+    }
+  },
+  "11": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "upscale_model": ["10", 0],
+      "image": ["8", 0]
+    }
+  },
+  "12": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": ["11", 0],
+      "upscale_method": "lanczos",
+      "width": __UPSCALE_W__,
+      "height": __UPSCALE_H__,
+      "crop": "center"
+    }
+  },
   "9": {
     "class_type": "SaveImage",
     "inputs": {
       "filename_prefix": "ultron",
-      "images": ["8", 0]
+      "images": ["12", 0]
     }
   }
 }

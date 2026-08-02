@@ -14,14 +14,27 @@
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { composeFullPrompt } from "./promptSanitizer";
+import { overlayText } from "./textOverlay";
 
 export interface LocalImage {
   b64: string;
   mime: string;
 }
 
+export interface LocalImageOptions {
+  width?: number;
+  height?: number;
+  seed?: number;
+  /** Caption drawn on a bottom banner (local tier only — Pillow overlay). */
+  text?: string;
+  /** Hidden EN tags re-injected from the sanitizer — LOCAL prompt only. */
+  inject?: string[];
+}
+
 const COMFY_URL = process.env.COMFY_URL || "http://127.0.0.1:8188";
-const COMFY_CHECKPOINT = process.env.COMFY_CHECKPOINT || "sd_xl_turbo_1.0_fp16.safetensors";
+const COMFY_CHECKPOINT = process.env.COMFY_CHECKPOINT || "RealVisXL_V5.0_fp16.safetensors";
+const COMFY_UPSCALE_MODEL = process.env.COMFY_UPSCALE_MODEL || "4x-UltraSharp.pth";
 const PROBE_TTL = 15_000;
 
 let probeState: { reachable: boolean; checkedAt: number } = { reachable: false, checkedAt: 0 };
@@ -60,10 +73,14 @@ function firstImageOutput(history: Record<string, unknown> | null, promptId: str
  * Generate an image with the local ComfyUI. Throws when ComfyUI is unreachable,
  * the workflow fails, or the image can't be fetched — the caller falls back.
  */
-export async function generateImageLocal(prompt: string, opts?: { width?: number; height?: number; seed?: number }): Promise<LocalImage> {
+export async function generateImageLocal(prompt: string, opts?: LocalImageOptions): Promise<LocalImage> {
   const width = opts?.width ?? 1024;
   const height = opts?.height ?? 1024;
   const seed = opts?.seed ?? Math.floor(Math.random() * 1_000_000_000);
+
+  // Hidden RU→EN tags (sanitizer) go ONLY into the local ComfyUI prompt — the
+  // Gemini/Pollinations tiers never see them.
+  const finalPrompt = opts?.inject?.length ? composeFullPrompt(prompt, opts.inject) : prompt;
 
   // The template has unquoted numeric placeholders (__WIDTH__, __HEIGHT__,
   // __SEED__), so it's NOT valid JSON until they're substituted. Replace on the
@@ -73,10 +90,13 @@ export async function generateImageLocal(prompt: string, opts?: { width?: number
   const template = await fs.readFile(path.join(process.cwd(), "comfy", "text2img.json"), "utf8");
   const raw = template
     .replaceAll("__CHECKPOINT__", esc(COMFY_CHECKPOINT))
-    .replaceAll("__PROMPT__", esc(prompt))
+    .replaceAll("__PROMPT__", esc(finalPrompt))
     .replaceAll("__NEGATIVE__", "")
     .replaceAll("__WIDTH__", String(width))
     .replaceAll("__HEIGHT__", String(height))
+    .replaceAll("__UPSCALE_MODEL__", esc(COMFY_UPSCALE_MODEL))
+    .replaceAll("__UPSCALE_W__", String(width * 2))
+    .replaceAll("__UPSCALE_H__", String(height * 2))
     .replaceAll("__SEED__", String(seed));
   const workflow = JSON.parse(raw) as Record<string, unknown>;
 
@@ -93,8 +113,9 @@ export async function generateImageLocal(prompt: string, opts?: { width?: number
   const queued = (await promptRes.json()) as { prompt_id?: string };
   if (!queued.prompt_id) throw new Error("comfyui returned no prompt_id");
 
-  // Poll /history until the job is done (or fails). ~1s cadence, 180s cap.
-  const deadline = Date.now() + 180_000;
+  // Poll /history until the job is done (or fails). ~1s cadence, 10 min cap
+  // (28 steps + 2× upscale on an 8GB card can take a while).
+  const deadline = Date.now() + 600_000;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 1000));
     const historyRes = await fetch(`${COMFY_URL}/history/${queued.prompt_id}`, {
@@ -130,7 +151,10 @@ export async function generateImageLocal(prompt: string, opts?: { width?: number
         const buf = Buffer.from(await viewRes.arrayBuffer());
         const contentType = viewRes.headers.get("content-type") ?? "";
         const mime = contentType.includes("png") ? "image/png" : contentType.includes("webp") ? "image/webp" : "image/jpeg";
-        return { b64: buf.toString("base64"), mime };
+        const result = { b64: buf.toString("base64"), mime };
+        // Caption overlay (best-effort; returns the image untouched on failure).
+        if (opts?.text) return overlayText(result.b64, opts.text);
+        return result;
       }
     }
   }

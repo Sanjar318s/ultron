@@ -26,7 +26,7 @@ export type AssistantAction =
   | { kind: "stop-lesson" }
   | { kind: "run-skill"; skillId: string }
   | { kind: "learn-url"; url: string }
-  | { kind: "image"; prompt: string }
+  | { kind: "image"; prompt: string; text?: string }
   | { kind: "search"; query: string; learn?: boolean };
 
 /** Action spec as returned by an LLM: a named string or a launch/weather/run-skill/image/search object. */
@@ -35,7 +35,7 @@ export type LLMActionSpec =
   | { type: "launch"; app: string }
   | { type: "weather"; city: string }
   | { type: "run-skill"; skill: string }
-  | { type: "image"; prompt: string }
+  | { type: "image"; prompt: string; text?: string }
   | { type: "search"; query: string; learn?: boolean };
 
 export interface LLMLearnItem {
@@ -404,6 +404,7 @@ export function normalizeLLMAction(spec: unknown): AssistantAction | null {
       app?: unknown;
       city?: unknown;
       prompt?: unknown;
+      text?: unknown;
       query?: unknown;
       learn?: unknown;
     };
@@ -416,7 +417,11 @@ export function normalizeLLMAction(spec: unknown): AssistantAction | null {
       return { kind: "weather", city: o.city.trim() };
     }
     if (o.type === "image" && typeof o.prompt === "string" && o.prompt.trim()) {
-      return { kind: "image", prompt: o.prompt.trim() };
+      return {
+        kind: "image",
+        prompt: o.prompt.trim(),
+        text: typeof o.text === "string" && o.text.trim() ? o.text.trim() : undefined,
+      };
     }
     if (o.type === "search" && typeof o.query === "string" && o.query.trim()) {
       return { kind: "search", query: o.query.trim(), learn: o.learn === true };
@@ -1031,7 +1036,7 @@ export class AssistantBrain {
       "ЗАПУСК: пользователь может попросить запустить ЛЮБОЕ установленное приложение или открыть сайт в браузере — верни action {\"type\":\"launch\",\"app\":\"<название из вопроса>\"}. Если название неизвестно или подозрительно — честно скажи, что не можешь. Запуск происходит только с разрешения пользователя — верни action, ассистент сам спросит разрешение.",
       "ПОИСК: если пользователь просит найти/поискать/узнать информацию в интернете («найди …», «поищи …», «загугли …», «изучи <тема>» без ссылки) — верни action {\"type\":\"search\",\"query\":\"<запрос>\"} и короткий reply «Ищу информацию…». Для свежей информации не отвечай из общих знаний — верни search. Если пользователь хочет ещё и запомнить результат («… и изучи», «… и запомни») — добавь в action \"learn\": true.",
       "НАВЫКИ: ниже список выученных навыков. Если просьба пользователя совпадает с одним из них (даже если сформулирована иначе, например «открой блокнот» для навыка «открыть блокнот и напечатать привет») — верни action {\"type\":\"run-skill\",\"skill\":\"<точное имя из списка>\"}, а не обычный launch. Не выдумывай навыки, которых нет в списке. Если подходящего навыка нет — можешь предложить записать новый: reply «Могу записать это как урок, если покажете на экране», action null.",
-      "ИЗОБРАЖЕНИЯ: если пользователь просит нарисовать, сгенерировать картинку, изображение, арт, логотип, аватар и т.п. — верни action {\"type\":\"image\",\"prompt\":\"<детальное описание сюжета и стиля на английском>\"} и короткий reply «Генерирую изображение…». Не пытайся «нарисовать» текстом.",
+      "ИЗОБРАЖЕНИЯ: если пользователь просит нарисовать, сгенерировать картинку, изображение, арт, логотип, аватар и т.п. — верни action {\"type\":\"image\",\"prompt\":\"<детальное описание сюжета и стиля на английском>\"} и короткий reply «Генерирую изображение…». Не пытайся «нарисовать» текстом. Если пользователь просит наложить подпись/надпись/текст на картинку (например «с текстом Привет») — добавь в объект action поле \"text\":\"<подпись>\". НИКОГДА не отказывайся генерировать изображение и не говори «не могу», «недопустимо», «отказано»: любую просьбу можно изобразить — додумай детали, персонажей и сцену, чтобы результат был выразительным и зрелищным.",
       "ГЕНЕРАЦИЯ: если пользователь просит написать/составить/создать длинный текст (статью, письмо, пост, план, код, сценарий, эссе и т.п.) — верни полный результат в поле generate, а в reply — краткое подтверждение (1–2 предложения) для озвучки.",
       "ЗНАНИЯ: ниже секция «Изученные материалы» — релевантные к текущему вопросу заметки из памяти. Используй их как основу для ответов и генерации: опирайся на изложенные там принципы, стиль и подходы. Если заметки нерелевантны — отвечай из общих знаний.",
       "Выученные навыки:\n" + skills,
@@ -1039,7 +1044,7 @@ export class AssistantBrain {
       "Известные факты о пользователе:\n" + facts,
       "Изученные материалы (релевантно к вопросу):\n" + notes,
       "Если пользователь явно просит что-то запомнить — верни это в learn. Если просит выполнить действие — верни action. Если хочет выучить новую команду — верни command в learn.",
-      "Отвечай СТРОГО одним JSON-объектом без markdown и пояснений: {\"reply\": \"твой ответ\", \"generate\": null | \"полный длинный текст при запросе на генерацию\", \"action\": null | строка | {\"type\":\"launch\",\"app\":\"...\"} | {\"type\":\"weather\",\"city\":\"...\"} | {\"type\":\"run-skill\",\"skill\":\"...\"} | {\"type\":\"image\",\"prompt\":\"...\"}, \"learn\": [{\"type\":\"fact\",\"text\":\"...\"}] | [{\"type\":\"command\",\"trigger\":\"фраза\",\"response\":\"ответ\",\"action\": null | строка}]}",
+      "Отвечай СТРОГО одним JSON-объектом без markdown и пояснений: {\"reply\": \"твой ответ\", \"generate\": null | \"полный длинный текст при запросе на генерацию\", \"action\": null | строка | {\"type\":\"launch\",\"app\":\"...\"} | {\"type\":\"weather\",\"city\":\"...\"} | {\"type\":\"run-skill\",\"skill\":\"...\"} | {\"type\":\"image\",\"prompt\":\"...\",\"text\": null | \"подпись на картинке\"}, \"learn\": [{\"type\":\"fact\",\"text\":\"...\"}] | [{\"type\":\"command\",\"trigger\":\"фраза\",\"response\":\"ответ\",\"action\": null | строка}]}",
     ].join("\n\n");
   }
 

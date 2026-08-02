@@ -99,10 +99,41 @@ On top of the orb there is a voice/text assistant with its own architecture
 - **`hooks/useVoiceAssistant.ts`** — the only React hook. Owns the local LLM
   router (`lib/llm`), speech recognition/synthesis, and the image pipeline.
 - **`app/api/assistant/route.ts`** — server core for the Telegram bot
-  (`scripts/telegram-bot.mjs`). Accepts `{ text, history? }`; history is owned
-  by the caller (the bot keeps a per-chat queue of the last ~16 turns) and is
-  injected into the LLM escalation so follow-ups like «сделай его сочнее» stay
-  in topic. Stateless otherwise.
+  (`scripts/telegram-bot.mjs`). Accepts `{ text, history?, chatId? }`; history is
+  owned by the caller (the bot keeps a per-chat queue of the last ~16 turns) and
+  is injected into the LLM escalation so follow-ups like «сделай его сочнее» stay
+  in topic. Also handles admin-control messages (`{ action: "approve"|"reject" }`)
+  from the bot and the LLM's autonomous `admin` JSON actions. Sanitizes RU
+  "restricted" vocabulary out of the LLM-visible text (via `promptSanitizer`),
+  re-injecting the hidden EN tags only into the local ComfyUI tier.
+- **`lib/promptSanitizer.ts`** — RU→EN sanitizer. `sanitize`/`sanitizeTexts` strip
+  restricted RU phrases from the LLM-visible text and collect English tags
+  (`nude`, `breasts`, `doggystyle`, …); `composeFullPrompt` appends those tags
+  to the LLM-built prompt ONLY for the local generator. Gemini/Pollinations never
+  see the tags (they moderate). Tags accumulate across recent user turns so a
+  follow-up keeps the hidden context. Cyrillic word boundaries are built by hand
+  (`\b` is ASCII-only in JS).
+- **`lib/adminOps.ts`** — server-side autonomy engine (localhost-only): path
+  validation inside the project root, LLM read-loop cap (4 per chat, 5-min TTL),
+  pending approvals (write/replace/run/build) with TTL, execution with backup +
+  `node --check` + `npm run build` and auto-rollback on failure, a 3-changes-per-
+  session limit, a `data/stop-ai` kill switch, and an audit log
+  (`data/admin-log.jsonl`). Settings live in `data/settings.json`; pending
+  approvals in `data/pending.json`.
+- **`lib/textOverlay.ts` + `scripts/text_overlay.py`** — caption banner drawn on
+  the generated image (bottom strip, Cyrillic-safe) using Pillow under ComfyUI's
+  bundled Python (`COM FY_PYTHON`). Best-effort: returns the image untouched if
+  Python is missing.
+- **`scripts/telegram-bot.mjs`** — long-polling Telegram bridge. Owner
+  (`TELEGRAM_OWNER_USERNAME`) gets full admin access: `/users /adduser /rmuser`,
+  file ops (`/ls /tree /cat /find /write /append /replace /rm /mkdir /mv /cp`),
+  shell (`/run /node /build /log /sysinfo`), git (`/git` via `GITHUB_TOKEN`),
+  snapshots/rollback (git `stash create` + `checkout`, tracked in
+  `data/snapshots.json`), server control (`/restart /restart-server`), and
+  LLM-autonomy control (`/autonomy on|off|status`, `/veto <id>`, `/stop-ai`).
+  Allowed users (`TELEGRAM_ALLOWED_USERNAMES` / `/adduser`) can only chat. User
+  registry persists to `data/telegram-users.json`; approvals render as inline
+  buttons (`approve:<id>` / `reject:<id>`) and execute via the route.
 - **LLM chain (local-first, unlimited):** browser router order
   `["ollama", "gemini", "groq", "webllm"]` (`lib/llm/router.ts`); server order
   `[ollama, gemini, groq]` (`lib/serverLLM.ts`). OpenAI/DeepSeek are excluded —
@@ -110,13 +141,23 @@ On top of the orb there is a voice/text assistant with its own architecture
   `think: false`: qwen3's thinking mode burns the whole token budget via the
   OpenAI-compat endpoint and returns empty content.
 - **Image chain (local-first):** `Gemini (quota-limited) → local ComfyUI
-  (`lib/localImage.ts`, SDXL-Turbo on 127.0.0.1:8188, workflow template in
-  `comfy/text2img.json`) → Pollinations (keyless fallback)`. `lib/localImage.ts`
-  probes ComfyUI (`/system_stats`, 15s TTL), POSTs the template, and polls
-  `/history/{id}` for the finished image.
+  (`lib/localImage.ts`, RealVisXL V5.0 fp16 on 127.0.0.1:8188, workflow template
+  in `comfy/text2img.json`: 28 steps dpmpp_2m/karras, then 2× upscale through
+  `4x-UltraSharp.pth`) → Pollinations (keyless fallback)`. `lib/localImage.ts`
+  probes ComfyUI (`/system_stats`, 15s TTL), POSTs the template, polls
+  `/history/{id}` for the finished image, and — when the sanitizer provided tags
+  or the user asked for a caption — injects tags into the local prompt and draws
+  the text overlay before returning.
+- **LLM autonomy (opt-in, owner-gated):** when `data/settings.json` has
+  `autonomy: true`, the route appends an admin-mode system block. The LLM may
+  return JSON `{ admin: { action: "read"|"write"|"replace"|"run"|"build", … } }`.
+  `read` executes immediately (≤4 per loop); the rest require the owner's «да»
+  via Telegram buttons, then run through `adminOps` with build-check + rollback.
+  Protected files (bot, routes, sanitizer, adminOps, `data/*`) are never editable
+  by the LLM.
 - **Setup:** `node scripts/setup-local.mjs` installs Ollama + qwen3:8b and
-  downloads/installs ComfyUI + SDXL-Turbo (`C:\ComfyUI`). Start ComfyUI with
-  `run_nvidia_gpu.bat`.
+  downloads/installs ComfyUI + RealVisXL V5.0 fp16 + 4x-UltraSharp
+  (`C:\ComfyUI`). Start ComfyUI with `run_nvidia_gpu.bat`.
   - Downloads use `aria2` (GitHub) and `scripts/download-parallel.mjs`
     (HuggingFace). HF's xet-bridge signs each URL for one range — a single
     large range (or aria2's multi-range) hangs/403s, so the HF downloader
