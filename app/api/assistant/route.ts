@@ -7,6 +7,13 @@ import {
   type LLMLearnItem,
 } from "@/lib/assistantBrain";
 import { completeCloud, completeWithProvider } from "@/lib/serverLLM";
+import { isQuotaError, reportFailure, resolveKey, type ResolveResult } from "@/lib/geminiKeys";
+import {
+  execute as executeCatalogSkill,
+  fuzzyFind as catalogFuzzyFind,
+  listCatalog,
+  listForPrompt,
+} from "@/lib/skillCatalog";
 import { commitBrain, loadBrain } from "@/lib/brainStore";
 import { buildStudyNote } from "@/lib/noteBuilder";
 import { extractVideoId, fetchVideoTranscript, isYouTubeUrl } from "@/lib/youtube";
@@ -55,6 +62,43 @@ function ensureAdmin(): Promise<void> {
 function isLocalRequest(req: NextRequest): boolean {
   const host = req.headers.get("host") ?? "";
   return host.startsWith("localhost") || host.startsWith("127.0.0.1");
+}
+
+/** How to call the LLM chain for this request (which Gemini key, if any). */
+export type CloudOpts = { geminiKey?: string; skipGemini?: boolean };
+
+/** Executor contexts for catalog skills awaiting owner approval (safe:false). */
+const skillRunContexts = new Map<string, { slug: string; name: string; chatId: string }>();
+
+/** Dispatch a run-skill request: screen-learned skill wins, else SKILL.md catalog. */
+async function runSkillDispatch(
+  brain: AssistantBrain,
+  name: string,
+  baseUrl: string,
+  chatKey: string,
+  cloudOpts: CloudOpts,
+): Promise<{ reply: string; needsApproval?: { id: string; description: string } }> {
+  const screen = brain.findSkill(name);
+  if (screen) {
+    return { reply: await executeSkill(brain, screen.id, baseUrl) };
+  }
+  const cat = await catalogFuzzyFind(name);
+  if (cat) {
+    if (!cat.safe) {
+      const info = await createPending("run", { cmd: `skill:${cat.slug}`, chatId: chatKey });
+      skillRunContexts.set(info.id, { slug: cat.slug, name: cat.name, chatId: chatKey });
+      return {
+        reply: `Навык «${cat.name}» требует одобрения владельца.`,
+        needsApproval: { id: info.id, description: info.description },
+      };
+    }
+    const res = await executeCatalogSkill(cat, name, {
+      chatId: chatKey,
+      complete: (msgs) => completeCloud(msgs as Parameters<typeof completeCloud>[0], cloudOpts),
+    });
+    return { reply: res.reply };
+  }
+  return { reply: `Не нашёл навык «${name}». Скажите «какие уроки» — покажу список.` };
 }
 
 /** Pull the first JSON object out of a model reply; tolerate extra text. */
@@ -140,8 +184,13 @@ async function handleSearchAction(
   brain: AssistantBrain,
   action: { query: string; learn?: boolean },
   baseUrl: string,
+  cloudOpts: CloudOpts,
 ): Promise<string> {
-  const res = await fetchInternal(baseUrl, `/api/search?q=${encodeURIComponent(action.query)}`);
+  const res = await fetchInternal(baseUrl, `/api/search?q=${encodeURIComponent(action.query)}`, {
+    headers: cloudOpts.geminiKey
+      ? { "x-gemini-key": cloudOpts.geminiKey }
+      : { "x-skip-gemini": "1" },
+  });
   const data = (await res.json().catch(() => null)) as { answer?: string; sources?: string[] } | null;
   if (!res.ok || !data?.answer) {
     return `Не удалось найти информацию по запросу «${action.query}». Попробуйте иначе сформулировать.`;
@@ -198,7 +247,12 @@ async function executeHandledAction(
   brain: AssistantBrain,
   action: AssistantAction,
   baseUrl: string,
-): Promise<{ reply: string; image?: { b64: string; mime: string } }> {
+  ctx: { chatKey: string; cloudOpts: CloudOpts },
+): Promise<{
+  reply: string;
+  image?: { b64: string; mime: string };
+  needsApproval?: { id: string; description: string };
+}> {
   switch (action.kind) {
     case "launch": {
       if (action.url) {
@@ -214,11 +268,15 @@ async function executeHandledAction(
     }
 
     case "run-skill": {
-      return { reply: await executeSkill(brain, action.skillId, baseUrl) };
+      const dispatched = await runSkillDispatch(brain, action.skillId, baseUrl, ctx.chatKey, ctx.cloudOpts);
+      return {
+        reply: dispatched.reply,
+        ...(dispatched.needsApproval ? { needsApproval: dispatched.needsApproval } : {}),
+      };
     }
 
     case "search": {
-      return { reply: await handleSearchAction(brain, action, baseUrl) };
+      return { reply: await handleSearchAction(brain, action, baseUrl, ctx.cloudOpts) };
     }
 
     case "weather": {
@@ -275,9 +333,28 @@ export async function POST(req: NextRequest) {
   }
   await ensureAdmin();
   const chatId = typeof body?.chatId === "string" ? body.chatId : "";
+  const isOwner = body?.isOwner === true;
+  const chatKey = chatId || "anon";
+  const gemini: ResolveResult = await resolveKey(chatKey, isOwner);
+  const cloudOpts: CloudOpts = gemini.provider === "gemini" ? { geminiKey: gemini.key } : { skipGemini: true };
 
   // Admin control messages from the bot (approve/reject buttons).
   if (body?.action === "approve" && typeof body.id === "string") {
+    // Catalog skill awaiting owner approval: run its sandboxed executor.
+    const skillCtx = skillRunContexts.get(body.id);
+    if (skillCtx) {
+      skillRunContexts.delete(body.id);
+      await rejectPending(body.id).catch(() => {});
+      const cat = (await listCatalog()).find((s) => s.slug === skillCtx.slug);
+      if (!cat) return NextResponse.json({ reply: "Навык не найден." });
+      const g = await resolveKey(skillCtx.chatId, isOwner);
+      const opts: CloudOpts = g.provider === "gemini" ? { geminiKey: g.key } : { skipGemini: true };
+      const res = await executeCatalogSkill(cat, skillCtx.name, {
+        chatId: skillCtx.chatId,
+        complete: (msgs) => completeCloud(msgs as Parameters<typeof completeCloud>[0], opts),
+      });
+      return NextResponse.json({ reply: res.reply });
+    }
     const result = await approvePending(body.id);
     return NextResponse.json({ reply: result.reply });
   }
@@ -357,7 +434,11 @@ export async function POST(req: NextRequest) {
           title: pageTitle || undefined,
           url: outcome.action.url,
           isVideo,
-          complete: async (messages) => completeCloud(messages.map((m) => ({ role: m.role, content: m.content }))),
+          complete: async (messages) =>
+            completeCloud(
+              messages.map((m) => ({ role: m.role, content: m.content })),
+              cloudOpts,
+            ),
         });
         const existing = brain.findNoteBySource(outcome.action.url);
         if (existing) brain.forgetNote(existing.id);
@@ -374,25 +455,28 @@ export async function POST(req: NextRequest) {
         const reply = isVideo
           ? `Изучил видео (${(pageText.length / 1000).toFixed(1)} тыс. символов, ${chapterCount} ${chWord}): «${note.topic}».`
           : `Изучил: «${note.topic}».`;
-        return NextResponse.json({ reply, provider: null });
+        return NextResponse.json({ reply, provider: null, ...(gemini.note ? { note: gemini.note } : {}) });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        return NextResponse.json({ reply: `Не удалось изучить страницу: ${message}.`, provider: null });
+        return NextResponse.json({ reply: `Не удалось изучить страницу: ${message}.`, provider: null, ...(gemini.note ? { note: gemini.note } : {}) });
       }
     }
 
     // Real actions (launch / run-skill / weather / orb / search) — execute
     // and reply. Search+learn mutates the brain, so persist afterwards.
     if (outcome.action) {
-      const executed = await executeHandledAction(brain, outcome.action, baseUrl);
+      const executed = await executeHandledAction(brain, outcome.action, baseUrl, {
+        chatKey,
+        cloudOpts,
+      });
       await commitBrain(brain, baseIds);
       const reply = executed.image
         ? executed.reply || "Изображение готово."
         : executed.reply || outcome.reply;
-      return NextResponse.json({ reply, image: executed.image, provider: null });
+      return NextResponse.json({ reply, image: executed.image, provider: null, ...(executed.needsApproval ? { needsApproval: executed.needsApproval } : {}), ...(gemini.note ? { note: gemini.note } : {}) });
     }
 
-    return NextResponse.json({ reply: outcome.reply, provider: null });
+    return NextResponse.json({ reply: outcome.reply, provider: null, ...(gemini.note ? { note: gemini.note } : {}) });
   }
 
   // Capability query («навыки», «навык X», «чего тебе не хватает», «чему ты
@@ -407,7 +491,13 @@ export async function POST(req: NextRequest) {
   // history as context so follow-ups («сделай его сочнее») stay in topic.
   try {
     let k = 0;
-    const systemContent = brain.buildSystemPrompt(visibleText, { brief: body?.mode === "browser" }) + (await autonomySystemNote());
+    const catalogList = await listForPrompt();
+    const systemContent =
+      brain.buildSystemPrompt(visibleText, { brief: body?.mode === "browser" }) +
+      (catalogList
+        ? `\n\nВНЕШНИЕ НАВЫКИ (SKILL.md):\n${catalogList}\nЕсли запрос — работа с файлами/документами (PDF/XLSX/DOCX/PPTX), системный отчёт или стиль изображения — верни action {"type":"run-skill","skill":"<точное имя>"} для подходящего внешнего навыка.`
+        : "") +
+      (await autonomySystemNote());
     const messages = [
       { role: "system" as const, content: systemContent },
       ...history.map((h) => ({
@@ -416,7 +506,16 @@ export async function POST(req: NextRequest) {
       })),
       { role: "user" as const, content: visibleText },
     ];
-    const result = await completeCloud(messages);
+    let result: string;
+    try {
+      result = await completeCloud(messages, cloudOpts);
+    } catch (err) {
+      // Gemini quota hit → mark the key exhausted so the pool rotates/reports.
+      if (gemini.key && isQuotaError(err instanceof Error ? err.message : String(err))) {
+        await reportFailure(chatKey, gemini.key, isOwner);
+      }
+      throw err;
+    }
     const parsed = parseJSONObject(result);
 
     const reply =
@@ -431,6 +530,7 @@ export async function POST(req: NextRequest) {
     // LLM proposed an action.
     let image: { b64: string; mime: string } | undefined;
     let actionReply: string | undefined;
+    let needsApproval: { id: string; description: string } | undefined;
     if (parsed?.action && typeof parsed.action === "object") {
       const a = parsed.action as {
         type?: unknown;
@@ -444,10 +544,15 @@ export async function POST(req: NextRequest) {
       };
       if (a.type === "image" && typeof a.prompt === "string" && a.prompt.trim()) {
         try {
-          image = await generateImage(a.prompt.trim(), {
-            text: typeof a.text === "string" && a.text.trim() ? a.text.trim() : extractCaptionText(visibleText),
-            localTags,
-          });
+          image = await generateImage(
+            a.prompt.trim(),
+            {
+              text: typeof a.text === "string" && a.text.trim() ? a.text.trim() : extractCaptionText(visibleText),
+              localTags,
+              forceLocal: gemini.provider !== "gemini",
+            },
+            gemini.key,
+          );
           actionReply = "Изображение готово.";
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -482,6 +587,7 @@ export async function POST(req: NextRequest) {
           brain,
           { query: a.query.trim(), learn: a.learn === true },
           baseUrl,
+          cloudOpts,
         );
       } else if (a.type === "run-skill" && typeof a.skill === "string") {
         const skill = brain.findSkill(a.skill);
@@ -491,14 +597,15 @@ export async function POST(req: NextRequest) {
           await commitBrain(brain, baseIds);
           actionReply = await executeSkill(brain, skill.id, baseUrl);
         } else {
-          actionReply = `Не нашёл навык «${a.skill}». Скажите «какие уроки» — покажу список.`;
+          const dispatched = await runSkillDispatch(brain, a.skill, baseUrl, chatKey, cloudOpts);
+          actionReply = dispatched.reply;
+          if (dispatched.needsApproval) needsApproval = dispatched.needsApproval;
         }
       }
     }
 
     // LLM-admin (autonomy): read executes inline; changes require the owner's
     // explicit «да» via the Telegram bot (approve/reject buttons).
-    let needsApproval: { id: string; description: string } | undefined;
     const admin = (parsed?.admin ?? null) as
       | {
           action?: unknown;
@@ -568,6 +675,7 @@ export async function POST(req: NextRequest) {
       image,
       provider: "server",
       needsApproval,
+      ...(gemini.note ? { note: gemini.note } : {}),
     });
   } catch (err) {
     console.warn("[assistant] llm escalation failed:", err);
@@ -577,14 +685,19 @@ export async function POST(req: NextRequest) {
     const fallbackPrompt = extractImagePrompt(visibleText);
     if (fallbackPrompt) {
       try {
-        const image = await generateImage(fallbackPrompt, {
-          text: extractCaptionText(visibleText),
-          localTags,
-        });
-        return NextResponse.json({ reply: "Изображение готово.", image, provider: null });
+        const image = await generateImage(
+          fallbackPrompt,
+          {
+            text: extractCaptionText(visibleText),
+            localTags,
+            forceLocal: gemini.provider !== "gemini",
+          },
+          gemini.key,
+        );
+        return NextResponse.json({ reply: "Изображение готово.", image, provider: null, ...(gemini.note ? { note: gemini.note } : {}) });
       } catch (imgErr) {
         const message = imgErr instanceof Error ? imgErr.message : String(imgErr);
-        return NextResponse.json({ reply: `Не удалось сгенерировать изображение: ${message}.`, provider: null });
+        return NextResponse.json({ reply: `Не удалось сгенерировать изображение: ${message}.`, provider: null, ...(gemini.note ? { note: gemini.note } : {}) });
       }
     }
     return NextResponse.json({ reply: brain.unknownReply(), provider: null });

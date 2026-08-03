@@ -24,8 +24,16 @@ export async function GET(req: NextRequest) {
   if (!q || !q.trim()) {
     return NextResponse.json({ error: "bad query" }, { status: 400 });
   }
+  // The assistant core forwards the caller's Gemini key (or a skip marker)
+  // via headers so each Telegram user's quota is tracked, not the global one.
+  const geminiKey = req.headers.get("x-gemini-key") || undefined;
+  const skipGemini = req.headers.get("x-skip-gemini") === "1";
   try {
-    const { answer, sources } = await completeCloudWithSearch(q.trim());
+    if (skipGemini && !geminiKey) {
+      const { answer, sources } = await completeCloudWithSearch(q.trim(), undefined, true);
+      return NextResponse.json({ answer, sources });
+    }
+    const { answer, sources } = await completeCloudWithSearch(q.trim(), geminiKey);
     return NextResponse.json({ answer, sources });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

@@ -2,9 +2,9 @@
  * Server-side LLM calls for the /api/assistant core and the web-search flow.
  * Unlike the browser router (which proxies through /api/llm and can use
  * WebLLM/Ollama), this talks to providers directly with server-side keys.
- * Priority: Ollama (local, unlimited) → Gemini → Groq. OpenAI/DeepSeek keys
- * are currently unfunded, so they are left out of the chain (re-add them to
- * PROVIDERS once the accounts have a balance).
+ * Priority: Gemini (per-user key from the key pool) → Ollama (local, unlimited)
+ * → Groq. OpenAI/DeepSeek keys are currently unfunded, so they are left out
+ * of the chain (re-add them to PROVIDERS once the accounts have a balance).
  */
 
 import type { ChatMessage } from "./llm/types";
@@ -25,8 +25,8 @@ const MODELS: Record<string, string> = {
 };
 
 const PROVIDERS: Array<{ id: string; key?: string }> = [
-  { id: "ollama" },
   { id: "gemini", key: process.env.GEMINI_API_KEY },
+  { id: "ollama" },
   { id: "groq", key: process.env.GROQ_API_KEY },
 ];
 
@@ -128,12 +128,16 @@ async function callProvider(messages: ChatMessage[], p: { id: string; key?: stri
 }
 
 /** Best available model. Falls through providers until one answers. */
-export async function completeCloud(messages: ChatMessage[]): Promise<string> {
+export async function completeCloud(
+  messages: ChatMessage[],
+  opts?: { geminiKey?: string },
+): Promise<string> {
   let lastError: unknown = null;
   for (const p of PROVIDERS) {
-    if (p.id !== "ollama" && !p.key) continue;
+    const key = p.id === "gemini" ? opts?.geminiKey || p.key : p.key;
+    if (p.id !== "ollama" && !key) continue;
     try {
-      return await callProvider(messages, p);
+      return await callProvider(messages, { id: p.id, key });
     } catch (err) {
       lastError = err;
       console.warn(`[assistant] ${p.id} failed:`, err);
@@ -233,7 +237,7 @@ async function wikipediaSearch(query: string): Promise<GroundedAnswer> {
  * as grounding material, so answers come from live pages, not model weights.
  * Returns null when the server is down, blocked, or has nothing usable.
  */
-async function openSerpSearch(query: string): Promise<GroundedAnswer | null> {
+async function openSerpSearch(query: string, geminiKey?: string): Promise<GroundedAnswer | null> {
   const base = process.env.OPENSERP_BASE_URL?.trim() || "http://127.0.0.1:7000";
   const engine = process.env.OPENSERP_ENGINE?.trim() || "";
   const limit = Math.min(Math.max(Number(process.env.OPENSERP_LIMIT) || 8, 1), 20);
@@ -282,14 +286,17 @@ async function openSerpSearch(query: string): Promise<GroundedAnswer | null> {
     if (sources.length >= 5) break;
   }
   if (chunks.length === 0) return null;
-  const answer = await completeCloud([
-    {
-      role: "system",
-      content:
-        "Ты — поисковик с реальным доступом в интернет. Ниже — свежие материалы, найденные по запросу. Отвечай по-русски, кратко и по делу, опираясь ТОЛЬКО на эти материалы. Если материала недостаточно — честно это скажи, не выдумывай. На факты ссылайся на источник в квадратных скобках, например [1], [2].",
-    },
-    { role: "user", content: `Запрос: ${query}\n\nМатериалы:\n${chunks.join("\n\n---\n\n")}` },
-  ]);
+  const answer = await completeCloud(
+    [
+      {
+        role: "system",
+        content:
+          "Ты — поисковик с реальным доступом в интернет. Ниже — свежие материалы, найденные по запросу. Отвечай по-русски, кратко и по делу, опираясь ТОЛЬКО на эти материалы. Если материала недостаточно — честно это скажи, не выдумывай. На факты ссылайся на источник в квадратных скобках, например [1], [2].",
+      },
+      { role: "user", content: `Запрос: ${query}\n\nМатериалы:\n${chunks.join("\n\n---\n\n")}` },
+    ],
+    { geminiKey },
+  );
   return { answer, sources };
 }
 
@@ -300,8 +307,12 @@ async function openSerpSearch(query: string): Promise<GroundedAnswer | null> {
  * (keyless real-time, default http://127.0.0.1:7000), then the keyless
  * Wikipedia API, and finally model knowledge with an honesty caveat.
  */
-export async function completeCloudWithSearch(query: string): Promise<GroundedAnswer> {
-  const key = process.env.GEMINI_API_KEY;
+export async function completeCloudWithSearch(
+  query: string,
+  geminiKey?: string,
+  skipGemini?: boolean,
+): Promise<GroundedAnswer> {
+  const key = skipGemini ? "" : geminiKey || process.env.GEMINI_API_KEY;
   const configured = process.env.GEMINI_SEARCH_MODEL?.trim();
   const modelCandidates = [configured ?? "gemini-3.6-flash", "gemini-2.5-flash"].filter(
     (m): m is string => Boolean(m),
@@ -346,7 +357,7 @@ export async function completeCloudWithSearch(query: string): Promise<GroundedAn
     }
   }
   // Keyless real-time search via local OpenSERP before the Wikipedia fallback.
-  const serp = await openSerpSearch(query);
+  const serp = await openSerpSearch(query, geminiKey);
   if (serp) return serp;
   // Last-resort keyless fallback.
   try {
@@ -354,14 +365,17 @@ export async function completeCloudWithSearch(query: string): Promise<GroundedAn
   } catch {
     // Nothing browsable found — answer from model knowledge (cutoff warning).
     try {
-      const answer = await completeCloud([
-        {
-          role: "system",
-          content:
-            "Ты — поисковик без живого доступа в интернет. Отвечай по своим знаниям; если информация может быть неактуальной, честно это отметь. Отвечай по-русски, лаконично и по делу.",
-        },
-        { role: "user", content: query },
-      ]);
+      const answer = await completeCloud(
+        [
+          {
+            role: "system",
+            content:
+              "Ты — поисковик без живого доступа в интернет. Отвечай по своим знаниям; если информация может быть неактуальной, честно это отметь. Отвечай по-русски, лаконично и по делу.",
+          },
+          { role: "user", content: query },
+        ],
+        { geminiKey },
+      );
       return { answer, sources: [] };
     } catch {
       throw lastError ?? new Error("search failed");

@@ -288,6 +288,10 @@ function git(args) {
   });
 }
 
+/** Wrap a PowerShell snippet with UTF-8 output encoding (fixes cp866 mojibake). */
+const ps = (cmd) =>
+  `powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ${cmd}"`;
+
 async function waitForServer(port, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -304,7 +308,9 @@ async function waitForServer(port, timeoutMs) {
 
 async function killPort(port) {
   await runCmd(
-    `powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | Sort-Object -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }"`,
+    ps(
+      `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | Sort-Object -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }`,
+    ),
     { timeout: 30_000 },
   );
 }
@@ -407,7 +413,12 @@ async function chatWithAssistant(chatId, msg, text) {
     res = await fetch(`${SERVER}/api/assistant`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, history: hist.slice(0, -1).slice(-12), chatId: String(chatId) }),
+      body: JSON.stringify({
+        text,
+        history: hist.slice(0, -1).slice(-12),
+        chatId: String(chatId),
+        isOwner: isOwner(msg?.from),
+      }),
       signal: AbortSignal.timeout(180_000),
     });
   } catch (err) {
@@ -440,6 +451,7 @@ async function chatWithAssistant(chatId, msg, text) {
       reply_markup: kb,
     });
     audit({ action: "approval-prompt", id, description: desc });
+    if (data.note) await sendText(chatId, data.note);
     return;
   }
 
@@ -449,6 +461,7 @@ async function chatWithAssistant(chatId, msg, text) {
   const joined = parts.length === 0 ? "Выполнено." : parts.join("\n\n");
   await finishStatus(chatId, statusId, joined);
   if (data.image) await sendPhoto(chatId, data.image.b64, data.image.mime);
+  if (data.note) await sendText(chatId, data.note);
   hist.push({ role: "assistant", content: joined });
   if (hist.length > 16) hist.splice(0, hist.length - 16);
   histories.set(String(chatId), hist);
@@ -479,6 +492,8 @@ const HELP_HTML = [
   "<b>Команды</b>",
   "• /menu — главное меню",
   "• /help — справка",
+  "• /skills — список навыков",
+  "• /keys — статус Gemini-ключей",
   "• /id — ваш числовой id",
 ].join("\n");
 
@@ -532,7 +547,7 @@ function mainMenuKeyboard(owner) {
     [
       { text: "🔍 Поиск", callback_data: "cmd:/search" },
       { text: "🖼 Рисовать", callback_data: "cmd:/draw" },
-      { text: "🆔 Мой id", callback_data: "cmd:/id" },
+      { text: "🔑 Статус", callback_data: "cmd:/keys" },
     ],
   ];
   if (owner) {
@@ -554,6 +569,67 @@ async function sendMenu(chatId, owner) {
     parse_mode: "HTML",
     reply_markup: mainMenuKeyboard(owner),
   });
+}
+
+/** Real skill list: screen-learned + SKILL.md catalog (not an LLM reply). */
+async function renderSkills(chatId) {
+  let data;
+  try {
+    const res = await fetch(`${SERVER}/api/skills`, { signal: AbortSignal.timeout(15_000) });
+    data = await res.json().catch(() => null);
+    if (!res.ok || !data) throw new Error("bad response");
+  } catch {
+    await sendText(chatId, "Не удалось получить список навыков (сервер запущен?).");
+    return;
+  }
+  const screen = Array.isArray(data.screen) ? data.screen : [];
+  const catalog = Array.isArray(data.catalog) ? data.catalog : [];
+  const lines = ["📚 <b>Мои навыки</b>", ""];
+  if (screen.length > 0) {
+    lines.push("<b>Экранные (шаги)</b>");
+    for (const s of screen) {
+      lines.push(`• ${esc(s.name)} — ${s.steps} шаг., ${s.uses} использ.`);
+    }
+    lines.push("");
+  }
+  if (catalog.length > 0) {
+    lines.push("<b>Каталог (SKILL.md)</b>");
+    for (const c of catalog) {
+      lines.push(`• ${esc(c.name)} — ${esc(c.description)}`);
+    }
+    lines.push("");
+  }
+  if (screen.length === 0 && catalog.length === 0) lines.push("Навыков пока нет.");
+  lines.push("Чтобы выполнить — просто опишите задачу, например: <code>извлеки текст из файла.pdf</code>");
+  await sendHtml(chatId, lines.join("\n"));
+}
+
+/** Gemini key-pool status panel (owner + per-user). */
+async function renderKeys(chatId, owner) {
+  let st;
+  try {
+    const res = await fetch(`${SERVER}/api/keys`, { signal: AbortSignal.timeout(15_000) });
+    st = await res.json().catch(() => null);
+    if (!res.ok || !st) throw new Error("bad response");
+  } catch {
+    await sendText(chatId, "Не удалось получить статус ключей (сервер запущен?).");
+    return;
+  }
+  const lines = ["🔑 <b>Статус Gemini-ключей</b>", ""];
+  if (owner && Array.isArray(st.owner)) {
+    lines.push("<b>Владелец</b>");
+    for (const k of st.owner) {
+      lines.push(`• Ключ №${k.index}: ${k.exhausted ? "лимит исчерпан ⏳" : "активен ✅"}`);
+    }
+    lines.push("");
+  }
+  if (typeof st.usersFree === "number") {
+    lines.push(`<b>Пользователи</b>`);
+    lines.push(`• В пуле: ${st.usersFree} свободн., ${st.usersAssigned} выдано, ${st.usersExhausted} исчерпано`);
+  }
+  lines.push("");
+  lines.push("Лимиты сбрасываются в полночь по Тихоокеанскому времени.");
+  await sendHtml(chatId, lines.join("\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +742,11 @@ async function handleCommand(chatId, msg, cmd) {
       return;
     }
     case "/skills": {
-      await chatWithAssistant(chatId, msg, "какие у тебя навыки?");
+      await renderSkills(chatId);
+      return;
+    }
+    case "/keys": {
+      await renderKeys(chatId, owner);
       return;
     }
     case "/search": {
@@ -1006,7 +1086,9 @@ async function handleCommand(chatId, msg, cmd) {
     case "/sysinfo": {
       if (!requireOwner(chatId, owner)) return;
       const r = await runCmd(
-        `powershell -NoProfile -Command "$os=Get-CimInstance Win32_OperatingSystem; $cpu=Get-CimInstance Win32_Processor | Select-Object -First 1; $disk=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'; $gpu=Get-CimInstance Win32_VideoController | Select-Object -First 1; $up=(Get-Date)-$os.LastBootUpTime; Write-Output ('OS: '+$os.Caption); Write-Output ('Uptime: '+[math]::Round($up.TotalHours,1)+' h'); Write-Output ('CPU: '+$cpu.Name+' load '+$cpu.LoadPercentage+'%'); Write-Output ('RAM free: '+[math]::Round($os.FreePhysicalMemory/1MB,1)+' GB / '+[math]::Round($os.TotalVisibleMemorySize/1MB,1)+' GB'); $disk | ForEach-Object { Write-Output ('DISK '+$_.DeviceID+' free '+[math]::Round($_.FreeSpace/1GB,1)+' GB / '+[math]::Round($_.Size/1GB,1)+' GB') }; Write-Output ('GPU: '+$gpu.Name)"`,
+        ps(
+          `$os=Get-CimInstance Win32_OperatingSystem; $cpu=Get-CimInstance Win32_Processor | Select-Object -First 1; $disk=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'; $gpu=Get-CimInstance Win32_VideoController | Select-Object -First 1; $up=(Get-Date)-$os.LastBootUpTime; Write-Output ('OS: '+$os.Caption); Write-Output ('Uptime: '+[math]::Round($up.TotalHours,1)+' h'); Write-Output ('CPU: '+$cpu.Name+' load '+$cpu.LoadPercentage+'%'); Write-Output ('RAM free: '+[math]::Round($os.FreePhysicalMemory/1MB,1)+' GB / '+[math]::Round($os.TotalVisibleMemorySize/1MB,1)+' GB'); $disk | ForEach-Object { Write-Output ('DISK '+$_.DeviceID+' free '+[math]::Round($_.FreeSpace/1GB,1)+' GB / '+[math]::Round($_.Size/1GB,1)+' GB') }; Write-Output ('GPU: '+$gpu.Name)`,
+        ),
         { timeout: 60_000 },
       );
       await sendText(chatId, `📊 Система:\n${r.out}`);
@@ -1112,10 +1194,29 @@ async function tryNlAdmin(chatId, msg, text) {
   await typing(chatId);
   if (/свободное место|место на диске|сколько места|диск заполнен/.test(lower)) {
     const r = await runCmd(
-      `powershell -NoProfile -Command "$disk=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'; $disk | ForEach-Object { Write-Output ($_.DeviceID+' free '+[math]::Round($_.FreeSpace/1GB,1)+' GB / '+[math]::Round($_.Size/1GB,1)+' GB') }"`,
+      ps(
+        `$disk=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'; $disk | ForEach-Object { Write-Output ($_.DeviceID+' free '+[math]::Round($_.FreeSpace/1GB,1)+' GB / '+[math]::Round($_.Size/1GB,1)+' GB') }`,
+      ),
       { timeout: 60_000 },
     );
     await sendText(chatId, `💾 Место на диске:\n${r.out}`);
+    return true;
+  }
+  // «сколько место освободилось / сколько стало свободно» — реальный замер TEMP.
+  if (/сколько\s+(место|места|пространства)\s+(освободилось|освободил|осталось|свободно|стало)/.test(lower)) {
+    const before = await runCmd(
+      ps(
+        `$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ('TEMP: '+[math]::Round($s/1GB,2)+' GB')`,
+      ),
+      { timeout: 60_000 },
+    );
+    const disk = await runCmd(
+      ps(
+        `$d=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Select-Object -First 1; Write-Output ('DISK '+$d.DeviceID+' free '+[math]::Round($d.FreeSpace/1GB,1)+' GB / '+[math]::Round($d.Size/1GB,1)+' GB')`,
+      ),
+      { timeout: 60_000 },
+    );
+    await sendText(chatId, `${before.out.trim()}\n${disk.out.trim()}\n\nМогу очистить временные файлы: «очисти временные файлы».`);
     return true;
   }
   if (/статус системы|состояние системы|загрузка системы|статус пк|состояние пк/.test(lower)) {
@@ -1157,7 +1258,9 @@ async function tryNlAdmin(chatId, msg, text) {
     await sendText(chatId, "🔍 Осматриваю систему…");
     await handleCommand(chatId, msg, { name: "/sysinfo", rest: "" });
     const tmp = await runCmd(
-      `powershell -NoProfile -Command "$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ('TEMP: '+[math]::Round($s/1GB,2)+' GB')"`,
+      ps(
+        `$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ('TEMP: '+[math]::Round($s/1GB,2)+' GB')`,
+      ),
       { timeout: 60_000 },
     );
     await sendText(
@@ -1167,18 +1270,27 @@ async function tryNlAdmin(chatId, msg, text) {
     return true;
   }
   // «очисти временные файлы» — безопасная чистка TEMP (best-effort).
-  if (/очисти\s+временн|очистка\s+временн|почисти\s+(темп|временн)|чистка\s+темп|удали\s+временн/.test(lower)) {
+  // Ловим и «очишай», и «очисти темп/temp», и «почисть».
+  if (
+    /очи(ст|ш|сти|стить|щай|стить)\s+(временн|темп|temp)|почист(и|ь)\s+(временн|темп|temp)|чистк(а|ой)\s+темп|удали\s+временн/.test(lower)
+  ) {
     await sendText(chatId, "🧹 Чищу временные файлы…");
     const before = await runCmd(
-      `powershell -NoProfile -Command "$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ([math]::Round($s/1MB,1))"`,
+      ps(
+        `$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ([math]::Round($s/1MB,1))`,
+      ),
       { timeout: 60_000 },
     );
     const r = await runCmd(
-      `powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; Get-ChildItem $env:TEMP -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue"`,
+      ps(
+        `$ErrorActionPreference='SilentlyContinue'; Get-ChildItem $env:TEMP -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue`,
+      ),
       { timeout: 180_000 },
     );
     const after = await runCmd(
-      `powershell -NoProfile -Command "$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ([math]::Round($s/1MB,1))"`,
+      ps(
+        `$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ([math]::Round($s/1MB,1))`,
+      ),
       { timeout: 60_000 },
     );
     await sendText(

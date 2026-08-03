@@ -4,7 +4,8 @@
  *
  * Cascade:
  *   1. Gemini image model (gemini-3.1-flash-image) — best quality, but the
- *      free-tier quota is often exhausted.
+ *      free-tier quota is often exhausted. Skipped entirely when the request
+ *      carries hidden NSFW tags (localTags) — those go straight to ComfyUI.
  *   2. Local ComfyUI (SDXL-Turbo) — free and unlimited, runs on this machine.
  *   3. Pollinations.ai — keyless, registration-free fallback.
  */
@@ -24,6 +25,8 @@ export interface GenerateImageOptions {
   text?: string;
   /** Hidden EN tags injected ONLY into the local ComfyUI prompt. */
   localTags?: string[];
+  /** Skip the Gemini tier entirely (no usable per-user key / NSFW request). */
+  forceLocal?: boolean;
 }
 
 async function generateGemini(prompt: string, key: string): Promise<GeneratedImage> {
@@ -74,8 +77,16 @@ async function generatePollinations(prompt: string): Promise<GeneratedImage> {
   return { b64: buf.toString("base64"), mime };
 }
 
-export async function generateImage(prompt: string, opts?: GenerateImageOptions): Promise<GeneratedImage> {
-  const key = process.env.GEMINI_API_KEY;
+export async function generateImage(
+  prompt: string,
+  opts?: GenerateImageOptions,
+  geminiKey?: string,
+): Promise<GeneratedImage> {
+  // NSFW-tagged requests (hidden EN tags from the RU→EN sanitizer) are never
+  // sent to Gemini (it moderates) — they go straight to the local generator.
+  const hasLocalOnlyTags =
+    opts?.forceLocal === true || (Array.isArray(opts?.localTags) && opts!.localTags!.length > 0);
+  const key = hasLocalOnlyTags ? undefined : geminiKey || process.env.GEMINI_API_KEY;
   if (key) {
     try {
       return await generateGemini(prompt, key);
