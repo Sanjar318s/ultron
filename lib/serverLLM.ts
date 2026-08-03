@@ -64,6 +64,9 @@ async function callProvider(messages: ChatMessage[], p: { id: string; key?: stri
         messages: flat,
         stream: false,
         think: false,
+        // qwen3 sometimes ignores the "return strict JSON" instruction and
+        // answers conversationally — structured output forces valid JSON.
+        format: "json",
         options: { temperature: 0.3, num_predict: 2048 },
       }),
       signal: AbortSignal.timeout(120_000),

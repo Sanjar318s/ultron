@@ -5,17 +5,18 @@ import {
   AssistantBrain,
   extractImagePrompt,
   normalize,
+  snapshotIds,
   type AssistantAction,
   type BrainSnapshot,
   type LLMLearnItem,
   type Skill,
   type SkillStep,
-  type StudyNote,
 } from "@/lib/assistantBrain";
 import { useVoiceCommands } from "@/hooks/useVoiceCommands";
-import { createAssistantLLM, type AssistantLLM } from "@/lib/llm";
+import { createAssistantLLM } from "@/lib/llm";
 import { getWebLLMStatus, loadWebLLMEngine, type WebLLMStatus } from "@/lib/llm/webllm";
 import { ScreenLesson } from "@/lib/screenLearn";
+import { buildStudyNote } from "@/lib/noteBuilder";
 import type { ChatMessage, ProviderId } from "@/lib/llm/types";
 
 export interface AssistantMessage {
@@ -104,39 +105,6 @@ function parseLLMContent(content: string): { text: string; parsed?: LLMParsed } 
     }
   }
   return { text: trimmed };
-}
-
-/**
- * Ask the LLM to compress a web page's text into a StudyNote. The model
- * returns JSON {topic, summary, keyPoints}; the caller stores the note.
- */
-async function summarizeIntoNote(
-  text: string,
-  url: string,
-  title: string | undefined,
-  llm: AssistantLLM,
-): Promise<Omit<StudyNote, "id" | "learnedAt">> {
-  const system =
-    "Ты — аналитик. Сожми статью в структурированную заметку для личной базы знаний. " +
-    "Верни СТРОГО один JSON-объект без markdown: " +
-    '{"topic":"короткая тема (5–8 слов)","summary":"суть в 3–5 предложениях, пригодная для пересказа и генерации","keyPoints":["2–5 ключевых тезисов"]}';
-  const user = `Заголовок: ${title ?? ""}\nURL: ${url}\n\nТекст статьи:\n${text.slice(0, 30000)}`;
-  const result = await llm.router.complete([
-    { role: "system", content: system },
-    { role: "user", content: user },
-  ]);
-  const raw = parseLLMContent(result.content).parsed as
-    | (LLMParsed & { topic?: unknown; summary?: unknown; keyPoints?: unknown })
-    | undefined;
-  const fallbackTopic = (title ?? url).slice(0, 100);
-  const topic =
-    typeof raw?.topic === "string" && raw.topic.trim() ? raw.topic.trim().slice(0, 100) : fallbackTopic;
-  const summary =
-    typeof raw?.summary === "string" && raw.summary.trim() ? raw.summary.trim() : text.slice(0, 400);
-  const keyPoints = Array.isArray(raw?.keyPoints)
-    ? raw.keyPoints.filter((k): k is string => typeof k === "string" && k.trim() !== "").map((k) => k.trim().slice(0, 200))
-    : [];
-  return { topic, summary, keyPoints: keyPoints.slice(0, 5), source: url };
 }
 
 interface WeatherPayload {
@@ -334,8 +302,10 @@ export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantAp
   );
 
   /**
-   * «изучи <url>» — fetch a page, summarize it into a StudyNote, store it in
-   * the brain so generation can reuse the knowledge later.
+   * «изучи <url>» — fetch a page (or a YouTube video's transcript via
+   * /api/fetch), build a StudyNote with the LLM, store it in the brain so
+   * generation can reuse the knowledge later. Videos are chunked so EVERYTHING
+   * said is captured, not just the opening.
    */
   const handleLearnUrl = useCallback(
     async (url: string) => {
@@ -348,7 +318,12 @@ export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantAp
           speakRef.current(msg);
           return;
         }
-        const data = (await res.json()) as { title?: string; text?: string };
+        const data = (await res.json()) as {
+          title?: string;
+          text?: string;
+          isVideo?: boolean;
+          durationSec?: number | null;
+        };
         const text = data.text ?? "";
         if (!text) {
           const msg = "Страница пуста — нечего изучать.";
@@ -356,11 +331,36 @@ export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantAp
           speakRef.current(msg);
           return;
         }
-        push("ai", "Анализирую содержимое…");
-        const note = await summarizeIntoNote(text, url, data.title, llm);
-        brain.addNote(note);
+        if (data.isVideo) {
+          const mins = data.durationSec ? Math.round(data.durationSec / 60) : 0;
+          const status = mins > 0
+            ? `Анализирую видео (~${mins} мин, ${(text.length / 1000).toFixed(1)} тыс. символов)…`
+            : "Анализирую видео…";
+          push("ai", status);
+        } else {
+          push("ai", "Анализирую содержимое…");
+        }
+        const note = await buildStudyNote({
+          text,
+          title: data.title,
+          url,
+          isVideo: data.isVideo === true,
+          complete: async (messages) => {
+            const r = await llm.router.complete(messages.map((m) => ({ role: m.role, content: m.content })));
+            return r.content;
+          },
+        });
+        brain.addNote({
+          topic: note.topic,
+          summary: note.summary,
+          keyPoints: note.keyPoints,
+          source: url,
+          ...(data.isVideo ? { chapters: note.chapters, fullText: note.fullText } : {}),
+        });
         setLearnedCount(brain.memoryCount);
-        const msg = `Изучил: «${note.topic}».`;
+        const msg = data.isVideo
+          ? `Изучил видео: «${note.topic}» (${note.chapters?.length ?? 0} разделов, полный текст сохранён).`
+          : `Изучил: «${note.topic}».`;
         push("ai", msg);
         speakRef.current(msg);
       } catch (err) {
@@ -625,7 +625,7 @@ export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantAp
       push("ai", "Думаю…");
       try {
         const result = await llm.router.complete([
-          { role: "system", content: brain.buildSystemPrompt(trimmed) },
+          { role: "system", content: brain.buildSystemPrompt(trimmed, { brief: true }) },
           ...history,
           { role: "user", content: trimmed },
         ]);
@@ -799,50 +799,63 @@ export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantAp
     void llm.refresh();
   }, [llm]);
 
-  // Restore/back-up the durable brain copy on the server (survives
-  // localStorage clears). Rules:
-  //   - server has data && local is wiped      → restore local from server
-  //   - otherwise (incl. fresh upgrade)        → push local to server
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const res = await fetch("/api/brain");
-        if (!res.ok) return;
-        const data = (await res.json()) as { brain?: BrainSnapshot | null };
-        if (cancelled) return;
-        const serverHasContent =
-          !!data.brain &&
-          (data.brain.rules.length > 0 ||
-            data.brain.facts.length > 0 ||
-            data.brain.notes.length > 0 ||
-            data.brain.skills.length > 0 ||
-            data.brain.pcControl);
-        const localHasContent =
-          brain.ruleCount > 0 || brain.memoryCount > 0 || brain.skillList.length > 0 || brain.pcControlEnabled;
-
-        if (serverHasContent && localHasContent) {
-          // Both sides know something — merge (union), never clobber. Notes
-          // learned via Telegram live only on the server; local-only learning
-          // is kept too.
-          brain.mergeFrom(data.brain ?? null);
-          brain.forceSync();
-        } else if (serverHasContent && !localHasContent) {
-          brain.hydrate(data.brain ?? null);
-        } else if (!serverHasContent && localHasContent) {
-          brain.forceSync();
-        }
+  // One-way sync with the server brain (data/brain.json), the single source of
+  // truth shared with the Telegram bot. The browser pushes every local change
+  // immediately (save → PUT /api/brain) and pulls the server state back on
+  // mount, periodically and on tab focus — mirroring it wholesale so memory,
+  // skills and abilities are identical on both sides at all times.
+  const pullServer = useCallback(async (): Promise<void> => {
+    // A local change is still in flight — pulling now could clobber it.
+    if (brain.syncDirty) return;
+    try {
+      const res = await fetch("/api/brain");
+      if (!res.ok) return;
+      const data = (await res.json()) as { brain?: BrainSnapshot | null };
+      if (!data.brain || data.brain.version !== 1) return;
+      brain.setServerBase(snapshotIds(data.brain));
+      if (brain.mirrorKnowledge(data.brain)) {
+        // Persist the mirrored state locally + confirm it on disk.
+        brain.forceSync();
         setSkills(brain.skillList);
         setLearnedCount(brain.memoryCount);
         setPcControlState(brain.pcControlEnabled);
-      } catch {
-        // Server not running — keep whatever localStorage had.
       }
+    } catch {
+      // Server not running — keep whatever localStorage had.
+    }
+  }, [brain]);
+
+  // On mount: push local knowledge first (so the server never loses
+  // browser-only material), then pull the authoritative state back. This
+  // restores the local brain after a localStorage clear and keeps both brains
+  // aligned from the first second.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      brain.forceSync();
+      for (let i = 0; i < 20 && brain.syncDirty; i++) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      if (!cancelled) await pullServer();
     })();
     return () => {
       cancelled = true;
     };
-  }, [brain]);
+  }, [brain, pullServer]);
+
+  // Keep both brains in sync while the page is open: pull every 25s and on
+  // returning to the tab.
+  useEffect(() => {
+    const timer = window.setInterval(() => void pullServer(), 25_000);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void pullServer();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [pullServer]);
 
   return {
     supported: voice.supported,

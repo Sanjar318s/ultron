@@ -1,14 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import {
-  AssistantBrain,
   extractImagePrompt,
-  type BrainSnapshot,
-  type LLMLearnItem,
+  snapshotIds,
   type AssistantAction,
+  type AssistantBrain,
+  type LLMLearnItem,
 } from "@/lib/assistantBrain";
 import { completeCloud, completeWithProvider } from "@/lib/serverLLM";
+import { commitBrain, loadBrain } from "@/lib/brainStore";
+import { buildStudyNote } from "@/lib/noteBuilder";
+import { extractVideoId, fetchVideoTranscript, isYouTubeUrl } from "@/lib/youtube";
 import { generateImage } from "@/lib/generateImage";
 import { sanitizeTexts } from "@/lib/promptSanitizer";
 import {
@@ -31,21 +32,19 @@ import { launchApp, openViaShell, SAFE_URL } from "@/lib/launcher";
 /**
  * Server-side assistant core (LOCALHOST-only). The Telegram bot POSTs user
  * text here; this route runs the SAME brain + LLM pipeline as the browser,
- * against the durable brain.json on disk:
+ * against the durable brain.json on disk (lib/brainStore.ts):
  *
- *   1. load brain.json → hydrate AssistantBrain
+ *   1. load the latest brain from disk
  *   2. brain.process(text) — known rules/intents answer instantly
  *   3. unknown → completeCloud(buildSystemPrompt(query) + text)
  *   4. apply learn / run actions (learn-url, image, launch, run-skill, weather)
- *   5. persist brain.json, return { reply, generate?, image?, provider? }
+ *   5. commit brain.json with the lossless merge (concurrent browser + bot)
  *
  * This keeps the web UI and the Telegram bot on the same knowledge — and lets
  * the bot really execute PC actions, not just echo the intent.
  */
 
 export const runtime = "nodejs";
-
-const BRAIN_FILE = path.join(process.cwd(), "data", "brain.json");
 
 let adminReady: Promise<void> | null = null;
 function ensureAdmin(): Promise<void> {
@@ -56,23 +55,6 @@ function ensureAdmin(): Promise<void> {
 function isLocalRequest(req: NextRequest): boolean {
   const host = req.headers.get("host") ?? "";
   return host.startsWith("localhost") || host.startsWith("127.0.0.1");
-}
-
-async function loadBrain(): Promise<AssistantBrain> {
-  const brain = new AssistantBrain();
-  try {
-    const raw = await fs.readFile(BRAIN_FILE, "utf-8");
-    const snapshot = JSON.parse(raw) as BrainSnapshot;
-    brain.hydrate(snapshot);
-  } catch {
-    // No file yet — start with an empty brain.
-  }
-  return brain;
-}
-
-async function saveBrain(brain: AssistantBrain): Promise<void> {
-  await fs.mkdir(path.dirname(BRAIN_FILE), { recursive: true });
-  await fs.writeFile(BRAIN_FILE, JSON.stringify(brain.snapshot()), "utf-8");
 }
 
 /** Pull the first JSON object out of a model reply; tolerate extra text. */
@@ -329,80 +311,70 @@ export async function POST(req: NextRequest) {
   const baseUrl = `http://${req.headers.get("host") ?? "localhost:3000"}`;
 
   const brain = await loadBrain();
+  const baseIds = snapshotIds(brain.snapshot());
   const outcome = brain.process(text);
 
   // Brain resolved it locally (rule / intent / launch confirm).
   if (outcome.handled) {
-    await saveBrain(brain);
+    await commitBrain(brain, baseIds);
 
-    // Learn a URL server-side (Telegram path).
+    // Learn a URL server-side (Telegram path). YouTube links use the full
+    // transcript (chunked, everything said in the video); other pages get the
+    // usual page-text compression.
     if (outcome.action?.kind === "learn-url") {
       try {
-        const res = await fetch(outcome.action.url, {
-          signal: AbortSignal.timeout(30_000),
-          cache: "no-store",
-          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" },
-          redirect: "follow",
-        });
-        if (!res.ok) {
-          console.log("[learn-url] fetch fail", res.status, res.statusText, "url:", res.url, "req:", outcome.action.url);
-          throw new Error(`HTTP ${res.status}`);
-        }
-        const html = await res.text();
-        const pageTitle = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, " ").trim() || "";
-        const pageText = stripHtml(html).slice(0, 60_000);
-        const notePrompt = [
-          "Сожми текст в структурированную заметку для личной базы знаний. Отвечай СТРОГО одним JSON-объектом без markdown, без пояснений и без обёрток:",
-          '{"topic":"короткая тема (5–8 слов)","summary":"суть в 3–5 предложениях","keyPoints":["2–5 тезисов"]}',
-          `Текст:\n${pageText}`,
-        ].join("\n\n");
-        let summary: string;
-        let parsed = null;
-        try {
-          summary = await completeCloud([
-            { role: "system", content: "Ты — аналитик-резюмёр. Твой ответ всегда один JSON-объект и ничего больше." },
-            { role: "user", content: notePrompt },
-          ]);
-          parsed = parseJSONObject(summary);
-          if (!parsed) {
-            summary = await completeCloud([
-              { role: "system", content: "Ты — аналитик-резюмёр. Твой ответ всегда один JSON-объект и ничего больше." },
-              { role: "user", content: `Сожми текст в заметку: {"topic":"5–8 слов","summary":"3–5 предложений","keyPoints":["тезисы"]}\n\n${pageText.slice(0, 20_000)}` },
-            ]);
-            parsed = parseJSONObject(summary);
+        let pageText = "";
+        let pageTitle = "";
+        let isVideo = false;
+        let durationSec: number | undefined;
+        const videoId = isYouTubeUrl(outcome.action.url) ? extractVideoId(outcome.action.url) : null;
+        if (videoId) {
+          const tr = await fetchVideoTranscript(videoId).catch(() => null);
+          if (tr && tr.transcript.trim().length >= 40) {
+            pageText = tr.transcript;
+            pageTitle = tr.title ?? "";
+            isVideo = true;
+            durationSec = tr.durationSec;
           }
-        } catch {
-          parsed = null;
         }
-        // Deterministic fallback when the model won't emit JSON: build the note
-        // from the page title + first meaningful sentences (works for code
-        // files whose header comment is prose, and for wiki lead paragraphs).
-        if (!parsed) {
-          const junk = /^(jump to|main menu|navigation|search|wikipedia|contents|current events|random article|help|tools|pages|views|what links|the article|image|from wikipedia)/i;
-          const sentences = pageText
-            .split(/(?<=[.!?])\s+/)
-            .map((s) => s.trim())
-            .filter((s) => s.length >= 50 && s.length <= 600 && !junk.test(s));
-          let topic = pageTitle.replace(/\s*-\s*Wikipedia$/i, "").trim();
-          if (!topic || /^https?:/i.test(topic)) topic = (sentences[0] || "").split(/[.!?]/)[0].slice(0, 100) || outcome.action.url.slice(0, 100);
-          const summary = sentences[0] || pageText.slice(0, 400);
-          const keyPoints = sentences.slice(1, 5).map((s) => s.slice(0, 200));
-          parsed = { topic: topic.slice(0, 100), summary, keyPoints };
+        if (!isVideo) {
+          const res = await fetch(outcome.action.url, {
+            signal: AbortSignal.timeout(30_000),
+            cache: "no-store",
+            headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" },
+            redirect: "follow",
+          });
+          if (!res.ok) {
+            console.log("[learn-url] fetch fail", res.status, res.statusText, "url:", res.url, "req:", outcome.action.url);
+            throw new Error(`HTTP ${res.status}`);
+          }
+          const html = await res.text();
+          pageTitle = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, " ").trim() || "";
+          pageText = stripHtml(html);
         }
-        const topic =
-          typeof parsed?.topic === "string" && parsed.topic.trim()
-            ? parsed.topic.trim().slice(0, 100)
-            : outcome.action.url.slice(0, 100);
-        const noteSummary =
-          typeof parsed?.summary === "string" && parsed.summary.trim() ? parsed.summary.trim() : pageText.slice(0, 400);
-        const keyPoints = Array.isArray(parsed?.keyPoints)
-          ? parsed.keyPoints.filter((k): k is string => typeof k === "string").map((k) => k.trim().slice(0, 200))
-          : [];
+        const note = await buildStudyNote({
+          text: pageText.slice(0, 400_000),
+          title: pageTitle || undefined,
+          url: outcome.action.url,
+          isVideo,
+          complete: async (messages) => completeCloud(messages.map((m) => ({ role: m.role, content: m.content }))),
+        });
         const existing = brain.findNoteBySource(outcome.action.url);
         if (existing) brain.forgetNote(existing.id);
-        brain.addNote({ topic, summary: noteSummary, keyPoints: keyPoints.slice(0, 5), source: outcome.action.url });
-        await saveBrain(brain);
-        return NextResponse.json({ reply: `Изучил: «${topic}».`, provider: null });
+        brain.addNote({
+          topic: note.topic,
+          summary: note.summary,
+          keyPoints: note.keyPoints,
+          source: outcome.action.url,
+          ...(isVideo ? { chapters: note.chapters, fullText: note.fullText } : {}),
+        });
+        await commitBrain(brain, baseIds);
+        const chapterCount = note.chapters?.length ?? 0;
+        const chWord = chapterCount === 1 ? "раздел" : chapterCount >= 2 && chapterCount <= 4 ? "раздела" : "разделов";
+        const reply = isVideo
+          ? `Изучил видео (${(pageText.length / 1000).toFixed(1)} тыс. символов, ${chapterCount} ${chWord}): «${note.topic}».`
+          : `Изучил: «${note.topic}».`;
+        return NextResponse.json({ reply, provider: null });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return NextResponse.json({ reply: `Не удалось изучить страницу: ${message}.`, provider: null });
@@ -413,7 +385,7 @@ export async function POST(req: NextRequest) {
     // and reply. Search+learn mutates the brain, so persist afterwards.
     if (outcome.action) {
       const executed = await executeHandledAction(brain, outcome.action, baseUrl);
-      await saveBrain(brain);
+      await commitBrain(brain, baseIds);
       const reply = executed.image
         ? executed.reply || "Изображение готово."
         : executed.reply || outcome.reply;
@@ -427,7 +399,7 @@ export async function POST(req: NextRequest) {
   // научился») — run the LLM analysis (or reuse the cache), persist, answer.
   if (outcome.needsAbilityAnalysis) {
     const reply = await answerAbilityQuery(brain, outcome.abilityQuery ?? "list", outcome.abilityName);
-    await saveBrain(brain);
+    await commitBrain(brain, baseIds);
     return NextResponse.json({ reply, provider: null });
   }
 
@@ -435,7 +407,7 @@ export async function POST(req: NextRequest) {
   // history as context so follow-ups («сделай его сочнее») stay in topic.
   try {
     let k = 0;
-    const systemContent = brain.buildSystemPrompt(visibleText) + (await autonomySystemNote());
+    const systemContent = brain.buildSystemPrompt(visibleText, { brief: body?.mode === "browser" }) + (await autonomySystemNote());
     const messages = [
       { role: "system" as const, content: systemContent },
       ...history.map((h) => ({
@@ -516,7 +488,7 @@ export async function POST(req: NextRequest) {
         if (skill) {
           skill.uses += 1;
           skill.lastUsedAt = Date.now();
-          await saveBrain(brain);
+          await commitBrain(brain, baseIds);
           actionReply = await executeSkill(brain, skill.id, baseUrl);
         } else {
           actionReply = `Не нашёл навык «${a.skill}». Скажите «какие уроки» — покажу список.`;
@@ -589,7 +561,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    await saveBrain(brain);
+    await commitBrain(brain, baseIds);
     return NextResponse.json({
       reply: actionReply ?? finalReply,
       generate,
@@ -599,7 +571,7 @@ export async function POST(req: NextRequest) {
     });
   } catch (err) {
     console.warn("[assistant] llm escalation failed:", err);
-    await saveBrain(brain);
+    await commitBrain(brain, baseIds);
     // All models down but the phrase was an explicit image request → fall
     // back to the keyless generator so «нарисуй …» still works.
     const fallbackPrompt = extractImagePrompt(visibleText);

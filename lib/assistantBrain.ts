@@ -118,6 +118,10 @@ export interface StudyNote {
   learnedAt: number;
   /** Where the note came from (URL, screen lesson, pasted text…). */
   source?: string;
+  /** Per-part chapter summaries for long content (videos). */
+  chapters?: { title: string; summary: string; atSec?: number }[];
+  /** Full source text (e.g. a video transcript) for deep recall. */
+  fullText?: string;
 }
 
 export interface BrainStats {
@@ -176,6 +180,28 @@ export interface BrainSnapshot {
   abilities?: AbilityResult[];
   abilityAnalyzedAt?: number;
   abilityHash?: number;
+}
+
+/**
+ * Identity set of a snapshot — the sync protocol's "base". Lets the server tell
+ * "an item I never saw (new, merge it in)" from "an item I deliberately
+ * removed (don't resurrect it)" when a writer pushes its full state.
+ */
+export interface BrainIdSet {
+  rules: string[];
+  notes: string[];
+  skills: string[];
+  facts: string[];
+}
+
+/** Extract the identity set of a snapshot (rules/notes/skills by id, facts by string). */
+export function snapshotIds(snapshot: BrainSnapshot): BrainIdSet {
+  return {
+    rules: snapshot.rules.map((r) => r.id),
+    notes: snapshot.notes.map((n) => n.id),
+    skills: snapshot.skills.map((s) => s.id),
+    facts: [...snapshot.facts],
+  };
 }
 
 const STORAGE_KEY = "ultron.brain.v1";
@@ -509,8 +535,53 @@ export class AssistantBrain {
   teachMode = false;
   /** Set by the UI while a screen lesson is being recorded. */
   lessonActive = false;
+  /** Ids of the last server state this brain observed (sync-protocol base). */
+  serverBaseIds: BrainIdSet | null = null;
+  /** Number of in-flight server pushes; >0 means local is ahead of the server. */
+  pendingPuts = 0;
+
+  /** Record which server state this brain last saw (called after a /api/brain GET). */
+  setServerBase(ids: BrainIdSet | null): void {
+    this.serverBaseIds = ids;
+  }
+
+  /** True while a local change hasn't been pushed to the server yet. */
+  get syncDirty(): boolean {
+    return this.pendingPuts > 0;
+  }
+
+  /**
+   * Ids/strings the server dropped during a mirror that the browser still had
+   * locally (e.g. the Telegram bot forgot them). They are excluded from pushes
+   * so a stale full-state push can't resurrect something the other side
+   * deliberately removed. Persisted so the protection survives a reload.
+   */
+  private dropped = new Set<string>();
+  private static DROPPED_KEY = "ultron.brain.dropped.v1";
+
+  private loadDropped(): void {
+    if (typeof localStorage === "undefined") return;
+    try {
+      const raw = localStorage.getItem(AssistantBrain.DROPPED_KEY);
+      if (!raw) return;
+      for (const k of JSON.parse(raw) as string[]) this.dropped.add(k);
+    } catch {
+      // Ignore corrupt/absent marker.
+    }
+  }
+
+  private persistDropped(): void {
+    if (typeof localStorage === "undefined") return;
+    try {
+      if (this.dropped.size === 0) localStorage.removeItem(AssistantBrain.DROPPED_KEY);
+      else localStorage.setItem(AssistantBrain.DROPPED_KEY, JSON.stringify([...this.dropped].slice(-1000)));
+    } catch {
+      // Private mode / quota — the marker just won't survive reloads.
+    }
+  }
 
   constructor() {
+    this.loadDropped();
     const saved = loadPersisted();
     if (saved) {
       this.stats = saved.stats;
@@ -574,7 +645,8 @@ export class AssistantBrain {
     };
   }
 
-  /** Replace the brain contents from a snapshot (server restore). */
+  /** Replace the brain contents from a snapshot (server restore). Does NOT
+   *  save — callers decide (server loads shouldn't trigger writes). */
   hydrate(snapshot: BrainSnapshot | null): void {
     if (!snapshot || snapshot.version !== 1) return;
     this.stats = { ...EMPTY_STATS, ...snapshot.stats };
@@ -589,7 +661,56 @@ export class AssistantBrain {
       Array.isArray(snapshot.abilities) && typeof snapshot.abilityHash === "number"
         ? { at: snapshot.abilityAnalyzedAt ?? Date.now(), hash: snapshot.abilityHash, skills: snapshot.abilities }
         : null;
-    this.save();
+  }
+
+  /**
+   * Adopt another brain's knowledge wholesale (the server is authoritative):
+   * rules/facts/skills/notes/pcControl are replaced, the ability analysis keeps
+   * the fresher of the two, stats merge by max. Returns true when the knowledge
+   * actually changed. Does NOT save — the caller persists.
+   */
+  mirrorKnowledge(snapshot: BrainSnapshot | null): boolean {
+    if (!snapshot || snapshot.version !== 1) return false;
+    const before = this.knowledgeHash();
+    const beforeRules = new Set(this.rules.map((r) => r.id));
+    const beforeNotes = new Set(this.notes.map((n) => n.id));
+    const beforeSkills = new Set(this.skills.map((s) => s.id));
+    const beforeFacts = new Set(this.facts);
+    this.rules = Array.isArray(snapshot.rules) ? snapshot.rules.map((r) => ({ ...r })) : [];
+    this.facts = Array.isArray(snapshot.facts) ? [...snapshot.facts] : [];
+    this.skills = Array.isArray(snapshot.skills)
+      ? snapshot.skills.map((s) => ({ ...s, steps: s.steps.map((st) => ({ ...st, params: { ...st.params } })) }))
+      : [];
+    this.notes = Array.isArray(snapshot.notes)
+      ? snapshot.notes.map((n) => ({ ...n, keyPoints: [...(n.keyPoints ?? [])] }))
+      : [];
+    this.pcControl = snapshot.pcControl === true;
+    // Remember what the server dropped so a stale full-state push can't bring
+    // it back; forget the marker once the server has it again.
+    const afterRules = new Set(this.rules.map((r) => r.id));
+    const afterNotes = new Set(this.notes.map((n) => n.id));
+    const afterSkills = new Set(this.skills.map((s) => s.id));
+    const afterFacts = new Set(this.facts);
+    for (const id of beforeRules) if (!afterRules.has(id)) this.dropped.add(`r:${id}`);
+    for (const id of beforeNotes) if (!afterNotes.has(id)) this.dropped.add(`n:${id}`);
+    for (const id of beforeSkills) if (!afterSkills.has(id)) this.dropped.add(`s:${id}`);
+    for (const f of beforeFacts) if (!afterFacts.has(f)) this.dropped.add(`f:${f}`);
+    for (const id of afterRules) this.dropped.delete(`r:${id}`);
+    for (const id of afterNotes) this.dropped.delete(`n:${id}`);
+    for (const id of afterSkills) this.dropped.delete(`s:${id}`);
+    for (const f of afterFacts) this.dropped.delete(`f:${f}`);
+    this.persistDropped();
+    const remoteAnalysis =
+      Array.isArray(snapshot.abilities) && typeof snapshot.abilityHash === "number"
+        ? { at: snapshot.abilityAnalyzedAt ?? Date.now(), hash: snapshot.abilityHash, skills: snapshot.abilities }
+        : null;
+    if (remoteAnalysis && (!this.abilityAnalysis || remoteAnalysis.at >= this.abilityAnalysis.at)) {
+      this.abilityAnalysis = remoteAnalysis;
+    }
+    this.stats.interactions = Math.max(this.stats.interactions, snapshot.stats.interactions);
+    this.stats.learnedTotal = Math.max(this.stats.learnedTotal, snapshot.stats.learnedTotal);
+    this.stats.forgotten = Math.max(this.stats.forgotten, snapshot.stats.forgotten);
+    return this.knowledgeHash() !== before;
   }
 
   /** Push the current brain to the server without changing anything locally. */
@@ -760,7 +881,8 @@ export class AssistantBrain {
     const q = normalize(query);
     const qTokens = q ? q.split(" ").filter((t) => t.length > 2) : [];
     const scored = this.notes.map((n) => {
-      const haystack = normalize(`${n.topic} ${n.summary} ${n.keyPoints.join(" ")}`);
+      const chaptersText = n.chapters ? n.chapters.map((c) => `${c.title} ${c.summary}`).join(" ") : "";
+      const haystack = normalize(`${n.topic} ${n.summary} ${n.keyPoints.join(" ")} ${chaptersText}`);
       let score = 0;
       if (q && (haystack.includes(q) || q.includes(haystack))) score = 0.9;
       const nTokens = haystack.split(" ").filter((t) => t.length > 2);
@@ -981,8 +1103,11 @@ export class AssistantBrain {
    * System prompt describing the assistant's identity, skills, memory and the
    * relevant knowledge notes. `query` is the user's current request — it's
    * used to retrieve the most relevant notes via retrieveKnowledge().
+   *
+   * `opts.brief` shortens the reply style (the browser's voice assistant —
+   * short answers read aloud quickly). The Telegram bot keeps full answers.
    */
-  buildSystemPrompt(query?: string): string {
+  buildSystemPrompt(query?: string, opts?: { brief?: boolean }): string {
     const rules =
       this.rules.length > 0
         ? this.rules.map((r) => `- «${r.trigger}» → ${r.action ? `действие «${describeAction(r.action)}»` : `ответ: ${r.reply ?? ""}`}`).join("\n")
@@ -995,7 +1120,12 @@ export class AssistantBrain {
     const notes =
       this.notes.length > 0
         ? this.retrieveKnowledge(query ?? "")
-            .map((n) => `- «${n.topic}»: ${n.summary}${n.keyPoints.length > 0 ? ` (ключевое: ${n.keyPoints.join("; ")})` : ""}`)
+            .map(
+              (n) =>
+                `- «${n.topic}»: ${n.summary}${n.keyPoints.length > 0 ? ` (ключевое: ${n.keyPoints.join("; ")})` : ""}${
+                  n.chapters && n.chapters.length > 0 ? `\n  Разделы: ${n.chapters.map((c) => c.title).join(" | ")}` : ""
+                }`,
+            )
             .join("\n")
         : "- (изученных материалов пока нет)";
     return [
@@ -1014,6 +1144,11 @@ export class AssistantBrain {
       "Известные факты о пользователе:\n" + facts,
       "Изученные материалы (релевантно к вопросу):\n" + notes,
       "Если пользователь явно просит что-то запомнить — верни это в learn. Если просит выполнить действие — верни action. Если хочет выучить новую команду — верни command в learn.",
+      ...(opts?.brief
+        ? [
+            "КРАТКО: это голосовой интерфейс — отвечай в reply ОЧЕНЬ коротко, 1–2 предложения, без воды и перечислений. Подробности или длинный текст — только по явной просьбе пользователя (тогда в поле generate).",
+          ]
+        : []),
       "Отвечай СТРОГО одним JSON-объектом без markdown и пояснений: {\"reply\": \"твой ответ\", \"generate\": null | \"полный длинный текст при запросе на генерацию\", \"action\": null | строка | {\"type\":\"launch\",\"app\":\"...\"} | {\"type\":\"weather\",\"city\":\"...\"} | {\"type\":\"run-skill\",\"skill\":\"...\"} | {\"type\":\"image\",\"prompt\":\"...\",\"text\": null | \"подпись на картинке\"}, \"learn\": [{\"type\":\"fact\",\"text\":\"...\"}] | [{\"type\":\"command\",\"trigger\":\"фраза\",\"response\":\"ответ\",\"action\": null | строка}]}",
     ].join("\n\n");
   }
@@ -1581,13 +1716,27 @@ export class AssistantBrain {
     } catch {
       // Private mode / quota exceeded — evolution just won't persist locally.
     }
-    // Best-effort durable copy on disk (survives localStorage clears).
+    // Best-effort durable copy on disk (survives localStorage clears). The base
+    // id-set tells the server which items we've already seen; the dropped set
+    // keeps a stale push from resurrecting knowledge the server removed.
+    const pushed: BrainSnapshot = {
+      ...payload,
+      rules: payload.rules.filter((r) => !this.dropped.has(`r:${r.id}`)),
+      facts: payload.facts.filter((f) => !this.dropped.has(`f:${f}`)),
+      skills: payload.skills.filter((s) => !this.dropped.has(`s:${s.id}`)),
+      notes: payload.notes.filter((n) => !this.dropped.has(`n:${n.id}`)),
+    };
+    this.pendingPuts += 1;
     void fetch("/api/brain", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ brain: payload }),
-    }).catch(() => {
-      // Server not reachable / not running — localStorage is the fallback.
-    });
+      body: JSON.stringify({ brain: pushed, base: this.serverBaseIds }),
+    })
+      .catch(() => {
+        // Server not reachable / not running — localStorage is the fallback.
+      })
+      .finally(() => {
+        this.pendingPuts -= 1;
+      });
   }
 }

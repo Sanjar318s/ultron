@@ -94,18 +94,56 @@ On top of the orb there is a voice/text assistant with its own architecture
 - **`lib/assistantBrain.ts`** — pure client-side "brain": rule/fact/skill/note
   storage, intent parsing (`parseAction`, `matchBuiltin`, weather intent,
   search/learn extraction), and `extractImagePrompt` (last-resort image fallback).
-  Works in both the browser and the Node server. Persists to `data/brain.json`
-  via `/api/brain` (server) and localStorage (browser), merged on save.
+  Works in both the browser and the Node server. Persists to localStorage
+  (browser) and mirrors a durable server copy. It tracks `serverBaseIds` (the
+  last server state it saw) and a persisted `dropped` id-set (items the server
+  removed that a stale full-state push must not resurrect); `save()` pushes
+  `{ brain, base }` to `/api/brain` and bumps `pendingPuts` (→ `syncDirty`).
+  `mirrorKnowledge(snapshot)` wholesale-adopts the server state without
+  re-saving (used by the browser's 25s live-sync poll) and maintains `dropped`.
+  `buildSystemPrompt(query, { brief })` — `brief: true` shortens the reply style
+  (the browser's voice assistant reads short answers aloud; the Telegram bot
+  keeps full answers).
+- **`lib/noteBuilder.ts`** — turns raw page text or a YouTube transcript into a
+  StudyNote. Framework-agnostic: callers inject their own LLM via `complete`.
+  Videos are split into ~8k-char, sentence-aware chunks (`chunkText`); each chunk
+  becomes a `chapter` (`{title, summary}` via a JSON-summarizer with up to 3
+  retries) and a final pass builds the global note — so EVERYTHING said in the
+  video is captured in `chapters` + `fullText` (≤260k), not just the opening.
+  Chunk size is 8k on purpose: qwen3's forced-JSON mode reliably returns
+  `{"title","summary"}` at 8k but falls back to a canned `{"status","data"}`
+  schema at ~12k. Regular pages use a single compression pass + `fallbackNote`.
+- **`lib/youtube.ts`** — keyless YouTube transcript extraction. Strategy order:
+  (1) **yt-dlp** if installed — binary found via `YTDLP_BIN` env, common paths
+  (`C:\Tools\yt-dlp\yt-dlp.exe`, PATH); runs with rotated player clients
+  (`youtube:player_client=default,android_vr,web_embedded,tv,ios,mweb,...`) to
+  dodge bot checks, `--write-auto-subs --write-subs --sub-langs ru,en`, then
+  parses the VTT files (prefers ru manual → ru auto → en → any). (2) a keyless
+  native flow: mobile watch page → `ytInitialPlayerResponse` balanced-brace
+  scan → best caption track → timedtext `fmt=json`. (3) a youtubei/v1/player
+  fallback. Some networks (flagged IPs, datacenter) return empty timedtext — on
+  this machine only yt-dlp works. yt-dlp was installed to `C:\Tools\yt-dlp\`
+  via aria2 (GitHub latest release).
+- **`lib/brainStore.ts`** — server-side durable store for `data/brain.json`
+  (the single source of truth): serialized write queue, `loadBrain()`,
+  `readBrainSnapshot()`, and `commitBrain(updated, base)`. `commitBrain`
+  merges only the deltas the writer hasn't seen yet, keeps the freshest
+  `abilityAnalysis`, and maintains short-TTL (2 min, in-memory) tombstones for
+  recently-deleted ids so a stale other writer can't resurrect them. Used by
+  `/api/brain` and `/api/assistant` (both routes hold a shared brain instance).
 - **`hooks/useVoiceAssistant.ts`** — the only React hook. Owns the local LLM
   router (`lib/llm`), speech recognition/synthesis, and the image pipeline.
 - **`app/api/assistant/route.ts`** — server core for the Telegram bot
-  (`scripts/telegram-bot.mjs`). Accepts `{ text, history?, chatId? }`; history is
-  owned by the caller (the bot keeps a per-chat queue of the last ~16 turns) and
-  is injected into the LLM escalation so follow-ups like «сделай его сочнее» stay
-  in topic. Also handles admin-control messages (`{ action: "approve"|"reject" }`)
-  from the bot and the LLM's autonomous `admin` JSON actions. Sanitizes RU
-  "restricted" vocabulary out of the LLM-visible text (via `promptSanitizer`),
-  re-injecting the hidden EN tags only into the local ComfyUI tier.
+  (`scripts/telegram-bot.mjs`). Accepts `{ text, history?, chatId?, mode? }`;
+  `mode: "browser"` makes the route build a brief system prompt (short spoken
+  answers for the browser's voice assistant — see `buildSystemPrompt`). history
+  is owned by the caller (the bot keeps a per-chat queue of the last ~16 turns)
+  and is injected into the LLM escalation so follow-ups like «сделай его сочнее»
+  stay in topic. Also handles admin-control messages
+  (`{ action: "approve"|"reject" }`) from the bot and the LLM's autonomous
+  `admin` JSON actions. Sanitizes RU "restricted" vocabulary out of the
+  LLM-visible text (via `promptSanitizer`), re-injecting the hidden EN tags only
+  into the local ComfyUI tier.
 - **`lib/promptSanitizer.ts`** — RU→EN sanitizer. `sanitize`/`sanitizeTexts` strip
   restricted RU phrases from the LLM-visible text and collect English tags
   (`nude`, `breasts`, `doggystyle`, …); `composeFullPrompt` appends those tags
@@ -138,8 +176,10 @@ On top of the orb there is a voice/text assistant with its own architecture
   `["ollama", "gemini", "groq", "webllm"]` (`lib/llm/router.ts`); server order
   `[ollama, gemini, groq]` (`lib/serverLLM.ts`). OpenAI/DeepSeek are excluded —
   their keys are unfunded. Ollama MUST use the native `/api/chat` endpoint with
-  `think: false`: qwen3's thinking mode burns the whole token budget via the
-  OpenAI-compat endpoint and returns empty content.
+  `think: false` and `format: "json"`: qwen3's thinking mode burns the whole
+  token budget via the OpenAI-compat endpoint and returns empty content, and
+  forced-JSON needs `format: "json"` (a plain prompt alone drifts off-schema at
+  long contexts).
 - **Web search (real-time, local-first):** `app/api/search/route.ts` →
   `completeCloudWithSearch` (`lib/serverLLM.ts`). Chain: Gemini Grounding
   (best; needs billing — free keys hit 429, and `gemini-2.5-flash` is
@@ -168,6 +208,8 @@ On top of the orb there is a voice/text assistant with its own architecture
 - **Setup:** `node scripts/setup-local.mjs` installs Ollama + qwen3:8b and
   downloads/installs ComfyUI + RealVisXL V5.0 fp16 + 4x-UltraSharp
   (`C:\ComfyUI`). Start ComfyUI with `run_nvidia_gpu.bat`.
+  - yt-dlp (for YouTube transcripts, `lib/youtube.ts`) is installed to
+    `C:\Tools\yt-dlp\yt-dlp.exe` — override with `YTDLP_BIN`.
   - Downloads use `aria2` (GitHub) and `scripts/download-parallel.mjs`
     (HuggingFace). HF's xet-bridge signs each URL for one range — a single
     large range (or aria2's multi-range) hangs/403s, so the HF downloader

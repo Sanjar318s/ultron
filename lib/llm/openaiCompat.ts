@@ -92,6 +92,9 @@ export function createOllamaProvider(
           messages,
           stream: false,
           think: false,
+          // Structured output: qwen3 otherwise ignores the "strict JSON"
+          // instruction and answers conversationally on long prompts.
+          format: "json",
           options: {
             temperature: opts?.temperature ?? 0.3,
             num_predict: opts?.maxTokens ?? 1024,

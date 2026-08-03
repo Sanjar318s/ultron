@@ -193,6 +193,50 @@ async function removeButtons(chatId, messageId) {
   await apiCall("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }).catch(() => {});
 }
 
+// --- HTML / status helpers --------------------------------------------------
+
+const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const stripTags = (s) => String(s ?? "").replace(/<[^>]*>/g, "");
+
+/** Send with HTML parse_mode; falls back to plain text if Telegram rejects a chunk. */
+async function sendHtml(chatId, text, extra = {}) {
+  for (const chunk of splitText(String(text ?? ""), 3900)) {
+    try {
+      await apiCall("sendMessage", { chat_id: chatId, text: chunk, parse_mode: "HTML", ...extra });
+    } catch {
+      await apiCall("sendMessage", { chat_id: chatId, text: stripTags(chunk), ...extra }).catch(() => {});
+    }
+  }
+}
+
+async function typing(chatId) {
+  await apiCall("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+}
+
+/** Send a transient status message and return its message_id for later editing. */
+async function sendStatus(chatId, text) {
+  try {
+    const res = await apiCall("sendMessage", { chat_id: chatId, text });
+    return res.result?.message_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function editStatus(chatId, messageId, text) {
+  await apiCall("editMessageText", { chat_id: chatId, message_id: messageId, text }).catch(() => {});
+}
+
+/** Replace a status message with the final reply, sending overflow as new messages. */
+async function finishStatus(chatId, messageId, reply) {
+  const chunks = splitText(String(reply ?? ""), 4096);
+  if (messageId !== null && chunks.length > 0) {
+    await editStatus(chatId, messageId, chunks[0]);
+    chunks.shift();
+  }
+  for (const c of chunks) await sendText(chatId, c);
+}
+
 // ---------------------------------------------------------------------------
 // Local exec / files
 // ---------------------------------------------------------------------------
@@ -356,6 +400,8 @@ const histories = new Map();
 async function chatWithAssistant(chatId, msg, text) {
   const hist = histories.get(String(chatId)) ?? [];
   hist.push({ role: "user", content: text });
+  await typing(chatId);
+  const statusId = await sendStatus(chatId, "⏳ Думаю…");
   let res;
   try {
     res = await fetch(`${SERVER}/api/assistant`, {
@@ -365,16 +411,17 @@ async function chatWithAssistant(chatId, msg, text) {
       signal: AbortSignal.timeout(180_000),
     });
   } catch (err) {
-    await sendText(chatId, `Сбой обработки: ${err.message}. Сервер запущен?`).catch(() => {});
+    await finishStatus(chatId, statusId, `Сбой обработки: ${err.message}. Сервер запущен?`);
     return;
   }
   const data = await res.json().catch(() => null);
   if (!res.ok || !data) {
-    await sendText(chatId, `Ошибка сервера: ${data?.error ?? res.status}.`);
+    await finishStatus(chatId, statusId, `Ошибка сервера: ${data?.error ?? res.status}.`);
     return;
   }
 
   if (data.needsApproval && isOwner(msg?.from)) {
+    await finishStatus(chatId, statusId, "⏳ Ожидается ваше решение.");
     const id = data.needsApproval.id;
     const desc = data.needsApproval.description;
     pendings.set(id, { id, chatId: String(chatId), createdAt: Date.now() });
@@ -388,7 +435,8 @@ async function chatWithAssistant(chatId, msg, text) {
     };
     await apiCall("sendMessage", {
       chat_id: chatId,
-      text: `🔐 Одобрение: ${desc}\n\n⏱ ${Math.round((settings.approvalTtlMs ?? 600_000) / 60_000)} минут на решение.`,
+      text: `🔐 <b>Одобрение</b>: ${esc(desc)}\n\n⏱ ${Math.round((settings.approvalTtlMs ?? 600_000) / 60_000)} минут на решение.`,
+      parse_mode: "HTML",
       reply_markup: kb,
     });
     audit({ action: "approval-prompt", id, description: desc });
@@ -398,10 +446,9 @@ async function chatWithAssistant(chatId, msg, text) {
   const parts = [];
   if (data.reply) parts.push(data.reply);
   if (data.generate) parts.push(data.generate);
+  const joined = parts.length === 0 ? "Выполнено." : parts.join("\n\n");
+  await finishStatus(chatId, statusId, joined);
   if (data.image) await sendPhoto(chatId, data.image.b64, data.image.mime);
-  if (parts.length === 0) parts.push("Выполнено.");
-  const joined = parts.join("\n\n");
-  await sendText(chatId, joined);
   hist.push({ role: "assistant", content: joined });
   if (hist.length > 16) hist.splice(0, hist.length - 16);
   histories.set(String(chatId), hist);
@@ -417,62 +464,97 @@ function parseCommand(text) {
   return { name: m[1].toLowerCase(), rest: (m[2] ?? "").trim() };
 }
 
-const HELP_TEXT = [
-  "УЛЬТРОН — команды бота:",
+const HELP_HTML = [
+  "<b>УЛЬТРОН — команды бота</b>",
   "",
-  "Общение:",
+  "<b>Общение</b>",
   "• просто пишите — я отвечаю",
-  "• «найди <запрос>» / «изучи <тема>» — поиск в интернете",
-  "• «навыки» / «навык <имя>» / «чего тебе не хватает»",
-  "• «изучи <ссылка>» — прочитать и запомнить",
-  "• «напиши статью про …» — текст",
-  "• «нарисуй …» — изображение",
+  "• <code>найди {запрос}</code> — поиск в интернете",
+  "• <code>изучи {тема}</code> — поиск и запоминание",
+  "• <code>изучи {ссылка}</code> — прочитать и запомнить",
+  "• <code>напиши статью про…</code> — текст",
+  "• <code>нарисуй …</code> — изображение",
+  "• <code>навыки</code> / <code>какие у тебя навыки</code>",
   "",
-  "Команды:",
-  "• /start — приветствие",
+  "<b>Команды</b>",
+  "• /menu — главное меню",
   "• /help — справка",
   "• /id — ваш числовой id",
 ].join("\n");
 
-const ADMIN_HELP = [
-  "УЛЬТРОН — админ-команды владельца:",
+const ADMIN_HELP_HTML = [
+  "<b>УЛЬТРОН — админ-команды владельца</b>",
   "",
-  "Доступ:",
+  "<b>Доступ</b>",
   "• /users — список допущенных",
-  "• /adduser <username|id> — допустить",
-  "• /rmuser <username|id> — убрать",
+  "• /adduser &lt;username|id&gt; — допустить",
+  "• /rmuser &lt;username|id&gt; — убрать",
   "",
-  "Файлы (относительно корня проекта):",
+  "<b>Файлы (относительно корня проекта)</b>",
   "• /ls [папка] — список",
   "• /tree [папка] — дерево",
-  "• /cat <файл> — показать",
-  "• /find <имя> — поиск файлов",
-  "• /write <файл> [--no-build] + перевод строки + содержимое",
-  "• /replace <файл> <старое> <новое> [--no-build]",
-  "• /append <файл> + перевод строки + текст",
-  "• /rm <файл|папка> • /mkdir <папка>",
-  "• /mv <откуда> <куда> • /cp <откуда> <куда>",
+  "• /cat &lt;файл&gt; — показать",
+  "• /find &lt;имя&gt; — поиск файлов",
+  "• /write &lt;файл&gt; [--no-build] + перевод строки + содержимое",
+  "• /replace &lt;файл&gt; &lt;старое&gt; &lt;новое&gt; [--no-build]",
+  "• /append &lt;файл&gt; + перевод строки + текст",
+  "• /rm &lt;файл|папка&gt; • /mkdir &lt;папка&gt;",
+  "• /mv &lt;откуда&gt; &lt;куда&gt; • /cp &lt;откуда&gt; &lt;куда&gt;",
   "",
-  "Система:",
-  "• /run <команда> — выполнить в корне проекта",
-  "• /node <файл.js> — запустить node",
+  "<b>Система</b>",
+  "• /run &lt;команда&gt; — выполнить в корне проекта",
+  "• /node &lt;файл.js&gt; — запустить node",
   "• /build — npm run build",
   "• /restart — перезапустить бота",
   "• /restart-server — перезапустить веб-сервер",
   "• /log [n] — хвост логов (next/bot)",
   "• /sysinfo — CPU/RAM/диск/GPU",
   "",
-  "Git и снимки:",
-  "• /git <аргументы> — git (авторизация через GITHUB_TOKEN)",
+  "<b>Git и снимки</b>",
+  "• /git &lt;аргументы&gt; — git (авторизация через GITHUB_TOKEN)",
   "• /snapshot [имя] — снимок состояния",
   "• /snapshots — список снимков",
   "• /rollback [имя] — откат к снимку",
   "",
-  "Автономия ИИ:",
+  "<b>Автономия ИИ</b>",
   "• /autonomy on|off|status",
-  "• /veto <id> — отклонить заявку",
+  "• /veto &lt;id&gt; — отклонить заявку",
   "• /stop-ai — аварийный стоп автономии",
 ].join("\n");
+
+function mainMenuKeyboard(owner) {
+  const rows = [
+    [
+      { text: "💬 Справка", callback_data: "cmd:/help" },
+      { text: "🧠 Память", callback_data: "cmd:/memory" },
+      { text: "📚 Навыки", callback_data: "cmd:/skills" },
+    ],
+    [
+      { text: "🔍 Поиск", callback_data: "cmd:/search" },
+      { text: "🖼 Рисовать", callback_data: "cmd:/draw" },
+      { text: "🆔 Мой id", callback_data: "cmd:/id" },
+    ],
+  ];
+  if (owner) {
+    rows.push([
+      { text: "📊 Система", callback_data: "cmd:/sysinfo" },
+      { text: "📁 Файлы", callback_data: "cmd:/ls" },
+      { text: "🔨 Сборка", callback_data: "cmd:/build" },
+    ]);
+    rows.push([{ text: "🔐 Админ-команды", callback_data: "cmd:/adminhelp" }]);
+  }
+  rows.push([{ text: "✖ Закрыть меню", callback_data: "menu:close" }]);
+  return { inline_keyboard: rows };
+}
+
+async function sendMenu(chatId, owner) {
+  await apiCall("sendMessage", {
+    chat_id: chatId,
+    text: "🕹 <b>Главное меню</b>",
+    parse_mode: "HTML",
+    reply_markup: mainMenuKeyboard(owner),
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Owner admin commands
@@ -480,7 +562,7 @@ const ADMIN_HELP = [
 
 function requireOwner(chatId, owner) {
   if (owner) return true;
-  sendText(chatId, "Команда доступна только владельцу.");
+  sendHtml(chatId, "🔒 <b>Команда доступна только владельцу.</b>");
   return false;
 }
 
@@ -562,15 +644,42 @@ async function handleCommand(chatId, msg, cmd) {
   switch (name) {
     case "/start": {
       const who = owner ? "Владелец" : isAllowed(msg.from) ? "Гость" : "";
-      await sendText(chatId, `Привет! Я УЛЬТРОН.${who ? ` (${who})` : ""}\n\n${HELP_TEXT}`);
+      await sendHtml(chatId, `Привет! Я <b>УЛЬТРОН</b>${who ? ` (${who})` : ""} — ваш ИИ-ассистент.\n\n${HELP_HTML}`);
+      await sendMenu(chatId, owner);
       return;
     }
     case "/help": {
-      await sendText(chatId, owner ? `${HELP_TEXT}\n\n${ADMIN_HELP}` : HELP_TEXT);
+      await sendHtml(chatId, owner ? `${HELP_HTML}\n\n${ADMIN_HELP_HTML}` : HELP_HTML);
+      await sendMenu(chatId, owner);
+      return;
+    }
+    case "/menu": {
+      await sendMenu(chatId, owner);
       return;
     }
     case "/id": {
       await sendText(chatId, `Ваш id: ${chatId}`);
+      return;
+    }
+    case "/memory": {
+      await chatWithAssistant(chatId, msg, "покажи свою память: какие правила, навыки и заметки ты помнишь");
+      return;
+    }
+    case "/skills": {
+      await chatWithAssistant(chatId, msg, "какие у тебя навыки?");
+      return;
+    }
+    case "/search": {
+      await sendHtml(chatId, "🔍 <b>Интернет-поиск</b>\n\nНапишите: <code>найди {запрос}</code>\nНапример: <code>найди последние новости про ИИ</code>");
+      return;
+    }
+    case "/draw": {
+      await sendHtml(chatId, "🖼 <b>Генерация изображений</b>\n\nНапишите: <code>нарисуй {описание}</code>\nНапример: <code>нарисуй неоновый кибергород</code>");
+      return;
+    }
+    case "/adminhelp": {
+      if (!requireOwner(chatId, owner)) return;
+      await sendHtml(chatId, ADMIN_HELP_HTML);
       return;
     }
 
@@ -834,10 +943,10 @@ async function handleCommand(chatId, msg, cmd) {
         return;
       }
       audit({ action: "run", cmd: rest.slice(0, 200), by: fromName });
-      await sendText(chatId, `⏳ Выполняю: ${rest}`);
+      const statusId = await sendStatus(chatId, `⏳ Выполняю: ${rest}`);
       const r = await runCmd(rest, { timeout: 300_000 });
       const head = r.ok ? "" : "⚠️ Команда завершилась с ошибкой.\n";
-      await sendText(chatId, `${head}${r.out.slice(0, 3500) || "(без вывода)"}`);
+      await finishStatus(chatId, statusId, `${head}${r.out.slice(0, 3500) || "(без вывода)"}`);
       return;
     }
     case "/node": {
@@ -848,18 +957,18 @@ async function handleCommand(chatId, msg, cmd) {
         return;
       }
       audit({ action: "node", file: rest, by: fromName });
-      await sendText(chatId, `⏳ Запускаю: ${rest}`);
+      const statusId = await sendStatus(chatId, `⏳ Запускаю: ${rest}`);
       const r = await runCmd(`node ${JSON.stringify(abs)}`, { timeout: 300_000 });
-      await sendText(chatId, `${r.out.slice(0, 3500) || "(без вывода)"}${r.ok ? "" : "\n⚠️ exit != 0"}`);
+      await finishStatus(chatId, statusId, `${r.out.slice(0, 3500) || "(без вывода)"}${r.ok ? "" : "\n⚠️ exit != 0"}`);
       return;
     }
     case "/build": {
       if (!requireOwner(chatId, owner)) return;
       audit({ action: "build", by: fromName });
-      await sendText(chatId, "⏳ Собираю (next build)…");
+      const statusId = await sendStatus(chatId, "⏳ Собираю (next build)…");
       const r = await runCmd("npm run build", { timeout: 360_000 });
       const last = r.out.split(/\r?\n/).slice(-25).join("\n");
-      await sendText(chatId, r.ok ? `✅ Сборка успешна.\n${last}` : `⚠️ Сборка не удалась:\n${last}`);
+      await finishStatus(chatId, statusId, r.ok ? `✅ Сборка успешна.\n${last}` : `⚠️ Сборка не удалась:\n${last}`);
       return;
     }
     case "/restart": {
@@ -1000,6 +1109,7 @@ async function handleCommand(chatId, msg, cmd) {
 
 async function tryNlAdmin(chatId, msg, text) {
   const lower = text.toLowerCase();
+  await typing(chatId);
   if (/свободное место|место на диске|сколько места|диск заполнен/.test(lower)) {
     const r = await runCmd(
       `powershell -NoProfile -Command "$disk=Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'; $disk | ForEach-Object { Write-Output ($_.DeviceID+' free '+[math]::Round($_.FreeSpace/1GB,1)+' GB / '+[math]::Round($_.Size/1GB,1)+' GB') }"`,
@@ -1092,12 +1202,28 @@ async function handleCallback(query) {
   if (chatId === undefined) return;
   const fakeFrom = { username: query.from?.username, id: query.from?.id };
   const msg = { chat: { id: chatId }, text: "", from: query.from };
+  const [verb, id] = data.split(":");
+
+  // Main-menu buttons are open to everyone: "cmd:/xxx" re-runs a command,
+  // "menu:close" hides the buttons.
+  if (verb === "cmd" && id) {
+    const fake = parseCommand(id.startsWith("/") ? id : `/${id}`);
+    if (fake) await handleCommand(chatId, msg, fake);
+    else await sendText(chatId, "Неизвестная команда. /help");
+    return;
+  }
+  if (verb === "menu" && id === "close") {
+    await removeButtons(chatId, query.message?.message_id);
+    return;
+  }
+
+  // Approve/reject are owner-only.
   if (!isOwner(fakeFrom)) {
     await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: "Только владелец может одобрять." }).catch(() => {});
     return;
   }
-  const [verb, id] = data.split(":");
   if (!id) return;
+
   await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: verb === "approve" ? "Одобрено" : "Отклонено" }).catch(() => {});
   await removeButtons(chatId, query.message?.message_id);
   const p = pendings.get(id);
@@ -1179,7 +1305,7 @@ async function main() {
   if (registry.owner.id !== null) {
     // Startup greeting so the owner knows the bot is alive after a restart.
     try {
-      await sendText(registry.owner.id, "🟢 Бот запущен.");
+      await sendHtml(registry.owner.id, "🟢 <b>Бот запущен.</b>");
     } catch {
       // owner chat may be blocked — ignore
     }
