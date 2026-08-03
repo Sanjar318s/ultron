@@ -340,19 +340,55 @@ export async function POST(req: NextRequest) {
       try {
         const res = await fetch(outcome.action.url, {
           signal: AbortSignal.timeout(30_000),
-          headers: { "User-Agent": "Mozilla/5.0 (Ultron Orb reader)" },
+          cache: "no-store",
+          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" },
           redirect: "follow",
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          console.log("[learn-url] fetch fail", res.status, res.statusText, "url:", res.url, "req:", outcome.action.url);
+          throw new Error(`HTTP ${res.status}`);
+        }
         const html = await res.text();
-        const pageText = stripHtml(html).slice(0, 100_000);
+        const pageTitle = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, " ").trim() || "";
+        const pageText = stripHtml(html).slice(0, 60_000);
         const notePrompt = [
-          "Ты — аналитик. Сожми статью в структурированную заметку для личной базы знаний. Верни СТРОГО один JSON-объект без markdown:",
+          "Сожми текст в структурированную заметку для личной базы знаний. Отвечай СТРОГО одним JSON-объектом без markdown, без пояснений и без обёрток:",
           '{"topic":"короткая тема (5–8 слов)","summary":"суть в 3–5 предложениях","keyPoints":["2–5 тезисов"]}',
           `Текст:\n${pageText}`,
         ].join("\n\n");
-        const summary = await completeCloud([{ role: "user", content: notePrompt }]);
-        const parsed = parseJSONObject(summary);
+        let summary: string;
+        let parsed = null;
+        try {
+          summary = await completeCloud([
+            { role: "system", content: "Ты — аналитик-резюмёр. Твой ответ всегда один JSON-объект и ничего больше." },
+            { role: "user", content: notePrompt },
+          ]);
+          parsed = parseJSONObject(summary);
+          if (!parsed) {
+            summary = await completeCloud([
+              { role: "system", content: "Ты — аналитик-резюмёр. Твой ответ всегда один JSON-объект и ничего больше." },
+              { role: "user", content: `Сожми текст в заметку: {"topic":"5–8 слов","summary":"3–5 предложений","keyPoints":["тезисы"]}\n\n${pageText.slice(0, 20_000)}` },
+            ]);
+            parsed = parseJSONObject(summary);
+          }
+        } catch {
+          parsed = null;
+        }
+        // Deterministic fallback when the model won't emit JSON: build the note
+        // from the page title + first meaningful sentences (works for code
+        // files whose header comment is prose, and for wiki lead paragraphs).
+        if (!parsed) {
+          const junk = /^(jump to|main menu|navigation|search|wikipedia|contents|current events|random article|help|tools|pages|views|what links|the article|image|from wikipedia)/i;
+          const sentences = pageText
+            .split(/(?<=[.!?])\s+/)
+            .map((s) => s.trim())
+            .filter((s) => s.length >= 50 && s.length <= 600 && !junk.test(s));
+          let topic = pageTitle.replace(/\s*-\s*Wikipedia$/i, "").trim();
+          if (!topic || /^https?:/i.test(topic)) topic = (sentences[0] || "").split(/[.!?]/)[0].slice(0, 100) || outcome.action.url.slice(0, 100);
+          const summary = sentences[0] || pageText.slice(0, 400);
+          const keyPoints = sentences.slice(1, 5).map((s) => s.slice(0, 200));
+          parsed = { topic: topic.slice(0, 100), summary, keyPoints };
+        }
         const topic =
           typeof parsed?.topic === "string" && parsed.topic.trim()
             ? parsed.topic.trim().slice(0, 100)
@@ -362,6 +398,8 @@ export async function POST(req: NextRequest) {
         const keyPoints = Array.isArray(parsed?.keyPoints)
           ? parsed.keyPoints.filter((k): k is string => typeof k === "string").map((k) => k.trim().slice(0, 200))
           : [];
+        const existing = brain.findNoteBySource(outcome.action.url);
+        if (existing) brain.forgetNote(existing.id);
         brain.addNote({ topic, summary: noteSummary, keyPoints: keyPoints.slice(0, 5), source: outcome.action.url });
         await saveBrain(brain);
         return NextResponse.json({ reply: `Изучил: «${topic}».`, provider: null });
@@ -462,7 +500,11 @@ export async function POST(req: NextRequest) {
       } else if (a.type === "launch" && typeof a.app === "string" && a.app.trim()) {
         const name = a.app.trim().toLowerCase();
         const outcome = await launchApp(name, undefined, { focus: true });
-        actionReply = outcome ? `Запускаю «${name}».` : `Не удалось найти приложение «${name}».`;
+        actionReply = outcome
+          ? outcome.url
+            ? `Открываю ${outcome.url} в браузере.`
+            : `Запускаю «${outcome.matched}».`
+          : `Не удалось найти приложение «${name}».`;
       } else if (a.type === "search" && typeof a.query === "string" && a.query.trim()) {
         actionReply = await handleSearchAction(
           brain,

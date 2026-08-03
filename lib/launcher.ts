@@ -7,11 +7,12 @@
  *  - openViaShell: fire-and-forget Start-Process (apps, URLs, app protocols).
  *  - runPs: await a PowerShell script and capture its output/errors (for
  *    keyboard/clipboard/mouse automation where we need to know it succeeded).
- *  - launchApp: match a spoken name → allowlist → installed apps → domain.
+ *  - launchApp: match a spoken name → allowlist → known site → installed apps → domain.
  */
 
 import { spawn } from "node:child_process";
 import { dedupeApps, findBestApp, isReasonableApp, scanInstalledApps } from "@/lib/installedApps";
+import { findSiteInPhrase, resolveSite } from "@/lib/sites";
 
 /** Safe charset for a URL (https/http only, no quotes/semicolons/whitespace). */
 export const SAFE_URL = /^https?:\/\/[a-z0-9\-._~:/?#[\]@!$&'()*+,;=%]*$/i;
@@ -136,9 +137,23 @@ function allowlistTarget(key: string): string | null {
 }
 
 /**
+ * Match an allowlist key only as a standalone token (Cyrillic-aware), so a
+ * longer phrase like «ютуб через браузер на пк» doesn't hijack the «браузер»
+ * entry via substring matching.
+ */
+function allowlistTokenMatch(name: string): [string, { command: string; args: string[] }] | null {
+  const hit = Object.entries(APPS).find(([key]) => {
+    if (!key) return false;
+    const re = new RegExp(`(?:^|[^a-zа-яё0-9])${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|[^a-zа-яё0-9])`, "i");
+    return re.test(name);
+  });
+  return hit ?? null;
+}
+
+/**
  * Match a spoken app/domain name and launch it: explicit URL → allowlist →
- * fuzzy match against installed apps → spoken domain in the browser.
- * Returns null when nothing matches.
+ * known site inside the phrase → fuzzy match against installed apps → spoken
+ * domain in the browser. Returns null when nothing matches.
  */
 export async function launchApp(
   spoken: string,
@@ -154,7 +169,29 @@ export async function launchApp(
   }
 
   const name = spoken.trim().toLowerCase();
-  const allowHit = APPS[name] ? { 0: name, 1: APPS[name] } : Object.entries(APPS).find(([key]) => name.includes(key));
+
+  // Exact allowlist first (стим → steam://, телеграм → desktop app, …).
+  if (APPS[name]) {
+    if (focus) {
+      const target = allowlistTarget(name);
+      if (target) {
+        await launchAndFocus(target);
+        return { launched: name, matched: name };
+      }
+    }
+    spawn(APPS[name].command, APPS[name].args, { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    return { launched: name, matched: name };
+  }
+
+  // Known site inside the phrase («ютуб через браузер на пк» → YouTube) —
+  // BEFORE the allowlist token fallback so «браузер» can't steal the intent.
+  const siteUrl = resolveSite(name) ?? findSiteInPhrase(name);
+  if (siteUrl) {
+    openViaShell(siteUrl);
+    return { launched: name, matched: name, url: siteUrl };
+  }
+
+  const allowHit = allowlistTokenMatch(name);
   const allowEntry = allowHit?.[1] ?? null;
   const allowKey = allowHit?.[0] ?? null;
   if (allowEntry && allowKey) {

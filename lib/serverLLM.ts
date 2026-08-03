@@ -223,21 +223,90 @@ async function wikipediaSearch(query: string): Promise<GroundedAnswer> {
 }
 
 /**
- * Answer a query using Gemini's Grounding with Google Search (real web search
- * via the model). Model comes from GEMINI_SEARCH_MODEL (default gemini-3.6-
- * flash); if it rejects grounding (e.g. billing not enabled on the account)
- * it falls back to gemini-2.5-flash, then to the keyless Wikipedia API.
+ * Real-time search via a self-hosted OpenSERP OSS server (MIT, keyless).
+ * By default hits the multi-engine endpoint with mode=any (tries engines in
+ * order until one answers); set OPENSERP_ENGINE to pin one engine. Results
+ * carry optional extracted page content (extract=N) which is fed to the LLM
+ * as grounding material, so answers come from live pages, not model weights.
+ * Returns null when the server is down, blocked, or has nothing usable.
+ */
+async function openSerpSearch(query: string): Promise<GroundedAnswer | null> {
+  const base = process.env.OPENSERP_BASE_URL?.trim() || "http://127.0.0.1:7000";
+  const engine = process.env.OPENSERP_ENGINE?.trim() || "";
+  const limit = Math.min(Math.max(Number(process.env.OPENSERP_LIMIT) || 8, 1), 20);
+  const extract = Math.min(Math.max(Number(process.env.OPENSERP_EXTRACT) || 3, 0), 5);
+  const region = process.env.OPENSERP_REGION?.trim() || "";
+  const params = new URLSearchParams({ text: query, limit: String(limit), extract: String(extract) });
+  if (region) params.set("region", region);
+  const endpoint = engine
+    ? `${base}/${engine}/search?${params}`
+    : `${base}/mega/search?${params}&mode=any`;
+  let res: Response;
+  try {
+    res = await fetch(endpoint, { signal: AbortSignal.timeout(50_000) });
+  } catch (err) {
+    console.warn("[search] openserp unreachable:", err instanceof Error ? err.message : String(err));
+    return null;
+  }
+  if (!res.ok) {
+    console.warn("[search] openserp HTTP", res.status);
+    return null;
+  }
+  const data = (await res.json().catch(() => null)) as {
+    meta?: { error_detail?: string };
+    results?: Array<{
+      rank?: number;
+      title?: string;
+      url?: string;
+      snippet?: string;
+      extracted?: { content?: string };
+    }>;
+  } | null;
+  if (!data?.results || data.results.length === 0) {
+    console.warn("[search] openserp empty:", data?.meta?.error_detail ?? "no results");
+    return null;
+  }
+  const chunks: string[] = [];
+  const sources: string[] = [];
+  for (const r of data.results) {
+    const url = r.url;
+    if (!url || sources.includes(url)) continue;
+    const content = (r.extracted?.content ?? "").trim().slice(0, 3000);
+    const body = content || (r.snippet ?? "").trim();
+    if (!body) continue;
+    chunks.push(`ИСТОЧНИК ${sources.length + 1}: ${r.title ?? url}\nURL: ${url}\n${body}`);
+    sources.push(url);
+    if (sources.length >= 5) break;
+  }
+  if (chunks.length === 0) return null;
+  const answer = await completeCloud([
+    {
+      role: "system",
+      content:
+        "Ты — поисковик с реальным доступом в интернет. Ниже — свежие материалы, найденные по запросу. Отвечай по-русски, кратко и по делу, опираясь ТОЛЬКО на эти материалы. Если материала недостаточно — честно это скажи, не выдумывай. На факты ссылайся на источник в квадратных скобках, например [1], [2].",
+    },
+    { role: "user", content: `Запрос: ${query}\n\nМатериалы:\n${chunks.join("\n\n---\n\n")}` },
+  ]);
+  return { answer, sources };
+}
+
+/**
+ * Answer a query using live web search. Chain: Gemini Grounding with Google
+ * Search first (best quality; model from GEMINI_SEARCH_MODEL, default
+ * gemini-3.6-flash; requires billing), then a self-hosted OpenSERP search
+ * (keyless real-time, default http://127.0.0.1:7000), then the keyless
+ * Wikipedia API, and finally model knowledge with an honesty caveat.
  */
 export async function completeCloudWithSearch(query: string): Promise<GroundedAnswer> {
   const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("no GEMINI_API_KEY");
   const configured = process.env.GEMINI_SEARCH_MODEL?.trim();
   const modelCandidates = [configured ?? "gemini-3.6-flash", "gemini-2.5-flash"].filter(
     (m): m is string => Boolean(m),
   );
-  const models = [...new Set(modelCandidates)];
+  const models = key ? [...new Set(modelCandidates)] : [];
   let lastError: unknown = null;
   for (const model of models) {
+    if (!key) break;
     try {
       const res = await fetch(`${GEMINI_URL}/${model}:generateContent`, {
         method: "POST",
@@ -273,6 +342,9 @@ export async function completeCloudWithSearch(query: string): Promise<GroundedAn
       console.warn(`[search] ${model} grounding failed:`, err);
     }
   }
+  // Keyless real-time search via local OpenSERP before the Wikipedia fallback.
+  const serp = await openSerpSearch(query);
+  if (serp) return serp;
   // Last-resort keyless fallback.
   try {
     return await wikipediaSearch(query);

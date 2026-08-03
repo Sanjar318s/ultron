@@ -140,6 +140,16 @@ On top of the orb there is a voice/text assistant with its own architecture
   their keys are unfunded. Ollama MUST use the native `/api/chat` endpoint with
   `think: false`: qwen3's thinking mode burns the whole token budget via the
   OpenAI-compat endpoint and returns empty content.
+- **Web search (real-time, local-first):** `app/api/search/route.ts` →
+  `completeCloudWithSearch` (`lib/serverLLM.ts`). Chain: Gemini Grounding
+  (best; needs billing — free keys hit 429, and `gemini-2.5-flash` is
+  discontinued) → self-hosted **OpenSERP** (`lib/serverLLM.ts:openSerpSearch`,
+  MIT, keyless; default `http://127.0.0.1:7000`, run
+  `openserp.exe serve -p 7000` in browser mode with Chrome/Edge; multi-engine
+  `mega mode=any` unless `OPENSERP_ENGINE` pins one; `extract=N` fetches page
+  content that is fed to the LLM as grounding, so answers come from live pages,
+  not qwen3's 2024 weights) → keyless Wikipedia → model knowledge (with an
+  honesty caveat). Never rely on qwen3/gemini weights for "what's new" answers.
 - **Image chain (local-first):** `Gemini (quota-limited) → local ComfyUI
   (`lib/localImage.ts`, RealVisXL V5.0 fp16 on 127.0.0.1:8188, workflow template
   in `comfy/text2img.json`: 28 steps dpmpp_2m/karras, then 2× upscale through

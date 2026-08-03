@@ -1042,6 +1042,43 @@ async function tryNlAdmin(chatId, msg, text) {
     await handleCommand(chatId, msg, fake);
     return true;
   }
+  // «сделай что-то полезное для пк» — системный осмотр + советы, а не картинка.
+  if (/что\s*[-\s]*(то|нибудь|либо)\s*[-\s]*полезн/.test(lower)) {
+    await sendText(chatId, "🔍 Осматриваю систему…");
+    await handleCommand(chatId, msg, { name: "/sysinfo", rest: "" });
+    const tmp = await runCmd(
+      `powershell -NoProfile -Command "$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ('TEMP: '+[math]::Round($s/1GB,2)+' GB')"`,
+      { timeout: 60_000 },
+    );
+    await sendText(
+      chatId,
+      `${tmp.out.trim()}\n\nМогу: очистить временные файлы («очисти временные файлы»), перезапустить сервер, показать логи (/log) или собрать проект (/build).`,
+    );
+    return true;
+  }
+  // «очисти временные файлы» — безопасная чистка TEMP (best-effort).
+  if (/очисти\s+временн|очистка\s+временн|почисти\s+(темп|временн)|чистка\s+темп|удали\s+временн/.test(lower)) {
+    await sendText(chatId, "🧹 Чищу временные файлы…");
+    const before = await runCmd(
+      `powershell -NoProfile -Command "$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ([math]::Round($s/1MB,1))"`,
+      { timeout: 60_000 },
+    );
+    const r = await runCmd(
+      `powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; Get-ChildItem $env:TEMP -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue"`,
+      { timeout: 180_000 },
+    );
+    const after = await runCmd(
+      `powershell -NoProfile -Command "$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ([math]::Round($s/1MB,1))"`,
+      { timeout: 60_000 },
+    );
+    await sendText(
+      chatId,
+      r.ok === false
+        ? `⚠️ Очистка частично не удалась: ${r.out.slice(0, 500)}`
+        : `✅ Очищено. Было ~${before.out.trim()} MB мусора, осталось ~${after.out.trim()} MB.`,
+    );
+    return true;
+  }
   return false;
 }
 

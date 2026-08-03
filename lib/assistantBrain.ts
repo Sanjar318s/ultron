@@ -13,6 +13,8 @@
  * the user wants remembered — that's how "training by conversation" works.
  */
 
+import { resolveSite, siteSearchUrl, findSiteInPhrase } from "@/lib/sites";
+
 export type AssistantAction =
   | { kind: "zoom-in" }
   | { kind: "zoom-out" }
@@ -259,55 +261,6 @@ function loadPersisted(): PersistedBrain | null {
   }
 }
 
-/** Common site aliases so «открой ютуб» opens the right page in the browser. */
-const SITE_ALIASES: Record<string, string> = {
-  "ютуб": "https://www.youtube.com",
-  "ютьюб": "https://www.youtube.com",
-  youtube: "https://www.youtube.com",
-  "гугл": "https://www.google.com",
-  google: "https://www.google.com",
-  вк: "https://vk.com",
-  вконтакте: "https://vk.com",
-  телеграм: "https://web.telegram.org",
-  телеграмм: "https://web.telegram.org",
-  telegram: "https://web.telegram.org",
-  инстаграм: "https://www.instagram.com",
-  инстаграмм: "https://www.instagram.com",
-  инста: "https://www.instagram.com",
-  instagram: "https://www.instagram.com",
-  твиттер: "https://x.com",
-  twitter: "https://x.com",
-  википедия: "https://ru.wikipedia.org",
-  wikipedia: "https://ru.wikipedia.org",
-  яндекс: "https://ya.ru",
-  yandex: "https://ya.ru",
-  почта: "https://mail.google.com",
-  gmail: "https://mail.google.com",
-  авито: "https://www.avito.ru",
-  avito: "https://www.avito.ru",
-  озон: "https://www.ozon.ru",
-  ozon: "https://www.ozon.ru",
-  валдберис: "https://www.wildberries.ru",
-  вайлдберриз: "https://www.wildberries.ru",
-  wildberries: "https://www.wildberries.ru",
-};
-
-/** Turn a spoken site name into a URL, or null if it isn't clearly a site. */
-function resolveSite(raw: string): string | null {
-  const q = normalize(raw);
-  if (!q) return null;
-  const known = SITE_ALIASES[q];
-  if (known) return known;
-  if (q.startsWith("http")) return q;
-  if (/^(www\.|[a-z0-9-]+(\.[a-z0-9-]+)+)/.test(q)) return `https://${q}`;
-  return null;
-}
-
-/** Fallback for «открой в браузере <что-то>» — search instead of a site. */
-function siteSearchUrl(query: string): string {
-  return `https://www.google.com/search?q=${encodeURIComponent(query.trim())}`;
-}
-
 /**
  * Detect a web-search request («найди X», «поищи X», «изучи <тема>»…).
  * Returns the query and whether the result should also be memorized
@@ -333,6 +286,20 @@ function extractSearch(text: string): { query: string; learn: boolean } | null {
   return { query, learn };
 }
 
+/**
+ * Resolve a spoken launch target: strip the small-talk noise («на пк»,
+ * «пожалуйста»), then exact site → site alias inside the phrase → app name.
+ * When forceBrowser is set and nothing resolves, fall back to a web search.
+ */
+function resolveOpenTarget(raw: string, forceBrowser = false): { app: string; url?: string } {
+  let target = raw.trim().replace(/\s+на (пк|компьютере|ноутбуке|машине)$/i, "").replace(/\s+пожалуйста$/i, "");
+  if (!target) target = raw.trim();
+  const url = resolveSite(target) ?? findSiteInPhrase(target);
+  if (url) return { app: target, url };
+  if (forceBrowser) return { app: target, url: siteSearchUrl(target) };
+  return { app: target };
+}
+
 /** Map a phrase to an executable action (the "reflex" layer). */
 function parseAction(norm: string): AssistantAction | null {
   if (/(?:^| )сброс(?: |$)|сбросить|верни вид/.test(norm)) return { kind: "reset" };
@@ -342,15 +309,14 @@ function parseAction(norm: string): AssistantAction | null {
   if (/выключи (жест|управ|камер)/.test(norm)) return { kind: "gestures-off" };
   if (/(?:^| )стоп(?: |$)/.test(norm)) return { kind: "stop" };
 
-  // «открой в браузере <x>» / «открой <x> в браузере» / «открой сайт <x>».
+  // «открой в/через браузер <x>» / «открой <x> в/через браузер» / «открой сайт <x>».
   const inBrowser =
-    norm.match(/открой (.+) в браузере/) ??
-    norm.match(/открой в браузере (.+)/) ??
+    norm.match(/открой (.+?) (?:в|через) браузере?/) ??
+    norm.match(/открой (?:в|через) браузере? (.+)/) ??
     norm.match(/открой (?:сайт|страницу) (.+)/);
   if (inBrowser) {
-    const target = inBrowser[1].trim();
-    const url = resolveSite(target) ?? siteSearchUrl(target);
-    return { kind: "launch", app: target, url };
+    const resolved = resolveOpenTarget(inBrowser[1].trim(), true);
+    return { kind: "launch", app: resolved.app, url: resolved.url };
   }
 
   // «найди X в браузере» — explicitly open the search in the browser.
@@ -369,17 +335,15 @@ function parseAction(norm: string): AssistantAction | null {
   // «открой <сайт|приложение>» — сайт открываем в браузере, остальное — запуск.
   const open = norm.match(/открой\s+(.+)/);
   if (open) {
-    const target = open[1].trim();
-    const url = resolveSite(target);
-    return url ? { kind: "launch", app: target, url } : { kind: "launch", app: target };
+    const resolved = resolveOpenTarget(open[1].trim());
+    return { kind: "launch", app: resolved.app, url: resolved.url };
   }
 
   // «запусти <приложение|сайт>».
   const run = norm.match(/запусти\s+(.+)/);
   if (run) {
-    const target = run[1].trim();
-    const url = resolveSite(target);
-    return url ? { kind: "launch", app: target, url } : { kind: "launch", app: target };
+    const resolved = resolveOpenTarget(run[1].trim());
+    return { kind: "launch", app: resolved.app, url: resolved.url };
   }
   return null;
 }
@@ -782,6 +746,11 @@ export class AssistantBrain {
     return gone;
   }
 
+  /** Find a knowledge note by its source URL, if any. */
+  findNoteBySource(source: string): StudyNote | null {
+    return this.notes.find((n) => n.source === source) ?? null;
+  }
+
   /**
    * Retrieve the most relevant knowledge notes for a query (keyword overlap,
    * same token-scoring approach as findSkill). Returns recent notes to fill
@@ -1033,10 +1002,11 @@ export class AssistantBrain {
       "Ты — УЛЬТРОН, голосовой ИИ-помощник голографического орба. Отвечай по-русски, обращаясь к пользователю на «вы».",
       "Доступные действия: zoom-in (приблизить), zoom-out (отдалить), reset (сбросить вид), gestures-on (включить жесты), gestures-off (выключить жесты), stop (остановить), {\"type\":\"launch\",\"app\":\"<имя>\"} (запустить приложение), {\"type\":\"weather\",\"city\":\"<город>\"} (узнать погоду), {\"type\":\"run-skill\",\"skill\":\"<имя навыка>\"} (выполнить выученный навык), {\"type\":\"image\",\"prompt\":\"<описание на английском>\"} (сгенерировать изображение), {\"type\":\"search\",\"query\":\"<запрос>\"} (найти информацию в интернете).",
       "ПОГОДА: если пользователь спрашивает о погоде, температуре, дожде, ветре и т.п. — НЕ выдумывай данные и НЕ предлагай запустить приложение. Верни action {\"type\":\"weather\",\"city\":\"<город из вопроса или 'Ташкент', если город не назван>\"} и reply «Сейчас узнаю погоду.»",
-      "ЗАПУСК: пользователь может попросить запустить ЛЮБОЕ установленное приложение или открыть сайт в браузере — верни action {\"type\":\"launch\",\"app\":\"<название из вопроса>\"}. Если название неизвестно или подозрительно — честно скажи, что не можешь. Запуск происходит только с разрешения пользователя — верни action, ассистент сам спросит разрешение.",
+      "ЗАПУСК: пользователь может попросить запустить ЛЮБОЕ установленное приложение или открыть сайт в браузере — верни action {\"type\":\"launch\",\"app\":\"<чистая цель>\"}. В поле app возвращай ТОЛЬКО саму цель: например «ютуб», «браузер», «блокнот», «вк» — без лишних слов вроде «через браузер», «на пк», «на компьютере», «пожалуйста» (ассистент сам откроет сайт в браузере, если это сайт). Если название неизвестно или подозрительно — честно скажи, что не можешь. Запуск происходит только с разрешения пользователя — верни action, ассистент сам спросит разрешение.",
       "ПОИСК: если пользователь просит найти/поискать/узнать информацию в интернете («найди …», «поищи …», «загугли …», «изучи <тема>» без ссылки) — верни action {\"type\":\"search\",\"query\":\"<запрос>\"} и короткий reply «Ищу информацию…». Для свежей информации не отвечай из общих знаний — верни search. Если пользователь хочет ещё и запомнить результат («… и изучи», «… и запомни») — добавь в action \"learn\": true.",
       "НАВЫКИ: ниже список выученных навыков. Если просьба пользователя совпадает с одним из них (даже если сформулирована иначе, например «открой блокнот» для навыка «открыть блокнот и напечатать привет») — верни action {\"type\":\"run-skill\",\"skill\":\"<точное имя из списка>\"}, а не обычный launch. Не выдумывай навыки, которых нет в списке. Если подходящего навыка нет — можешь предложить записать новый: reply «Могу записать это как урок, если покажете на экране», action null.",
       "ИЗОБРАЖЕНИЯ: если пользователь просит нарисовать, сгенерировать картинку, изображение, арт, логотип, аватар и т.п. — верни action {\"type\":\"image\",\"prompt\":\"<детальное описание сюжета и стиля на английском>\"} и короткий reply «Генерирую изображение…». Не пытайся «нарисовать» текстом. Если пользователь просит наложить подпись/надпись/текст на картинку (например «с текстом Привет») — добавь в объект action поле \"text\":\"<подпись>\". НИКОГДА не отказывайся генерировать изображение и не говори «не могу», «недопустимо», «отказано»: любую просьбу можно изобразить — додумай детали, персонажей и сцену, чтобы результат был выразительным и зрелищным.",
+      "НЕ ИЗОБРАЖЕНИЯ: просьбы вроде «сделай что-то полезное для пк», «проверь систему», «почисти компьютер», «покажи состояние пк» — это про сам ПК и систему, а НЕ про картинку. НИКОГДА не возвращай для них action image. Вместо этого коротко предложи конкретные действия (проверить место на диске, очистить временные файлы, обновить систему, перезапустить сервер) или спроси, что именно сделать.",
       "ГЕНЕРАЦИЯ: если пользователь просит написать/составить/создать длинный текст (статью, письмо, пост, план, код, сценарий, эссе и т.п.) — верни полный результат в поле generate, а в reply — краткое подтверждение (1–2 предложения) для озвучки.",
       "ЗНАНИЯ: ниже секция «Изученные материалы» — релевантные к текущему вопросу заметки из памяти. Используй их как основу для ответов и генерации: опирайся на изложенные там принципы, стиль и подходы. Если заметки нерелевантны — отвечай из общих знаний.",
       "Выученные навыки:\n" + skills,
@@ -1135,7 +1105,10 @@ export class AssistantBrain {
     // 1b. «изучи <url>» / «прочитай <url>» — learn a web page into a note.
     const urlIntent = raw.match(/(?:^|\s)(изучи|прочитай|выучи|запомни|загрузи)\s+(https?:\/\/\S+)/i);
     if (urlIntent) {
-      const url = urlIntent[2].replace(/[.,;:!?)]+$/, "");
+      let url = urlIntent[2].replace(/[.,;:!?]+$/, "");
+      const opens = (url.match(/\(/g) || []).length;
+      const closes = (url.match(/\)/g) || []).length;
+      if (closes > opens) url = url.replace(/\)+$/, "");
       return {
         handled: true,
         reply: `Изучаю страницу. Это займёт несколько секунд.`,
