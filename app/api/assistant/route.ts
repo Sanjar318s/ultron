@@ -8,6 +8,7 @@ import {
 } from "@/lib/assistantBrain";
 import { completeCloud, completeWithProvider } from "@/lib/serverLLM";
 import { isQuotaError, reportFailure, resolveKey, type ResolveResult } from "@/lib/geminiKeys";
+import { getLearnedFacts } from "@/lib/lessonStore";
 import {
   execute as executeCatalogSkill,
   fuzzyFind as catalogFuzzyFind,
@@ -148,6 +149,17 @@ async function autonomySystemNote(): Promise<string> {
     '{"admin":{"action":"build"}} — собрать проект (одобрение).',
     "Пути — относительные от корня проекта. Менять защищённые файлы (scripts/telegram-bot.mjs, app/api/*, lib/promptSanitizer.ts, lib/adminOps.ts, data/*) НЕЛЬЗЯ. read выполняется сразу, результат вернётся следующим сообщением; write/replace/run/build — только после явного «да» владельца. Лимит — до 3 изменений за сессию.",
   ].join("\n");
+}
+
+/** Learned-facts block injected from data/learned-facts.json (see lessonStore). */
+async function learnedFactsSystemNote(): Promise<string> {
+  try {
+    const facts = await getLearnedFacts();
+    if (facts.length === 0) return "";
+    return `\n\nВЫУЧЕННЫЕ ФАКТЫ (учитывай в ответах, они уже подтверждены пользователем):\n${facts.map((f) => `- ${f}`).join("\n")}`;
+  } catch {
+    return "";
+  }
 }
 
 async function fetchInternal(baseUrl: string, path: string, init?: RequestInit): Promise<Response> {
@@ -497,7 +509,8 @@ export async function POST(req: NextRequest) {
       (catalogList
         ? `\n\nВНЕШНИЕ НАВЫКИ (SKILL.md):\n${catalogList}\nЕсли запрос — работа с файлами/документами (PDF/XLSX/DOCX/PPTX), системный отчёт или стиль изображения — верни action {"type":"run-skill","skill":"<точное имя>"} для подходящего внешнего навыка.`
         : "") +
-      (await autonomySystemNote());
+      (await autonomySystemNote()) +
+      (await learnedFactsSystemNote());
     const messages = [
       { role: "system" as const, content: systemContent },
       ...history.map((h) => ({

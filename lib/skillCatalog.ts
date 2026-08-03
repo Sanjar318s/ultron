@@ -20,6 +20,7 @@
 import { promises as fs, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { getLearnedStyles } from "./lessonStore.ts";
 
 export const SKILLS_DIR = path.join(process.cwd(), "skills");
 
@@ -86,12 +87,19 @@ export async function listCatalog(): Promise<CatalogSkill[]> {
       const raw = await fs.readFile(mdPath, "utf8");
       const { meta, body } = parseFrontmatter(raw);
       if (!meta.name) continue;
+      let effectiveBody = body;
+      if (dir === "image-style") {
+        const learned = await getLearnedStyles();
+        if (learned.length > 0) {
+          effectiveBody = `${body}\n\n## Выученное у пользователя\n${learned.map((s) => `- ${s}`).join("\n")}`;
+        }
+      }
       out.push({
         slug: dir,
         name: meta.name,
         description: meta.description ?? "",
         safe: String(meta.safe ?? "true").toLowerCase() !== "false",
-        body,
+        body: effectiveBody,
         dir: path.join(SKILLS_DIR, dir),
       });
     } catch {

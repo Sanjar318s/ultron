@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { ContentPart } from "@/lib/llm/types";
 import { messageText } from "@/lib/llm/types";
+import { resolveKey as poolResolveKey, reportFailure as poolReportFailure, isQuotaError as poolIsQuota } from "@/lib/geminiKeys";
 
 /**
  * Server-side LLM proxy for the cloud providers. Browser code sends
@@ -32,7 +33,6 @@ const KEYS: Record<string, () => string | undefined> = {
   deepseek: () => process.env.DEEPSEEK_API_KEY,
   gemini: () => process.env.GEMINI_API_KEY,
 };
-
 const MAX_PARTS_PER_MESSAGE = 16;
 const MAX_IMAGE_B64 = 2_000_000;
 
@@ -152,7 +152,11 @@ export async function POST(req: NextRequest) {
   if (provider !== "gemini" && messages.some((m) => Array.isArray(m.content))) {
     return NextResponse.json({ error: "images only supported for gemini" }, { status: 400 });
   }
-  const key = KEYS[provider]?.();
+  let key = KEYS[provider]?.();
+  if (provider === "gemini") {
+    const resolved = await poolResolveKey("", true);
+    if (resolved.state === "ok" && resolved.key) key = resolved.key;
+  }
   if (!key) {
     return NextResponse.json({ error: "missing api key" }, { status: 503 });
   }
@@ -200,6 +204,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ content });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    if (provider === "gemini" && key && poolIsQuota(message)) {
+      void poolReportFailure("", key, true);
+    }
     return NextResponse.json({ error: message }, { status: 502 });
   }
 }

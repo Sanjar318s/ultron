@@ -64,6 +64,12 @@ export interface VoiceAssistantApi {
   send(text: string): void;
   /** Push an assistant message + speak it (used to report action results). */
   say(text: string): void;
+
+  /**
+   * Fire-and-forget a successful Gemini exchange to /api/learn so the
+   * system can distill reusable facts/style rules ("учёба у Gemini").
+   */
+  learnFromGemini(query: string, reply: string): void;
   /**
    * Resolve a spoken app name (e.g. «майнкрафт») to the exact name in the
    * installed-apps list (e.g. "Minecraft") using the LLM. Returns null if
@@ -632,6 +638,9 @@ export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantAp
         setActiveProvider(result.provider);
 
         const { text: replyText, parsed } = parseLLMContent(result.content);
+        if (result.provider === "gemini") {
+          learnFromGemini(trimmed, replyText);
+        }
         const reply = replyText || "Выполнено.";
         const action = parsed?.action ? brain.resolveLLMAction(parsed.action) ?? undefined : undefined;
         const added =
@@ -707,6 +716,15 @@ export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantAp
     },
     [push],
   );
+
+  const learnFromGemini = useCallback((query: string, reply: string) => {
+    if (!query || !reply) return;
+    void fetch("/api/learn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, reply }),
+    }).catch(() => {});
+  }, []);
 
   const resolveLaunch = useCallback(
     async (spoken: string): Promise<string | null> => {
@@ -876,6 +894,7 @@ export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantAp
     togglePcControl,
     send,
     say,
+    learnFromGemini,
     resolveLaunch,
     startLesson,
     stopLesson,

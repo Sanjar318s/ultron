@@ -173,13 +173,36 @@ On top of the orb there is a voice/text assistant with its own architecture
   registry persists to `data/telegram-users.json`; approvals render as inline
   buttons (`approve:<id>` / `reject:<id>`) and execute via the route.
 - **LLM chain (local-first, unlimited):** browser router order
-  `["ollama", "gemini", "groq", "webllm"]` (`lib/llm/router.ts`); server order
-  `[ollama, gemini, groq]` (`lib/serverLLM.ts`). OpenAI/DeepSeek are excluded —
-  their keys are unfunded. Ollama MUST use the native `/api/chat` endpoint with
-  `think: false` and `format: "json"`: qwen3's thinking mode burns the whole
-  token budget via the OpenAI-compat endpoint and returns empty content, and
-  forced-JSON needs `format: "json"` (a plain prompt alone drifts off-schema at
-  long contexts).
+  `["gemini", "ollama", "groq", "webllm"]` (`lib/llm/router.ts`); server order
+  `[gemini, ollama, groq]` (`lib/serverLLM.ts`). The browser's `gemini`
+  provider proxies through `/api/llm`, which rotates the owner's key pool
+  (`lib/geminiKeys.ts`) and reports quota failures so the pool cycles keys.
+  OpenAI/DeepSeek are excluded — their keys are unfunded. Ollama MUST use
+  the native `/api/chat` endpoint with `think: false` and `format: "json"`:
+  qwen3's thinking mode burns the whole token budget via the OpenAI-compat
+  endpoint and returns empty content, and forced-JSON needs `format: "json"`
+  (a plain prompt alone drifts off-schema at long contexts).
+- **Hybrid SKILL.md skills (`lib/skillCatalog.ts`):** beyond screen-learned
+  skills there's a catalog of `skills/<slug>/SKILL.md` folders (frontmatter
+  `name`/`description`/`safe`; scripts in `skills/<slug>/scripts/`). Packed in:
+  official `pdf`/`xlsx`/`docx`/`pptx`/`skill-creator` (anthropics/skills) and
+  custom `sys-report` (python report) + `image-style` (knowledge/prompt styles).
+  Dispatch (`runSkillDispatch` in `/api/assistant`) prefers screen skills, then
+  fuzzy-matches the catalog (`fuzzyFind` — scores name/slug/description plus
+  RU aliases from `skills/aliases.json`, threshold 0.2). Non-safe skills need
+  owner approval (`data/pending.json`). The sandbox executor runs ONLY
+  `python/py/node/pip` with a blocked-fragment validator, per-chat workdir
+  `data/skill-work/<chatId>`, ≤6 LLM rounds, and appends external tool bins
+  (poppler/pandoc/LibreOffice from `C:\Tools`) to PATH. `image-style` also gets
+  user-learned styles appended to its body.
+- **«Учёба у Gemini» (`lib/lessonStore.ts` + `/api/learn`):** the browser
+  voice/assistant reports successful Gemini exchanges (`learnFromGemini` in
+  `hooks/useVoiceAssistant.ts`); they accumulate in `data/gemini-lessons.json`.
+  When ≥4 pile up (≤1 distill per 30 min) the route asks Gemini to distill
+  reusable **facts** (`data/learned-facts.json`, injected into the server
+  assistant system prompt via `learnedFactsSystemNote`) and **style rules**
+  (`data/learned-styles.json`, injected into the image-style skill body). All
+  three files are gitignored runtime state.
 - **Web search (real-time, local-first):** `app/api/search/route.ts` →
   `completeCloudWithSearch` (`lib/serverLLM.ts`). Chain: Gemini Grounding
   (best; needs billing — free keys hit 429, and `gemini-2.5-flash` is

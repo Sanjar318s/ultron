@@ -1,9 +1,9 @@
 /**
  * LLMRouter — picks the best available model for a request and falls back
  * down the chain on failure. Priority order is configurable at runtime
- * (setPreferred) and defaults to local-first:
+ * (setPreferred) and defaults to:
  *
- *   Ollama → Gemini → Groq → WebLLM
+ *   Gemini → Ollama → Groq → WebLLM
  *
  * (OpenAI/DeepSeek keys exist but are unfunded — removed from the active
  * chain so we don't wait on their timeouts.)
@@ -13,7 +13,7 @@
 
 import type { ChatMessage, CompleteOptions, LLMProvider, LLMResult, ProviderId } from "./types";
 
-export const DEFAULT_ORDER: ProviderId[] = ["ollama", "gemini", "groq", "webllm"];
+export const DEFAULT_ORDER: ProviderId[] = ["gemini", "ollama", "groq", "webllm"];
 
 export class LLMRouter {
   private readonly providers = new Map<ProviderId, LLMProvider>();
