@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   extractImagePrompt,
+  normalizeLLMAction,
   snapshotIds,
   type AssistantAction,
   type AssistantBrain,
@@ -378,6 +379,11 @@ async function executeHandledAction(
       shell(url);
       return { reply: `Локально ничего не нашёл. Открываю поиск в Google Картинках.` };
     }
+    case "music-search": {
+      const url = `https://music.yandex.ru/search?text=${encodeURIComponent(action.query)}`;
+      openViaShell(url);
+      return { reply: `Ищу «${action.query}» в Яндекс Музыке.` };
+    }
   }
 }
 
@@ -599,23 +605,29 @@ export async function POST(req: NextRequest) {
       parsed?.learn && Array.isArray(parsed.learn) ? brain.learnFromLLM(parsed.learn as LLMLearnItem[]) : 0;
     const finalReply = added > 0 ? `${reply} Запомнил.` : reply;
 
-    // LLM proposed an action.
+    // LLM proposed an action. Images need the special local/ref pipeline and
+    // stay inline; everything else (launch, chain, music-search, weather,
+    // search, run-skill, window ops, file-search) normalizes through
+    // normalizeLLMAction and runs in executeHandledAction — the same executor
+    // the brain's local path uses, so chains and new actions work identically
+    // from the LLM and the rule layer.
     let image: { b64: string; mime: string } | undefined;
     let actionReply: string | undefined;
     let needsApproval: { id: string; description: string } | undefined;
-    if (parsed?.action && typeof parsed.action === "object") {
+    if (parsed?.action != null) {
       const a = parsed.action as {
         type?: unknown;
         prompt?: unknown;
         text?: unknown;
         ref?: unknown;
-        skill?: unknown;
-        city?: unknown;
-        app?: unknown;
-        query?: unknown;
-        learn?: unknown;
       };
-      if (a.type === "image" && typeof a.prompt === "string" && a.prompt.trim()) {
+      if (
+        typeof a === "object" &&
+        a !== null &&
+        a.type === "image" &&
+        typeof a.prompt === "string" &&
+        a.prompt.trim()
+      ) {
         try {
           const explicitRef = typeof a.ref === "string" && a.ref.trim() ? a.ref.trim() : "";
           const reference = await resolveImageReference(explicitRef || visibleText, Boolean(explicitRef));
@@ -634,48 +646,13 @@ export async function POST(req: NextRequest) {
           const message = err instanceof Error ? err.message : String(err);
           actionReply = `Не удалось сгенерировать изображение: ${message}.`;
         }
-      } else if (a.type === "weather" && typeof a.city === "string" && a.city.trim()) {
-        const w = await fetchInternal(baseUrl, `/api/weather?city=${encodeURIComponent(a.city.trim())}`);
-        const data = (await w.json().catch(() => null)) as {
-          city?: string;
-          temp?: number;
-          feelsLike?: number;
-          humidity?: number;
-          condition?: string;
-          error?: string;
-        } | null;
-        if (w.ok && data?.city) {
-          const feels = data.feelsLike !== undefined ? ` Ощущается как ${data.feelsLike}°.` : "";
-          actionReply = `Сейчас в ${data.city}: ${data.temp}°, ${data.condition ?? ""}.${feels}`;
-        } else {
-          actionReply = `Не удалось узнать погоду: ${data?.error ?? w.status}.`;
-        }
-      } else if (a.type === "launch" && typeof a.app === "string" && a.app.trim()) {
-        const name = a.app.trim().toLowerCase();
-        const outcome = await launchApp(name, undefined, { focus: true });
-        actionReply = outcome
-          ? outcome.url
-            ? `Открываю ${outcome.url} в браузере.`
-            : `Запускаю «${outcome.matched}».`
-          : `Не удалось найти приложение «${name}».`;
-      } else if (a.type === "search" && typeof a.query === "string" && a.query.trim()) {
-        actionReply = await handleSearchAction(
-          brain,
-          { query: a.query.trim(), learn: a.learn === true },
-          baseUrl,
-          cloudOpts,
-        );
-      } else if (a.type === "run-skill" && typeof a.skill === "string") {
-        const skill = brain.findSkill(a.skill);
-        if (skill) {
-          skill.uses += 1;
-          skill.lastUsedAt = Date.now();
-          await commitBrain(brain, baseIds);
-          actionReply = await executeSkill(brain, skill.id, baseUrl);
-        } else {
-          const dispatched = await runSkillDispatch(brain, a.skill, baseUrl, chatKey, cloudOpts);
-          actionReply = dispatched.reply;
-          if (dispatched.needsApproval) needsApproval = dispatched.needsApproval;
+      } else {
+        const llmAction = normalizeLLMAction(parsed.action);
+        if (llmAction) {
+          const executed = await executeHandledAction(brain, llmAction, baseUrl, { chatKey, cloudOpts });
+          if (executed.reply) actionReply = executed.reply;
+          if (executed.needsApproval) needsApproval = executed.needsApproval;
+          if (executed.image) image = executed.image;
         }
       }
     }

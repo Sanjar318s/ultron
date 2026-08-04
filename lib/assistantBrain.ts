@@ -14,7 +14,7 @@
  */
 
 import { resolveSite, siteSearchUrl, findSiteInPhrase } from "@/lib/sites";
-import { isCompoundCommand, splitLaunchChain } from "@/lib/commandSplit";
+import { isCompoundCommand, musicSearchQuery, splitLaunchChain } from "@/lib/commandSplit";
 import type { MetaAlgorithm } from "@/lib/metaLearning";
 
 export type AssistantAction =
@@ -38,7 +38,8 @@ export type AssistantAction =
   | { kind: "restore" }
   | { kind: "toggle-maximize" }
   | { kind: "chain"; actions: AssistantAction[] }
-  | { kind: "file-search"; query: string };
+  | { kind: "file-search"; query: string }
+  | { kind: "music-search"; query: string };
 
 /** Action spec as returned by an LLM: a named string or a launch/weather/run-skill/image/search object. */
 export type LLMActionSpec =
@@ -47,7 +48,8 @@ export type LLMActionSpec =
   | { type: "weather"; city: string }
   | { type: "run-skill"; skill: string }
   | { type: "image"; prompt: string; text?: string }
-  | { type: "search"; query: string; learn?: boolean };
+  | { type: "search"; query: string; learn?: boolean }
+  | { type: "music-search"; query: string };
 
 export interface LLMLearnItem {
   type: "fact" | "command";
@@ -362,6 +364,10 @@ function resolveOpenTarget(raw: string, forceBrowser = false): { app: string; ur
  */
 function launchParts(appName: string): AssistantAction[] {
   return splitLaunchChain(appName).map((p) => {
+    // A split-out part that names a track («… и поставь песню салам») is a
+    // music-search, not a launch of an app named «песню салам».
+    const music = musicSearchQuery(p);
+    if (music) return { kind: "music-search", query: music } as AssistantAction;
     const r = resolveOpenTarget(p);
     return { kind: "launch", app: r.app, url: r.url } as AssistantAction;
   });
@@ -411,6 +417,15 @@ function parseAction(norm: string): AssistantAction | null {  if (/(?:^| )сбр
   if (browserSearch) {
     const target = browserSearch[1].trim();
     return { kind: "launch", app: target, url: siteSearchUrl(target) };
+  }
+
+  // «поставь/включи/найди песню/трек X (в яндекс музыке)» — search inside the
+  // music service, NOT launch an app named «песню X». Checked BEFORE extractSearch
+  // (which would turn «найди песню X» into a web search) and before open/run so
+  // the tail «в яндекс музыке» never becomes a second launch of the site.
+  const musicQuery = musicSearchQuery(norm);
+  if (musicQuery) {
+    return { kind: "music-search", query: musicQuery };
   }
 
   // «найди <x>» / «изучи <тема>» — search the web and answer (or learn).
@@ -477,6 +492,7 @@ export function normalizeLLMAction(spec: unknown): AssistantAction | null {
       query?: unknown;
       learn?: unknown;
       actions?: unknown;
+      skill?: unknown;
     };
     if (o.type === "launch" && typeof o.app === "string" && o.app.trim()) {
       const parts = splitLaunchChain(o.app.trim()).map(
@@ -506,6 +522,12 @@ export function normalizeLLMAction(spec: unknown): AssistantAction | null {
     }
     if (o.type === "search" && typeof o.query === "string" && o.query.trim()) {
       return { kind: "search", query: o.query.trim(), learn: o.learn === true };
+    }
+    if (o.type === "music-search" && typeof o.query === "string" && o.query.trim()) {
+      return { kind: "music-search", query: o.query.trim() };
+    }
+    if (o.type === "run-skill" && typeof o.skill === "string" && o.skill.trim()) {
+      return { kind: "run-skill", skillId: o.skill.trim() };
     }
     if (o.type === "maximize") return { kind: "maximize" };
     if (o.type === "minimize") return { kind: "minimize" };
@@ -563,6 +585,8 @@ function describeAction(action: AssistantAction): string {
       return action.actions.map(describeAction).join(" → ");
     case "file-search":
       return `найти файл «${action.query}»`;
+    case "music-search":
+      return `найти в музыке «${action.query}»`;
   }
 }
 
@@ -1255,9 +1279,10 @@ export class AssistantBrain {
         : "- (изученных материалов пока нет)";
     return [
       "Ты — УЛЬТРОН, голосовой ИИ-помощник голографического орба. Отвечай по-русски, обращаясь к пользователю на «вы».",
-      "Доступные действия: zoom-in (приблизить), zoom-out (отдалить), reset (сбросить вид), gestures-on (включить жесты), gestures-off (выключить жесты), stop (остановить), {\"type\":\"launch\",\"app\":\"<имя>\"} (запустить приложение), {\"type\":\"weather\",\"city\":\"<город>\"} (узнать погоду), {\"type\":\"run-skill\",\"skill\":\"<имя навыка>\"} (выполнить выученный навык), {\"type\":\"image\",\"prompt\":\"<описание на английском>\"} (сгенерировать изображение), {\"type\":\"search\",\"query\":\"<запрос>\"} (найти информацию в интернете), {\"type\":\"maximize\"} (развернуть окно на весь экран), {\"type\":\"minimize\"} (свернуть окно), {\"type\":\"close\"} (закрыть окно), {\"type\":\"restore\"} (восстановить окно), {\"type\":\"toggle-maximize\"} (переключить размер), {\"type\":\"file-search\",\"query\":\"<запрос>\"} (найти файл/фото на ПК).",
+      "Доступные действия: zoom-in (приблизить), zoom-out (отдалить), reset (сбросить вид), gestures-on (включить жесты), gestures-off (выключить жесты), stop (остановить), {\"type\":\"launch\",\"app\":\"<имя>\"} (запустить приложение), {\"type\":\"weather\",\"city\":\"<город>\"} (узнать погоду), {\"type\":\"run-skill\",\"skill\":\"<имя навыка>\"} (выполнить выученный навык), {\"type\":\"image\",\"prompt\":\"<описание на английском>\"} (сгенерировать изображение), {\"type\":\"search\",\"query\":\"<запрос>\"} (найти информацию в интернете), {\"type\":\"music-search\",\"query\":\"<запрос>\"} (найти песню/трек в Яндекс Музыке), {\"type\":\"maximize\"} (развернуть окно на весь экран), {\"type\":\"minimize\"} (свернуть окно), {\"type\":\"close\"} (закрыть окно), {\"type\":\"restore\"} (восстановить окно), {\"type\":\"toggle-maximize\"} (переключить размер), {\"type\":\"file-search\",\"query\":\"<запрос>\"} (найти файл/фото на ПК).",
       "УПРАВЛЕНИЕ ОКНАМИ: если пользователь просит «сделай на весь экран», «разверни», «сверни», «свернуть», «закрой окно», «закрой», «восстанови», «переключи размер окна» — верни соответствующее действие: maximize, minimize, close, restore, toggle-maximize. Если это модификатор к запуску («открой блокнот на весь экран»), верни chain: [{\"type\":\"launch\",\"app\":\"блокнот\"}, {\"type\":\"maximize\"}].",
-      "СОСТАВНЫЕ КОМАНДЫ: если в одной просьбе несколько действий через «и», «затем», «потом», запятую или точку с запятой — верни chain с последовательными действиями, а НЕ одно действие с общим названием. Пример: «открой стим и запусти кс 2» → {\"type\":\"chain\",\"actions\":[{\"type\":\"launch\",\"app\":\"стим\"},{\"type\":\"launch\",\"app\":\"кс 2\"}]}. «включи ютуб и поставь музыку» → chain из launch(\"ютуб\") и launch(\"музыка\"). Никогда не возвращай app вида «стим и запусти кс 2».",
+      "СОСТАВНЫЕ КОМАНДЫ: если в одной просьбе несколько действий через «и», «затем», «потом», запятую или точку с запятой — верни chain с последовательными действиями, а НЕ одно действие с общим названием. Пример: «открой стим и запусти кс 2» → {\"type\":\"chain\",\"actions\":[{\"type\":\"launch\",\"app\":\"стим\"},{\"type\":\"launch\",\"app\":\"кс 2\"}]}. «включи ютуб и поставь музыку» → chain из launch(\"ютуб\") и launch(\"музыка\"). «открой яндекс музыку и поставь песню салам» → {\"type\":\"chain\",\"actions\":[{\"type\":\"launch\",\"app\":\"яндекс музыка\"},{\"type\":\"music-search\",\"query\":\"Салам\"}]}. Никогда не возвращай app вида «стим и запусти кс 2».",
+      "МУЗЫКА: если пользователь просит «поставь/включи песню X», «поставь/включи трек X», «найди песню X», «поставь X в яндекс музыке» — верни action {\"type\":\"music-search\",\"query\":\"<название песни/трека>\"}. Это открывает поиск в Яндекс Музыке, а НЕ запуск приложения «песню X» и НЕ повторное открытие сайта. Никогда не возвращай launch с app «песню …» или «трек …». Если запрос начинается с «открой/включи яндекс музыку, и поставь …» — верни chain: сначала launch(\"яндекс музыка\"), затем music-search.",
       "СИСТЕМНЫЕ НАСТРОЙКИ: «настройки» / «параметры» → action {\"type\":\"launch\",\"app\":\"настройки\"} (откроется ms-settings:). «Приложения по умолчанию» → {\"type\":\"launch\",\"app\":\"приложения по умолчанию\"}. «Дисплей» / «экран» → {\"type\":\"launch\",\"app\":\"дисплей\"}. «Звук» → {\"type\":\"launch\",\"app\":\"звук\"}. Не ищи .exe файлы для системных настроек — они открываются через URI schemes Windows.",
       "ПОИСК ФАЙЛОВ: если пользователь просит «открой фото X», «найди фото X», «покажи фото X», «найди картинку X» — верни action {\"type\":\"file-search\",\"query\":\"<запрос>\"}. Сначала ищет локально на ПК, потом в Google Картинки. Никогда не говори «я не могу» — ты умеешь искать файлы.",
       "ПОГОДА: если пользователь спрашивает о погоде, температуре, дожде, ветре и т.п. — НЕ выдумывай данные и НЕ предлагай запустить приложение. Верни action {\"type\":\"weather\",\"city\":\"<город из вопроса или 'Ташкент', если город не назван>\"} и reply «Сейчас узнаю погоду.»",
@@ -1279,7 +1304,7 @@ export class AssistantBrain {
             "КРАТКО: это голосовой интерфейс — отвечай в reply ОЧЕНЬ коротко, 1–2 предложения, без воды и перечислений. Подробности или длинный текст — только по явной просьбе пользователя (тогда в поле generate).",
           ]
         : []),
-      "Отвечай СТРОГО одним JSON-объектом без markdown и пояснений: {\"reply\": \"твой ответ\", \"generate\": null | \"полный длинный текст при запросе на генерацию\", \"action\": null | строка | {\"type\":\"launch\",\"app\":\"...\"} | {\"type\":\"weather\",\"city\":\"...\"} | {\"type\":\"run-skill\",\"skill\":\"...\"} | {\"type\":\"image\",\"prompt\":\"...\",\"text\": null | \"подпись на картинке\"} | {\"type\":\"maximize\"} | {\"type\":\"minimize\"} | {\"type\":\"close\"} | {\"type\":\"restore\"} | {\"type\":\"file-search\",\"query\":\"...\"}, \"learn\": [{\"type\":\"fact\",\"text\":\"...\"}] | [{\"type\":\"command\",\"trigger\":\"фраза\",\"response\":\"ответ\",\"action\": null | строка}]}",
+      "Отвечай СТРОГО одним JSON-объектом без markdown и пояснений: {\"reply\": \"твой ответ\", \"generate\": null | \"полный длинный текст при запросе на генерацию\", \"action\": null | строка | {\"type\":\"launch\",\"app\":\"...\"} | {\"type\":\"weather\",\"city\":\"...\"} | {\"type\":\"run-skill\",\"skill\":\"...\"} | {\"type\":\"image\",\"prompt\":\"...\",\"text\": null | \"подпись на картинке\"} | {\"type\":\"music-search\",\"query\":\"...\"} | {\"type\":\"chain\",\"actions\":[...]} | {\"type\":\"maximize\"} | {\"type\":\"minimize\"} | {\"type\":\"close\"} | {\"type\":\"restore\"} | {\"type\":\"file-search\",\"query\":\"...\"}, \"learn\": [{\"type\":\"fact\",\"text\":\"...\"}] | [{\"type\":\"command\",\"trigger\":\"фраза\",\"response\":\"ответ\",\"action\": null | строка}]}",
     ].join("\n\n");
   }
 
@@ -1917,6 +1942,8 @@ export class AssistantBrain {
         return { handled: true, reply: "Выполняю цепочку команд.", action };
       case "file-search":
         return { handled: true, reply: `Ищу файл «${action.query}»…`, action };
+      case "music-search":
+        return { handled: true, reply: `Ищу «${action.query}» в Яндекс Музыке.`, action };
     }
   }
 

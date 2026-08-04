@@ -3,7 +3,12 @@ import { mkdtempSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { splitLaunchChain, steamAliasName } from "../lib/commandSplit.ts";
+import {
+  musicSearchQuery,
+  splitLaunchChain,
+  steamAliasName,
+  stripLaunchQualifiers,
+} from "../lib/commandSplit.ts";
 import { findSiteInPhrase, resolveSite } from "../lib/sites.ts";
 
 /**
@@ -97,6 +102,19 @@ export async function runSelfTests({ live = false } = {}) {
     ["split single command", splitLaunchChain("блокнот").length === 1],
     ["steam alias cs2", steamAliasName("кс 2") === "Counter-Strike 2"],
     ["steam alias kontra in phrase", steamAliasName("запусти контра") === "Counter-Strike 2"],
+    ["strip tail 'стим открыт'", stripLaunchQualifiers("кс 2 стим открыт") === "кс 2"],
+    ["strip tail 'уже открыт'", stripLaunchQualifiers("кс 2 уже открыт") === "кс 2"],
+    ["strip tail 'в яндекс музыке'", stripLaunchQualifiers("кс 2 в яндекс музыке") === "кс 2"],
+    ["strip tail 'через браузер'", stripLaunchQualifiers("яндекс музыка через браузер") === "яндекс музыка"],
+    ["strip idempotent chain", stripLaunchQualifiers("кс 2 стим открыт уже запущен") === "кс 2"],
+    [
+      "music full command",
+      musicSearchQuery("поставь песню салам в яндекс музыке") === "салам",
+    ],
+    ["music bare noun", musicSearchQuery("песню салам") === "салам"],
+    ["music 'найди трек'", musicSearchQuery("найди трек imagination") === "imagination"],
+    ["music non-music null", musicSearchQuery("открой стим") === null],
+    ["music track quote keeps words", musicSearchQuery("включи музыку стану джазом") === "стану джазом"],
   ];
   for (const [name, ok] of pureChecks) check(`pure ${name}`, ok);
 

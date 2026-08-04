@@ -15,7 +15,7 @@ import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { dedupeApps, findBestApp, isReasonableApp, matchAppScore, normForMatch, scanInstalledApps } from "@/lib/installedApps";
-import { steamAliasName } from "@/lib/commandSplit";
+import { steamAliasName, stripLaunchQualifiers } from "@/lib/commandSplit";
 import { findSiteInPhrase, resolveSite } from "@/lib/sites";
 
 /** Safe charset for a URL (https/http only, no quotes/semicolons/whitespace). */
@@ -493,6 +493,77 @@ export async function matchSteamGame(query: string): Promise<SteamGame | null> {
   return best;
 }
 
+/** Short async delay (used while waiting for Steam/Windows to settle). */
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Launch a Steam game by appid. Steam's protocol handler is `Steam.exe -- %1`
+ * registered at HKEY_CLASSES_ROOT\steam, but `Start-Process 'steam://…'` is
+ * unreliable on this machine; the mechanism that provably opens Steam is
+ * `cmd /c start "" "steam://…"` (the same one the «стим» allowlist uses). The
+ * protocol URL sent while the client is still booting is silently dropped, so
+ * we first make sure the client is up, then send the game URL and verify via
+ * Steam's RunningAppID registry value, retrying if it didn't take.
+ */
+export async function launchSteamGame(appid: string): Promise<boolean> {
+  await ensureSteamReady();
+  const target = `steam://rungameid/${appid}`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    spawn("cmd.exe", ["/c", "start", "", target], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    if (await waitForRunningAppId(appid, 12_000)) return true;
+  }
+  return false;
+}
+
+/** Fire-and-forget open of the Steam client itself. */
+function startSteamClient(): void {
+  spawn("cmd.exe", ["/c", "start", "", "steam://"], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+}
+
+/** Whether steam.exe (and ideally the UI helper) is alive. */
+async function steamRunning(): Promise<boolean> {
+  const out = await runPs(
+    "$p = @(Get-Process steam -ErrorAction SilentlyContinue); if ($p.Count -gt 0) { '1' } else { '0' }",
+    10_000,
+  ).catch(() => "0");
+  return out.includes("1");
+}
+
+/** Start the client if needed and wait until it's up and settled (~35s cap). */
+async function ensureSteamReady(timeoutMs = 35_000): Promise<boolean> {
+  let started = false;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await steamRunning()) {
+      // Let the client finish drawing its UI so a game URL isn't dropped.
+      await sleep(2_500);
+      return true;
+    }
+    if (!started) {
+      startSteamClient();
+      started = true;
+    }
+    await sleep(1_500);
+  }
+  return false;
+}
+
+/** Poll Steam's RunningAppID registry value; true once it equals the appid. */
+async function waitForRunningAppId(appid: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const out = await runPs(
+      "$v = (Get-ItemProperty 'HKCU:\\Software\\Valve\\Steam\\RunningAppID' -ErrorAction SilentlyContinue).RunningAppID; if ($v) { Write-Output $v }",
+      8_000,
+    ).catch(() => "");
+    if (out.trim() === appid) return true;
+    await sleep(2_000);
+  }
+  return false;
+}
+
 /** Resolve an allowlist entry to a launchable target string, if it has one. */
 function allowlistTarget(key: string): string | null {
   const entry = APPS[key];
@@ -534,29 +605,32 @@ export async function launchApp(
   }
 
   const name = spoken.trim().toLowerCase();
+  // Drop tail qualifiers («кс 2 стим открыт» → «кс 2») before any matching so
+  // the whole phrase never goes into the app scan / Steam lookup.
+  const clean = stripLaunchQualifiers(name);
 
   // Exact allowlist first (стим → steam://, телеграм → desktop app, …).
-  if (APPS[name]) {
+  if (APPS[clean]) {
     if (focus) {
-      const target = allowlistTarget(name);
+      const target = allowlistTarget(clean);
       if (target) {
         await launchAndFocus(target);
-        return { launched: name, matched: name };
+        return { launched: name, matched: clean };
       }
     }
-    spawn(APPS[name].command, APPS[name].args, { detached: true, stdio: "ignore", windowsHide: true }).unref();
-    return { launched: name, matched: name };
+    spawn(APPS[clean].command, APPS[clean].args, { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    return { launched: name, matched: clean };
   }
 
   // Known site inside the phrase («ютуб через браузер на пк» → YouTube) —
   // BEFORE the allowlist token fallback so «браузер» can't steal the intent.
-  const siteUrl = resolveSite(name) ?? findSiteInPhrase(name);
+  const siteUrl = resolveSite(clean) ?? findSiteInPhrase(clean);
   if (siteUrl) {
     openViaShell(siteUrl);
-    return { launched: name, matched: name, url: siteUrl };
+    return { launched: name, matched: clean, url: siteUrl };
   }
 
-  const allowHit = allowlistTokenMatch(name);
+  const allowHit = allowlistTokenMatch(clean);
   const allowEntry = allowHit?.[1] ?? null;
   const allowKey = allowHit?.[0] ?? null;
   if (allowEntry && allowKey) {
@@ -564,31 +638,31 @@ export async function launchApp(
       const target = allowlistTarget(allowKey);
       if (target) {
         await launchAndFocus(target);
-        return { launched: name, matched: name };
+        return { launched: name, matched: clean };
       }
     }
     spawn(allowEntry.command, allowEntry.args, { detached: true, stdio: "ignore", windowsHide: true }).unref();
-    return { launched: name, matched: name };
+    return { launched: name, matched: clean };
   }
 
   // System settings URI fallback (ms-settings: for common phrases).
-  const settingsUri = resolveSettingsUri(name);
+  const settingsUri = resolveSettingsUri(clean);
   if (settingsUri) {
     openViaShell(settingsUri);
-    return { launched: name, matched: name };
+    return { launched: name, matched: clean };
   }
 
   // Installed Steam game («запусти кс 2» → steam://rungameid/730). Checked
   // BEFORE the installed-app scan: game names must never be shadowed by a
   // Windows app (e.g. the Xbox Game Bar surfacing for «кс 2»).
-  const game = await matchSteamGame(name);
+  const game = await matchSteamGame(clean);
   if (game) {
-    openViaShell(`steam://rungameid/${game.appid}`);
+    await launchSteamGame(game.appid);
     return { launched: name, matched: game.name };
   }
 
   const installed = findBestApp(
-    name,
+    clean,
     dedupeApps((await scanInstalledApps()).filter((a) => isReasonableApp(a.name))),
   );
   if (installed) {
@@ -597,15 +671,15 @@ export async function launchApp(
     return { launched: name, matched: installed.name };
   }
 
-  if (/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(name)) {
-    openViaShell(`https://${name}`);
-    return { launched: name, matched: name };
+  if (/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(clean)) {
+    openViaShell(`https://${clean}`);
+    return { launched: name, matched: clean };
   }
 
   // Last resort: Windows Start-menu search by spoken name (clipboard-safe).
-  if (/^[\p{L}\p{N} _-]{2,40}$/u.test(name)) {
-    const ok = await winSearchLaunch(name);
-    if (ok) return { launched: name, matched: name };
+  if (/^[\p{L}\p{N} _-]{2,40}$/u.test(clean)) {
+    const ok = await winSearchLaunch(clean);
+    if (ok) return { launched: name, matched: clean };
   }
 
   return null;

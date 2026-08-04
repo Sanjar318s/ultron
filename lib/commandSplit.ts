@@ -17,6 +17,31 @@ const CHAIN_SEPARATOR =
 
 const SPOKEN_VERB = /^(?:запусти|запустить|запустите|открой|открыть|откройте|включи|включить|включите|поставь|поставить|напиши|написать|сделай|сделать|загрузи|загрузить)\s+/i;
 
+/** Tail qualifiers that describe HOW a target should run, not what it is.
+ *  «запусти кс 2 стим открыт» → «кс 2». Applied repeatedly from the end. */
+const TAIL_QUALIFIERS = [
+  /\s+(?:стим|steam)\s+(?:уже\s+)?(?:открыт|запущен|включ[её]н)\s*$/i,
+  /\s+(?:уже\s+)?(?:открыт|запущен|включ[её]н)\s*$/i,
+  /\s+(?:в|через|на)\s+(?:стим|steam|браузер)\s*$/i,
+  /\s+из\s+стима\s*$/i,
+  /\s+(?:в|через)\s+(?:яндекс\s*музык\p{L}*|музык\p{L}*|спотифай|spotify)\s*$/iu,
+];
+
+/**
+ * Strip trailing qualifiers from a launch target so the remaining string is a
+ * clean app/site/game name. Returns the trimmed name (never empty for a
+ * non-empty input — only the qualifier tail is removed).
+ */
+export function stripLaunchQualifiers(name: string): string {
+  let s = String(name ?? "").trim();
+  let prev: string;
+  do {
+    prev = s;
+    for (const re of TAIL_QUALIFIERS) s = s.replace(re, "").trim();
+  } while (s !== prev);
+  return s;
+}
+
 /**
  * Split a compound launch phrase into individual launch targets.
  * Returns 1..n parts; a single part is returned as-is (no split).
@@ -88,4 +113,21 @@ export function steamAliasName(name: string): string | null {
     if (re.test(key)) return title;
   }
   return null;
+}
+
+/**
+ * Extract the track/album name from a music phrase. Accepts full commands
+ * («поставь песню салам в яндекс музыке» → «салам») and bare noun phrases
+ * from split chains («песню салам» → «салам»). Returns null when the phrase
+ * is not a music request.
+ */
+export function musicSearchQuery(phrase: string): string | null {
+  const s = String(phrase ?? "").trim();
+  if (!s) return null;
+  const full = s.match(
+    /(?:поставь|включи|поставить|включить|запусти|запустить|найди|найти|покажи)\s+(?:песню|песня|трек|музыку|музыка|композицию|мелодию|альбом)\s+(.+?)\s*(?:в\s+(?:яндекс\s*музык\p{L}*|музык\p{L}*|спотифай|spotify))?$/iu,
+  );
+  if (full) return full[1].trim();
+  const bare = s.match(/^(?:песню|песня|трек|музыку|музыка|композицию|мелодию|альбом)\s+(.+)$/i);
+  return bare?.[1]?.trim() ?? null;
 }
