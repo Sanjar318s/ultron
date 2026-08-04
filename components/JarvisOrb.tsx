@@ -35,6 +35,8 @@ export default function JarvisOrb() {
   const [mounted, setMounted] = useState(false);
   const [inputText, setInputText] = useState("");
   const [panelCollapsed, setPanelCollapsed] = useState(false);
+  const [hintsOpen, setHintsOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -183,6 +185,12 @@ export default function JarvisOrb() {
   const assistantRef = useRef(assistant);
   assistantRef.current = assistant;
 
+  // The orb core pulses in sync with the voice: soft "attention" while
+  // listening, a pronounced speech pulse while speaking.
+  useEffect(() => {
+    sceneRef.current?.setSpeaking(assistant.speaking || assistant.listening);
+  }, [assistant.speaking, assistant.listening]);
+
   const toggleLesson = useCallback(() => {
     if (assistant.lesson) {
       void assistant.stopLesson();
@@ -203,6 +211,7 @@ export default function JarvisOrb() {
       if (!text) return;
       assistant.send(text);
       setInputText("");
+      setMoreOpen(false);
     },
     [assistant, inputText],
   );
@@ -244,6 +253,11 @@ export default function JarvisOrb() {
 
   const cameraOn = camera === "on";
   const assistantLive = assistant.listening || assistant.speaking;
+  const statusLabel = assistant.speaking
+    ? "ГОВОРИТ"
+    : assistant.listening
+      ? "СЛУШАЕТ"
+      : PROVIDER_LABEL[assistant.activeProvider ?? assistant.preferredProvider ?? ""] ?? "В РЕЖИМЕ ОЖИДАНИЯ";
 
   return (
     <>
@@ -255,38 +269,54 @@ export default function JarvisOrb() {
 
       <div className="hud hud-title">U.L.T.R.O.N.</div>
 
-      <div className="hud hud-hint">
-        <div>
-          <span className="key">ТЯНИ</span> вращение&nbsp;&nbsp;
-          <span className="key">КОЛЕСО</span> масштаб
+      {mounted && (
+        <div className="hud hud-hint-wrap">
+          <button
+            type="button"
+            className="hint-toggle"
+            aria-pressed={hintsOpen}
+            onClick={() => setHintsOpen((o) => !o)}
+            title="Подсказки"
+          >
+            ?
+          </button>
+          {hintsOpen && (
+            <div className="hud-hint">
+              <div>
+                <span className="key">ТЯНИ</span> вращение&nbsp;&nbsp;
+                <span className="key">КОЛЕСО</span> масштаб
+              </div>
+              {cameraOn ? (
+                <div>
+                  <span className="key">ЩИПОК + ДВИЖЕНИЕ</span> вращение&nbsp;&nbsp;
+                  <span className="key">ДВА ЩИПКА ± РАЗВЕДЕНИЕ</span> масштаб
+                </div>
+              ) : (
+                <div>
+                  <span className="key">G</span> жесты&nbsp;&nbsp;
+                  <span className="key">R</span> сброс&nbsp;&nbsp;
+                  <span className="key">+/−</span> масштаб&nbsp;&nbsp;
+                  <span className="key">V</span> голос
+                </div>
+              )}
+              {assistant.supported && (
+                <div>
+                  <span className="key">ГОЛОС</span> «включи жесты» · «сброс» · «запусти …» ·
+                  «выучи &lt;фраза&gt;» · «чему ты научился»
+                </div>
+              )}
+            </div>
+          )}
         </div>
-        {cameraOn ? (
-          <div>
-            <span className="key">ЩИПОК + ДВИЖЕНИЕ</span> вращение&nbsp;&nbsp;
-            <span className="key">ДВА ЩИПКА ± РАЗВЕДЕНИЕ</span> масштаб
-          </div>
-        ) : (
-          <div>
-            <span className="key">G</span> жесты&nbsp;&nbsp;
-            <span className="key">R</span> сброс&nbsp;&nbsp;
-            <span className="key">+/−</span> масштаб&nbsp;&nbsp;
-            <span className="key">V</span> голос
-          </div>
-        )}
-        {mounted && assistant.supported && (
-          <div>
-            <span className="key">ГОЛОС</span> «включи жесты» · «сброс» · «запусти …» ·
-            «выучи &lt;фраза&gt;» · «чему ты научился»
-          </div>
-        )}
-      </div>
+      )}
 
       {mounted && assistant.supported && (
         <div className="hud hud-assistant">
           <div className="assistant-head">
             <span className={`assistant-dot${assistantLive ? " live" : ""}`} />
             <span>J.A.R.V.I.S.</span>
-            <span className="assistant-count">выучено: {assistant.learnedCount}</span>
+            <span className="assistant-status">{statusLabel}</span>
+            <span className="assistant-count">навыков: {assistant.learnedCount}</span>
             <button
               type="button"
               className="assistant-collapse"
@@ -303,7 +333,7 @@ export default function JarvisOrb() {
               <div className="assistant-log" ref={logRef}>
                 {assistant.messages.length === 0 && (
                   <div className="assistant-empty">
-                    Голосовой помощник выключен. Нажми МИК или пиши сообщение.
+                    Голосовой помощник выключен. Нажми ГОВОРИТЬ или пиши сообщение.
                     Скажи «выучи &lt;фраза&gt;», чтобы обучить меня новой команде.
                   </div>
                 )}
@@ -349,89 +379,22 @@ export default function JarvisOrb() {
               <div className="assistant-controls">
                 <button
                   type="button"
-                  className="hud-btn"
+                  className={`hud-btn hud-btn-mic${assistantLive ? " live" : ""}`}
                   aria-pressed={assistant.listening}
                   onClick={assistant.toggle}
                 >
-                  {assistant.listening ? "МИК ВКЛ" : "МИК ВЫКЛ"}
+                  {assistant.listening ? "■ СТОП" : "● ГОВОРИТЬ"}
                 </button>
                 <button
                   type="button"
                   className="hud-btn"
-                  aria-pressed={assistant.teachMode}
-                  onClick={assistant.toggleTeachMode}
+                  aria-pressed={cameraOn}
+                  onClick={toggleGestures}
+                  disabled={camera === "starting"}
                 >
-                  ОБУЧЕНИЕ{assistant.teachMode ? " ВКЛ" : ""}
-                </button>
-                <button
-                  type="button"
-                  className="hud-btn"
-                  aria-pressed={assistant.lesson !== null}
-                  onClick={toggleLesson}
-                  title="Записать урок по демонстрации экрана"
-                >
-                  {assistant.lesson ? `УРОК: СТОП (${assistant.lesson.frames})` : "УРОК"}
-                </button>
-                <button
-                  type="button"
-                  className="hud-btn"
-                  aria-pressed={assistant.lesson !== null}
-                  onClick={() => assistant.say("Скажите «учись <что сделать>» — запишу урок, или «какие навыки» — покажу выученное.")}
-                  title="Помощь по урокам"
-                >
-                  НАВЫКИ
+                  {camera === "starting" ? "ЖЕСТЫ…" : cameraOn ? "✋ ЖЕСТЫ ВКЛ" : "✋ ЖЕСТЫ"}
                 </button>
               </div>
-
-              <div className="assistant-controls">
-                <button
-                  type="button"
-                  className="hud-btn"
-                  onClick={assistant.clearLog}
-                >
-                  ОЧИСТИТЬ
-                </button>
-                <button type="button" className="hud-btn" onClick={assistant.forgetAll}>
-                  ЗАБЫТЬ ВСЁ
-                </button>
-                <button
-                  type="button"
-                  className="hud-btn"
-                  aria-pressed={assistant.pcControl}
-                  onClick={assistant.togglePcControl}
-                  title="Разрешить/запретить запуск приложений без вопроса"
-                >
-                  ДОСТУП: {assistant.pcControl ? "ВКЛ" : "ВЫКЛ"}
-                </button>
-              </div>
-
-              <div className="assistant-controls">
-                <button
-                  type="button"
-                  className="hud-btn"
-                  onClick={assistant.cycleProvider}
-                  title="Сменить предпочтительную модель"
-                >
-                  МОДЕЛЬ:{" "}
-                  {PROVIDER_LABEL[assistant.activeProvider ?? assistant.preferredProvider ?? ""] ?? "АВТО"}
-                </button>
-                {!assistant.webllm.loaded && (
-                  <button
-                    type="button"
-                    className="hud-btn"
-                    onClick={() => void assistant.loadWebLLM()}
-                    disabled={assistant.webllm.loading}
-                    title="Скачать модель в браузер (1–3 ГБ) для работы без интернета"
-                  >
-                    {assistant.webllm.loading
-                      ? `WEBLLM ${Math.round(assistant.webllm.progress * 100)}%`
-                      : "WEBLLM"}
-                  </button>
-                )}
-              </div>
-              {assistant.webllm.error && (
-                <div className="hud-error">WEBLLM: {assistant.webllm.error}</div>
-              )}
 
               <form className="assistant-input" onSubmit={submitMessage}>
                 <input
@@ -444,6 +407,72 @@ export default function JarvisOrb() {
                   ОК
                 </button>
               </form>
+
+              <div className="more-menu">
+                <button
+                  type="button"
+                  className="hud-btn hud-btn-more"
+                  aria-pressed={moreOpen}
+                  onClick={() => setMoreOpen((o) => !o)}
+                >
+                  ⋯
+                </button>
+                {moreOpen && (
+                  <div className="more-pop">
+                    <button type="button" onClick={toggleLesson}>
+                      {assistant.lesson ? `■ УРОК (${assistant.lesson.frames})` : "● ЗАПИСАТЬ УРОК"}
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={assistant.teachMode}
+                      onClick={assistant.toggleTeachMode}
+                    >
+                      ОБУЧЕНИЕ{assistant.teachMode ? " ВКЛ" : ""}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        assistant.say("Скажите «учись <что сделать>» — запишу урок, или «какие навыки» — покажу выученное.")
+                      }
+                    >
+                      НАВЫКИ
+                    </button>
+                    <button type="button" onClick={assistant.cycleProvider}>
+                      МОДЕЛЬ:{" "}
+                      {PROVIDER_LABEL[assistant.activeProvider ?? assistant.preferredProvider ?? ""] ?? "АВТО"}
+                    </button>
+                    {!assistant.webllm.loaded && (
+                      <button
+                        type="button"
+                        onClick={() => void assistant.loadWebLLM()}
+                        disabled={assistant.webllm.loading}
+                      >
+                        {assistant.webllm.loading
+                          ? `WEBLLM ${Math.round(assistant.webllm.progress * 100)}%`
+                          : "WEBLLM"}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      aria-pressed={assistant.pcControl}
+                      onClick={assistant.togglePcControl}
+                    >
+                      ДОСТУП: {assistant.pcControl ? "ВКЛ" : "ВЫКЛ"}
+                    </button>
+                    <button type="button" onClick={assistant.clearLog}>
+                      ОЧИСТИТЬ
+                    </button>
+                    <button type="button" onClick={assistant.forgetAll}>
+                      ЗАБЫТЬ ВСЁ
+                    </button>
+                    <button type="button" onClick={() => sceneRef.current?.resetView()}>
+                      СБРОС ВИДА
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {assistant.webllm.error && <div className="hud-error">WEBLLM: {assistant.webllm.error}</div>}
             </>
           )}
         </div>
@@ -462,29 +491,6 @@ export default function JarvisOrb() {
         </div>
 
         {error && <div className="hud-error">{error}</div>}
-
-        <div className="hud-row">
-          <button
-            type="button"
-            className="hud-btn"
-            aria-pressed={cameraOn}
-            onClick={toggleGestures}
-            disabled={camera === "starting"}
-          >
-            {camera === "starting" ? "ИНИЦИАЛИЗАЦИЯ…" : cameraOn ? "ЖЕСТЫ ВКЛ" : "ЖЕСТЫ ВЫКЛ"}
-          </button>
-        </div>
-        <div className="hud-row">
-          <button type="button" className="hud-btn" onClick={() => sceneRef.current?.zoomIn()} aria-label="Приблизить">
-            +
-          </button>
-          <button type="button" className="hud-btn" onClick={() => sceneRef.current?.zoomOut()} aria-label="Отдалить">
-            −
-          </button>
-          <button type="button" className="hud-btn" onClick={() => sceneRef.current?.resetView()}>
-            СБРОС
-          </button>
-        </div>
       </div>
     </>
   );

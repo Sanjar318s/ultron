@@ -492,10 +492,22 @@ const HELP_HTML = [
   "<b>Команды</b>",
   "• /menu — главное меню",
   "• /help — справка",
-  "• /skills — список навыков",
+  "• /skills — список навыков (запуск в один тап)",
   "• /keys — статус Gemini-ключей",
   "• /id — ваш числовой id",
 ].join("\n");
+
+/** Command list registered via setMyCommands (shown by the «/» menu). */
+const BOT_COMMANDS = [
+  { command: "menu", description: "Главное меню" },
+  { command: "skills", description: "Мои навыки — список и запуск" },
+  { command: "memory", description: "Память: правила и заметки" },
+  { command: "search", description: "Интернет-поиск" },
+  { command: "draw", description: "Генерация изображений" },
+  { command: "help", description: "Справка" },
+  { command: "keys", description: "Статус Gemini-ключей" },
+  { command: "id", description: "Ваш числовой id" },
+];
 
 const ADMIN_HELP_HTML = [
   "<b>УЛЬТРОН — админ-команды владельца</b>",
@@ -571,8 +583,10 @@ async function sendMenu(chatId, owner) {
   });
 }
 
-/** Real skill list: screen-learned + SKILL.md catalog (not an LLM reply). */
-async function renderSkills(chatId) {
+const SKILLS_PER_PAGE = 5;
+
+/** Real skill list: screen-learned + SKILL.md catalog, as tappable cards. */
+async function renderSkills(chatId, owner, page = 1) {
   let data;
   try {
     const res = await fetch(`${SERVER}/api/skills`, { signal: AbortSignal.timeout(15_000) });
@@ -584,24 +598,120 @@ async function renderSkills(chatId) {
   }
   const screen = Array.isArray(data.screen) ? data.screen : [];
   const catalog = Array.isArray(data.catalog) ? data.catalog : [];
-  const lines = ["📚 <b>Мои навыки</b>", ""];
-  if (screen.length > 0) {
-    lines.push("<b>Экранные (шаги)</b>");
-    for (const s of screen) {
-      lines.push(`• ${esc(s.name)} — ${s.steps} шаг., ${s.uses} использ.`);
-    }
-    lines.push("");
+  const items = [
+    ...screen.map((s) => ({
+      id: s.id,
+      name: s.name,
+      desc: s.goal || "",
+      tag: `экранный · ${s.steps} шаг., ${s.uses} использ.`,
+      kind: "screen",
+      safe: true,
+    })),
+    ...catalog.map((c) => ({
+      id: `cat:${c.slug}`,
+      name: c.name,
+      desc: c.description || "",
+      tag: "каталог (SKILL.md)",
+      kind: "cat",
+      safe: c.safe,
+    })),
+  ];
+  if (items.length === 0) {
+    await sendHtml(chatId, "📚 <b>Мои навыки</b>\n\nНавыков пока нет.");
+    return;
   }
-  if (catalog.length > 0) {
-    lines.push("<b>Каталог (SKILL.md)</b>");
-    for (const c of catalog) {
-      lines.push(`• ${esc(c.name)} — ${esc(c.description)}`);
-    }
-    lines.push("");
+  const pages = Math.max(1, Math.ceil(items.length / SKILLS_PER_PAGE));
+  const pageIdx = Math.min(Math.max(1, page), pages);
+  const slice = items.slice((pageIdx - 1) * SKILLS_PER_PAGE, pageIdx * SKILLS_PER_PAGE);
+
+  const lines = [`📚 <b>Мои навыки</b> — ${pageIdx}/${pages}`, ""];
+  for (const it of slice) {
+    const desc = it.desc.length > 90 ? `${it.desc.slice(0, 87).trim()}…` : it.desc;
+    lines.push(
+      `▫️ <b>${esc(it.name)}</b>\n   ${desc ? `${esc(desc)} ` : ""}<i>${it.tag}</i>${it.kind === "cat" && !it.safe ? " ⚠️" : ""}`,
+    );
   }
-  if (screen.length === 0 && catalog.length === 0) lines.push("Навыков пока нет.");
-  lines.push("Чтобы выполнить — просто опишите задачу, например: <code>извлеки текст из файла.pdf</code>");
-  await sendHtml(chatId, lines.join("\n"));
+
+  const kb = [];
+  for (const it of slice) {
+    const row = [
+      it.safe ? { text: "▶ Запустить", callback_data: `skill:run:${it.id}` } : null,
+      { text: "ℹ", callback_data: `skill:info:${it.id}` },
+      it.kind === "screen" && owner ? { text: "🗑", callback_data: `skill:del:${it.id}` } : null,
+    ].filter(Boolean);
+    kb.push(row);
+  }
+  if (pages > 1) {
+    const nav = [];
+    if (pageIdx > 1) nav.push({ text: "◀", callback_data: `skill:page:${pageIdx - 1}` });
+    nav.push({ text: `${pageIdx}/${pages}`, callback_data: "skill:none" });
+    if (pageIdx < pages) nav.push({ text: "▶", callback_data: `skill:page:${pageIdx + 1}` });
+    kb.push(nav);
+  }
+  kb.push([{ text: "✖ Закрыть", callback_data: "menu:close" }]);
+
+  await apiCall("sendMessage", {
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: kb },
+  });
+}
+
+/** Details of one skill (step list for screen skills, description for catalog). */
+async function skillInfo(chatId, id) {
+  let data;
+  try {
+    const res = await fetch(`${SERVER}/api/skills`, { signal: AbortSignal.timeout(15_000) });
+    data = await res.json().catch(() => null);
+    if (!res.ok || !data) throw new Error("bad response");
+  } catch {
+    await sendText(chatId, "Сервер недоступен.");
+    return;
+  }
+  const screen = (Array.isArray(data.screen) ? data.screen : []).find((s) => s.id === id);
+  if (screen) {
+    const steps = Array.isArray(screen.stepList) && screen.stepList.length > 0 ? screen.stepList : [];
+    const lines = [`🧩 <b>${esc(screen.name)}</b>`, "", `<b>Цель:</b> ${esc(screen.goal || "—")}`, `<b>Использован:</b> ${screen.uses} раз`];
+    if (steps.length > 0) {
+      lines.push("", "<b>Шаги:</b>");
+      for (let i = 0; i < steps.length; i += 1) lines.push(`${i + 1}. ${esc(steps[i])}`);
+    }
+    await sendHtml(chatId, lines.join("\n"));
+    return;
+  }
+  const cat = (Array.isArray(data.catalog) ? data.catalog : []).find((c) => `cat:${c.slug}` === id);
+  if (cat) {
+    await sendHtml(chatId, [
+      `📘 <b>${esc(cat.name)}</b>`,
+      "",
+      esc(cat.description || "—"),
+      "",
+      `Каталог SKILL.md · безопасность: ${cat.safe ? "✅ автозапуск" : "⚠️ требует одобрения владельца"}`,
+    ].join("\n"));
+    return;
+  }
+  await sendText(chatId, "Навык не найден.");
+}
+
+/** Run a skill (screen id or `cat:<slug>`) via /api/skills and report back. */
+async function runSkillFromTelegram(chatId, id, owner) {
+  await typing(chatId);
+  const statusId = await sendStatus(chatId, "▶ Выполняю навык…");
+  let res;
+  try {
+    res = await fetch(`${SERVER}/api/skills`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "run", id, chatId: String(chatId), isOwner: owner }),
+      signal: AbortSignal.timeout(600_000),
+    });
+  } catch (err) {
+    await finishStatus(chatId, statusId, `Сбой: ${err.message}. Сервер запущен?`);
+    return;
+  }
+  const data = await res.json().catch(() => null);
+  await finishStatus(chatId, statusId, data?.reply ?? `Ошибка сервера: ${res.status}.`);
 }
 
 /** Gemini key-pool status panel (owner + per-user). */
@@ -742,7 +852,7 @@ async function handleCommand(chatId, msg, cmd) {
       return;
     }
     case "/skills": {
-      await renderSkills(chatId);
+      await renderSkills(chatId, owner);
       return;
     }
     case "/keys": {
@@ -1329,6 +1439,50 @@ async function handleCallback(query) {
     return;
   }
 
+  // Skill cards are open to anyone allowed to chat (run/info); delete is
+  // owner-only. Format: skill:<run|info|del|page|none>:<arg>
+  if (verb === "skill") {
+    const [sub, ...rest] = data.split(":").slice(1);
+    const arg = rest.join(":");
+    const owner = isOwner(fakeFrom);
+    if (sub === "none") {
+      await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: "" }).catch(() => {});
+      return;
+    }
+    if (sub === "page") {
+      await renderSkills(chatId, owner, parseInt(arg, 10) || 1);
+      return;
+    }
+    if (sub === "run" && arg) {
+      await runSkillFromTelegram(chatId, arg, owner);
+      return;
+    }
+    if (sub === "info" && arg) {
+      await skillInfo(chatId, arg);
+      return;
+    }
+    if (sub === "del" && arg) {
+      if (!owner) {
+        await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: "Только владелец." }).catch(() => {});
+        return;
+      }
+      const res = await fetch(`${SERVER}/api/skills`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "forget", id: arg }),
+      }).catch(() => null);
+      const resData = res ? await res.json().catch(() => null) : null;
+      await apiCall("answerCallbackQuery", {
+        callback_query_id: query.id,
+        text: resData?.ok ? "Удалён" : "Ошибка удаления",
+      }).catch(() => {});
+      await removeButtons(chatId, query.message?.message_id);
+      await renderSkills(chatId, owner);
+      return;
+    }
+    return;
+  }
+
   // Approve/reject are owner-only.
   if (!isOwner(fakeFrom)) {
     await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: "Только владелец может одобрять." }).catch(() => {});
@@ -1454,6 +1608,11 @@ async function handleMessage(msg) {
 async function main() {
   let offset = 0;
   console.log(`[bot] запущен. Сервер: ${SERVER}. Владелец: @${OWNER_USERNAME || "?"}.`);
+  try {
+    await apiCall("setMyCommands", { commands: BOT_COMMANDS });
+  } catch (e) {
+    console.warn("[bot] setMyCommands:", e.message);
+  }
   if (registry.owner.id !== null) {
     // Startup greeting so the owner knows the bot is alive after a restart.
     try {

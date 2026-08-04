@@ -13,6 +13,8 @@ export interface OrbSceneApi {
   zoomIn(): void;
   zoomOut(): void;
   resetView(): void;
+  /** Drive the voice-state envelope: `true` while the assistant is speaking. */
+  setSpeaking(active: boolean): void;
   dispose(): void;
 }
 
@@ -707,6 +709,12 @@ export function createOrbScene(container: HTMLElement): OrbSceneApi {
   let flickerTimer = 0;
   let rafId = 0;
   let disposed = false;
+  let speaking = false;
+  let speechAmp = 0;
+
+  function setSpeaking(active: boolean) {
+    speaking = active;
+  }
 
   function animate() {
     if (disposed) return;
@@ -734,25 +742,31 @@ export function createOrbScene(container: HTMLElement): OrbSceneApi {
     icoWire.rotation.x += 0.008;
     icoWire.rotation.y += 0.012;
 
+    // Voice-state envelope: ramps toward 1 when the assistant is speaking and
+    // back to 0 when it goes quiet, so the core visibly pulses with the voice.
+    speechAmp += ((speaking ? 1 : 0) - speechAmp) * 0.06;
+    const speechPulse =
+      speechAmp > 0.01 ? (0.55 + 0.45 * Math.sin(t * (6 + speechAmp * 6))) * speechAmp : 0;
+
     // Core pulse — dramatic surges but mostly transparent
     const wave1 = Math.sin(t * 1.2);
     const wave3 = Math.pow(Math.max(0, Math.sin(t * 0.4)), 5); // rare big surge
     const wave4 = Math.pow(Math.max(0, Math.sin(t * 0.7 + 2)), 8); // mega surge
     const fadeOut = Math.pow(Math.max(0, Math.sin(t * 0.25)), 3); // periodic full transparency
     const surge = wave3 * 1.5 + wave4 * 2.0;
-    const coreScale = 1 + surge + Math.sin(t * 5) * 0.05;
+    const coreScale = 1 + surge + Math.sin(t * 5) * 0.05 + speechPulse * 0.5;
     coreSphere.scale.setScalar(coreScale);
     // Opacity: mostly very low (0-0.15), sometimes fully transparent, brief bright on surge
     const coreOpacity = Math.max(
       0,
-      (0.08 + wave1 * 0.05 + surge * 0.2) * (1 - fadeOut * 0.95),
+      (0.08 + wave1 * 0.05 + surge * 0.2) * (1 - fadeOut * 0.95) + speechPulse * 0.5,
     );
-    coreSphereMat.opacity = Math.min(0.6, coreOpacity);
-    glowSphere.scale.setScalar(1 + surge * 0.8);
-    glowSphereMat.opacity = Math.max(0, (0.03 + surge * 0.08) * (1 - fadeOut * 0.9));
+    coreSphereMat.opacity = Math.min(0.85, coreOpacity);
+    glowSphere.scale.setScalar(1 + surge * 0.8 + speechPulse * 0.6);
+    glowSphereMat.opacity = Math.max(0, (0.03 + surge * 0.08) * (1 - fadeOut * 0.9) + speechPulse * 0.25);
     // Icosahedron wireframe stays visible even when glow fades
-    icoWire.scale.setScalar(1 + surge * 0.6);
-    icoWireMat.opacity = Math.min(1, 0.5 + surge * 0.4);
+    icoWire.scale.setScalar(1 + surge * 0.6 + speechPulse * 0.4);
+    icoWireMat.opacity = Math.min(1, 0.5 + surge * 0.4 + speechPulse * 0.3);
 
     // Debris orbits
     debrisMeshes.forEach((inst, gi) => {
@@ -820,7 +834,7 @@ export function createOrbScene(container: HTMLElement): OrbSceneApi {
     }
 
     // Bloom pulse
-    bloom.strength = 1.6 + Math.sin(t * 0.8) * 0.3;
+    bloom.strength = 1.6 + Math.sin(t * 0.8) * 0.3 + speechAmp * 1.2;
 
     // Update chromatic aberration time
     chromaticPass.uniforms.uTime.value = t;
@@ -870,6 +884,7 @@ export function createOrbScene(container: HTMLElement): OrbSceneApi {
     zoomIn: () => zoomBy(0.65),
     zoomOut: () => zoomBy(1.55),
     resetView,
+    setSpeaking,
     dispose,
   };
 }

@@ -37,6 +37,7 @@ import {
 } from "@/lib/adminOps";
 import { answerAbilityQuery } from "@/lib/serverAbility";
 import { launchApp, openViaShell, SAFE_URL } from "@/lib/launcher";
+import { executeSkill } from "@/lib/skillRunner";
 
 /**
  * Server-side assistant core (LOCALHOST-only). The Telegram bot POSTs user
@@ -183,26 +184,6 @@ async function learnedFactsSystemNote(): Promise<string> {
 
 async function fetchInternal(baseUrl: string, path: string, init?: RequestInit): Promise<Response> {
   return fetch(`${baseUrl}${path}`, init);
-}
-
-/** Run a screen-learned skill step by step via /api/do-step. */
-async function executeSkill(brain: AssistantBrain, skillId: string, baseUrl: string): Promise<string> {
-  const skill = brain.skillList.find((s) => s.id === skillId);
-  if (!skill || skill.steps.length === 0) return "Навык не найден.";
-  let ran = 0;
-  for (const step of skill.steps) {
-    ran += 1;
-    const res = await fetchInternal(baseUrl, "/api/do-step", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: step.action, params: step.params }),
-    });
-    if (!res.ok) {
-      const body = (await res.json().catch(() => null)) as { error?: string } | null;
-      return `Навык «${skill.name}»: шаг ${ran}/${skill.steps.length} не удался — ${body?.error ?? res.status}.`;
-    }
-  }
-  return `Навык «${skill.name}» выполнен (${ran} шагов).`;
 }
 
 /**
