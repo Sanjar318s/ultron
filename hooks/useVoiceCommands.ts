@@ -50,6 +50,10 @@ function getRecognitionCtor(): SpeechRecognitionConstructor | null {
   return window.SpeechRecognition ?? window.webkitSpeechRecognition ?? null;
 }
 
+// Voice ID: "male" → DmitryNeural, "female" → SvetlanaNeural.
+export type VoiceId = "male" | "female";
+const VOICE_STORAGE_KEY = "ultron-voice-id";
+
 export interface VoiceHandlers {
   /** Called for every final recognized phrase — the raw transcript. */
   onHear?(transcript: string): void;
@@ -59,20 +63,84 @@ export interface VoiceApi {
   supported: boolean;
   listening: boolean;
   speaking: boolean;
-  /** Speak a line out loud via the built-in speechSynthesis (ru-RU). */
+  /** Current voice selection (persisted in localStorage). */
+  voiceId: VoiceId;
+  /** Switch voice between "male" and "female". */
+  setVoice(id: VoiceId): void;
+  /** Speak a line out loud (Edge TTS with browser fallback). */
   speak(text: string): void;
   start(): void;
   stop(): void;
   toggle(): void;
 }
 
+// ---------------------------------------------------------------------------
+// Browser TTS fallback (used when Edge TTS server is unreachable)
+// ---------------------------------------------------------------------------
+
+function speakBrowser(
+  text: string,
+  seq: number,
+  speakSeqRef: React.MutableRefObject<number>,
+  setSpeaking: (v: boolean) => void,
+  wasListening: boolean,
+  listeningRef: React.MutableRefObject<boolean>,
+  suppressRestartRef: React.MutableRefObject<boolean>,
+  start: () => void,
+) {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  const synth = window.speechSynthesis;
+  synth.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = "ru-RU";
+  utterance.rate = 0.9;
+  utterance.pitch = 0.75;
+
+  const pickVoice = () => {
+    const ru = synth.getVoices().filter((v) => v.lang.toLowerCase().startsWith("ru"));
+    if (ru.length === 0) return null;
+    const maleHints = ["pavel", "vladimir", "boris", "dmitri", "mikhail", "mihail", "male"];
+    return (
+      ru.find((v) => /pavel/i.test(v.name)) ??
+      ru.find((v) => maleHints.some((h) => v.name.toLowerCase().includes(h))) ??
+      ru[0]
+    );
+  };
+  const applyVoice = () => {
+    const voice = pickVoice();
+    if (voice) utterance.voice = voice;
+  };
+  applyVoice();
+  if (synth.getVoices().length === 0) {
+    synth.addEventListener("voiceschanged", applyVoice, { once: true });
+  }
+
+  const resume = () => {
+    if (speakSeqRef.current !== seq) return;
+    setSpeaking(false);
+    suppressRestartRef.current = false;
+    if (wasListening && listeningRef.current) {
+      setTimeout(() => {
+        if (listeningRef.current) start();
+      }, 400);
+    }
+  };
+  utterance.onstart = () => {
+    if (speakSeqRef.current === seq) setSpeaking(true);
+  };
+  utterance.onend = resume;
+  utterance.onerror = resume;
+  synth.speak(utterance);
+}
+
+// ---------------------------------------------------------------------------
+// Main hook
+// ---------------------------------------------------------------------------
+
 /**
- * Raw speech I/O: continuous Russian recognition (Web Speech API) + TTS
- * synthesis. Recognition stubbornly stops itself after a pause in speech —
- * `onend` restarts it automatically as long as `listeningRef` says the user
- * still wants to be listening, which is what makes this feel "continuous".
- * It delivers raw transcripts via `onHear` and does no command parsing — the
- * AssistantBrain owns interpretation.
+ * Raw speech I/O: continuous Russian recognition (Web Speech API) + Edge TTS
+ * (Microsoft neural voices) with browser TTS fallback.
  */
 export function useVoiceCommands(handlers: VoiceHandlers): VoiceApi {
   const handlersRef = useRef(handlers);
@@ -80,14 +148,26 @@ export function useVoiceCommands(handlers: VoiceHandlers): VoiceApi {
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const listeningRef = useRef(false);
-  // While the assistant speaks (TTS), recognition is paused so it can't
-  // hear its own voice and echo/re-execute the reply.
   const suppressRestartRef = useRef(false);
   const speakSeqRef = useRef(0);
 
   const [supported] = useState(() => getRecognitionCtor() !== null);
   const [listening, setListening] = useState(false);
   const [speaking, setSpeaking] = useState(false);
+  const [voiceId, setVoiceIdState] = useState<VoiceId>(() => {
+    if (typeof window === "undefined") return "male";
+    return (localStorage.getItem(VOICE_STORAGE_KEY) as VoiceId) || "male";
+  });
+
+  const setVoice = useCallback((id: VoiceId) => {
+    setVoiceIdState(id);
+    localStorage.setItem(VOICE_STORAGE_KEY, id);
+  }, []);
+
+  // Keep a ref to the current voice so the speak callback always reads the
+  // latest value without needing to be recreated when voiceId changes.
+  const voiceIdRef = useRef(voiceId);
+  voiceIdRef.current = voiceId;
 
   const start = useCallback(() => {
     const Ctor = getRecognitionCtor();
@@ -112,8 +192,6 @@ export function useVoiceCommands(handlers: VoiceHandlers): VoiceApi {
 
     recognition.onerror = (event) => {
       console.warn("[voice] recognition error:", event.error);
-      // These mean the user (or OS) denied mic access — retrying would
-      // just error again, so stop instead of looping forever.
       if (event.error === "not-allowed" || event.error === "service-not-allowed") {
         listeningRef.current = false;
         setListening(false);
@@ -142,12 +220,11 @@ export function useVoiceCommands(handlers: VoiceHandlers): VoiceApi {
     else start();
   }, [start, stop]);
 
+  // Edge TTS speak: fetch audio from /api/tts, play via <audio>.
+  // Falls back to browser TTS if the server is unreachable.
   const speak = useCallback(
     (text: string) => {
-      if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
       const seq = ++speakSeqRef.current;
-      const synth = window.speechSynthesis;
-      synth.cancel();
 
       // Pause recognition so the assistant doesn't hear its own reply.
       const wasListening = listeningRef.current;
@@ -156,52 +233,48 @@ export function useVoiceCommands(handlers: VoiceHandlers): VoiceApi {
         recognitionRef.current?.stop();
       }
 
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = "ru-RU";
-      // JARVIS-style delivery: calm, measured, deep — slightly slow, low pitch.
-      utterance.rate = 0.9;
-      utterance.pitch = 0.75;
-
-      /** Prefer a deep Russian male voice (Pavel / male hints), else any ru voice. */
-      const pickVoice = () => {
-        const ru = synth.getVoices().filter((v) => v.lang.toLowerCase().startsWith("ru"));
-        if (ru.length === 0) return null;
-        const maleHints = ["pavel", "vladimir", "boris", "dmitri", "mikhail", "mihail", "male"];
-        return (
-          ru.find((v) => /pavel/i.test(v.name)) ??
-          ru.find((v) => maleHints.some((h) => v.name.toLowerCase().includes(h))) ??
-          ru[0]
-        );
-      };
-      const applyVoice = () => {
-        const voice = pickVoice();
-        if (voice) utterance.voice = voice;
-      };
-      applyVoice();
-      // Voices may load asynchronously; retry once they arrive.
-      if (synth.getVoices().length === 0) {
-        synth.addEventListener("voiceschanged", applyVoice, { once: true });
-      }
-
-      // Resume listening only for the latest utterance (older ones may be
-      // cancelled and fire their end events too).
       const resume = () => {
         if (speakSeqRef.current !== seq) return;
         setSpeaking(false);
         suppressRestartRef.current = false;
         if (wasListening && listeningRef.current) {
-          // Small delay so the tail of our own speech isn't captured.
           setTimeout(() => {
             if (listeningRef.current) start();
           }, 400);
         }
       };
-      utterance.onstart = () => {
-        if (speakSeqRef.current === seq) setSpeaking(true);
-      };
-      utterance.onend = resume;
-      utterance.onerror = resume;
-      synth.speak(utterance);
+
+      // Try Edge TTS first.
+      const voiceParam = voiceIdRef.current;
+      fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, voice: voiceParam }),
+        signal: AbortSignal.timeout(15_000),
+      })
+        .then(async (res) => {
+          if (!res.ok) throw new Error(`TTS ${res.status}`);
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const audio = new Audio(url);
+          audio.onended = () => {
+            URL.revokeObjectURL(url);
+            resume();
+          };
+          audio.onerror = () => {
+            URL.revokeObjectURL(url);
+            resume();
+          };
+          audio.onplay = () => {
+            if (speakSeqRef.current === seq) setSpeaking(true);
+          };
+          await audio.play();
+        })
+        .catch(() => {
+          // Fallback to browser TTS.
+          console.warn("[voice] Edge TTS unavailable, falling back to browser TTS");
+          speakBrowser(text, seq, speakSeqRef, setSpeaking, wasListening, listeningRef, suppressRestartRef, start);
+        });
     },
     [start],
   );
@@ -217,5 +290,5 @@ export function useVoiceCommands(handlers: VoiceHandlers): VoiceApi {
     };
   }, []);
 
-  return { supported, listening, speaking, speak, start, stop, toggle };
+  return { supported, listening, speaking, voiceId, setVoice, speak, start, stop, toggle };
 }

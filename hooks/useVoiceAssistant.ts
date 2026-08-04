@@ -44,6 +44,10 @@ export interface VoiceAssistantApi {
   supported: boolean;
   listening: boolean;
   speaking: boolean;
+  /** Current TTS voice (male/female). */
+  voiceId: "male" | "female";
+  /** Switch TTS voice. */
+  setVoice(id: "male" | "female"): void;
   teachMode: boolean;
   learnedCount: number;
   pcControl: boolean;
@@ -938,6 +942,8 @@ export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantAp
     supported: voice.supported,
     listening: voice.listening,
     speaking: voice.speaking,
+    voiceId: voice.voiceId,
+    setVoice: voice.setVoice,
     teachMode,
     learnedCount,
     pcControl,

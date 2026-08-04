@@ -441,6 +441,12 @@ export default function JarvisOrb() {
                       МОДЕЛЬ:{" "}
                       {PROVIDER_LABEL[assistant.activeProvider ?? assistant.preferredProvider ?? ""] ?? "АВТО"}
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => assistant.setVoice(assistant.voiceId === "male" ? "female" : "male")}
+                    >
+                      ГОЛОС: {assistant.voiceId === "male" ? "ДМИТРИЙ" : "СВЕТЛАНА"}
+                    </button>
                     {!assistant.webllm.loaded && (
                       <button
                         type="button"
