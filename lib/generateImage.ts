@@ -15,6 +15,23 @@ import { generateImageLocal, isLocalImageAvailable } from "./localImage";
 const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const IMAGE_MODEL = "gemini-3.1-flash-image";
 
+// Negative cache: the free tier has a literal 0 image-generation quota, so a
+// quota failure blocks the Gemini image tier for an hour instead of retrying
+// on every request (latency + log noise). GEMINI_IMAGE_ENABLED=1 re-enables it
+// unconditionally (e.g. after connecting billing).
+let geminiImageBlockedUntil = 0;
+const GEMINI_IMAGE_BLOCK_MS = 60 * 60 * 1000;
+
+function isGeminiImageBlocked(): boolean {
+  if (process.env.GEMINI_IMAGE_ENABLED === "1") return false;
+  return Date.now() < geminiImageBlockedUntil;
+}
+
+function isQuotaError(message: string): boolean {
+  const m = message.toLowerCase();
+  return m.includes("quota") || m.includes("429") || m.includes("resource_exhausted") || m.includes("rate limit");
+}
+
 export interface GeneratedImage {
   b64: string;
   mime: string;
@@ -27,6 +44,11 @@ export interface GenerateImageOptions {
   localTags?: string[];
   /** Skip the Gemini tier entirely (no usable per-user key / NSFW request). */
   forceLocal?: boolean;
+  /** Reference image (basename in ComfyUI input/refs/) steering the LOCAL
+   *  tier: "style" → IPAdapter, "face" → FaceID. */
+  reference?: { file: string; mode: "style" | "face" };
+  /** IPAdapter weight override. */
+  weight?: number;
 }
 
 async function generateGemini(prompt: string, key: string): Promise<GeneratedImage> {
@@ -87,12 +109,16 @@ export async function generateImage(
   const hasLocalOnlyTags =
     opts?.forceLocal === true || (Array.isArray(opts?.localTags) && opts!.localTags!.length > 0);
   const key = hasLocalOnlyTags ? undefined : geminiKey || process.env.GEMINI_API_KEY;
-  if (key) {
+  if (key && !isGeminiImageBlocked()) {
     try {
       return await generateGemini(prompt, key);
     } catch (err) {
-      console.warn("[image] gemini failed, falling back to local comfy:", (err as Error).message);
+      const message = err instanceof Error ? err.message : String(err);
+      if (isQuotaError(message)) geminiImageBlockedUntil = Date.now() + GEMINI_IMAGE_BLOCK_MS;
+      console.warn("[image] gemini failed, falling back to local comfy:", message);
     }
+  } else if (key) {
+    console.warn("[image] gemini-image blocked (negative cache), skipping gemini");
   } else {
     console.warn("[image] no gemini key — skipping gemini");
   }
@@ -101,6 +127,8 @@ export async function generateImage(
       return await generateImageLocal(prompt, {
         text: opts?.text,
         inject: opts?.localTags,
+        reference: opts?.reference,
+        weight: opts?.weight,
       });
     }
   } catch (err) {

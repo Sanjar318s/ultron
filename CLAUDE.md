@@ -216,11 +216,34 @@ On top of the orb there is a voice/text assistant with its own architecture
 - **Image chain (local-first):** `Gemini (quota-limited) → local ComfyUI
   (`lib/localImage.ts`, RealVisXL V5.0 fp16 on 127.0.0.1:8188, workflow template
   in `comfy/text2img.json`: 28 steps dpmpp_2m/karras, then 2× upscale through
-  `4x-UltraSharp.pth`) → Pollinations (keyless fallback)`. `lib/localImage.ts`
-  probes ComfyUI (`/system_stats`, 15s TTL), POSTs the template, polls
-  `/history/{id}` for the finished image, and — when the sanitizer provided tags
-  or the user asked for a caption — injects tags into the local prompt and draws
-  the text overlay before returning.
+  `4x-UltraSharp.pth`) → Pollinations (keyless fallback)`. Checkpoint is picked
+  by `isAnimePrompt()` — anime/аниме/манга/маньхуа/вей у сянь switches to
+  Animagine XL 4.0 (`COMFY_ANIME_CHECKPOINT`, prompt gets a
+  `masterpiece, best quality, very aesthetic, absurdres, anime style, ` prefix),
+  everything else stays on RealVisXL. `lib/localImage.ts` probes ComfyUI
+  (`/system_stats`, 15s TTL), POSTs the template, polls `/history/{id}` for the
+  finished image, and — when the sanitizer provided tags or the user asked for a
+  caption — injects tags into the local prompt and draws the text overlay before
+  returning.
+- **Character references (IPAdapter/FaceID):** `lib/characters.ts` keeps a
+  character registry (`data/character-refs.json`, gitignored; images in
+  `C:\ComfyUI\ComfyUI\input\refs`). `resolveCharacterRef` fuzzy-matches by name
+  + aliases; `fetchCharacterRefWeb` auto-fetches via Wikimedia (lead image →
+  Commons search) when the LLM names an explicit character/work (`"ref"` in the
+  image action). Commons search filters to raster files only (skips PDF/SVG
+  scans) and skips cosplay photos; all Wikimedia calls send a descriptive
+  `User-Agent` (Node's default agent gets throttled). Note: enwiki/ruwiki
+  character infobox images are often non-free and never returned by the
+  thumbnail API, so many anime characters resolve to nothing — the reliable
+  path is manual registration via Telegram «запомни как <имя>». The route passes
+  `{reference: {file, mode}}` into `generateImage`; `lib/localImage.ts` picks
+  `comfy/ref2img.json` (IPAdapterUnifiedLoader STANDARD, style, weight 0.7) for
+  `mode: "style"` and
+  `comfy/faceid2img.json` (IPAdapterUnifiedLoaderFaceID FACEID PLUS V2 0.85,
+  provider CPU, InsightFace `buffalo_l` in `models/insightface`) for
+  `mode: "face"`, substituting `__REFERENCE__`/`__IPADAPTER_WEIGHT__`. Manual
+  refs: caption a photo in Telegram «запомни как <имя>» → bot downloads it and
+  POSTs to the localhost-only `app/api/characters/route.ts` (GET lists refs).
 - **LLM autonomy (opt-in, owner-gated):** when `data/settings.json` has
   `autonomy: true`, the route appends an admin-mode system block. The LLM may
   return JSON `{ admin: { action: "read"|"write"|"replace"|"run"|"build", … } }`.

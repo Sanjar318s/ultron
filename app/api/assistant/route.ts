@@ -19,6 +19,7 @@ import { commitBrain, loadBrain } from "@/lib/brainStore";
 import { buildStudyNote } from "@/lib/noteBuilder";
 import { extractVideoId, fetchVideoTranscript, isYouTubeUrl } from "@/lib/youtube";
 import { generateImage } from "@/lib/generateImage";
+import { fetchCharacterRefWeb, resolveCharacterRef } from "@/lib/characters";
 import { sanitizeTexts } from "@/lib/promptSanitizer";
 import {
   initAdmin,
@@ -133,6 +134,24 @@ function stripHtml(html: string): string {
 function extractCaptionText(raw: string): string | undefined {
   const m = raw.match(/(?:с текстом|с надписью|с подписью|надпись|подпись)\s*(?:["«']?)([^»"'»«\n]{1,60})/i);
   return m?.[1]?.trim() || undefined;
+}
+
+/**
+ * Resolve a reference image for the current request: a previously stored
+ * character (by name/alias) wins; otherwise, when the LLM named an explicit
+ * character/work (`ref`), fetch a reference from Wikimedia automatically.
+ */
+async function resolveImageReference(
+  query: string,
+  allowFetch: boolean,
+): Promise<{ file: string; mode: "style" | "face" } | null> {
+  const q = query.trim();
+  if (!q) return null;
+  const known = await resolveCharacterRef(q);
+  if (known) return { file: known.ref.file, mode: known.ref.mode };
+  if (!allowFetch) return null;
+  const fetched = await fetchCharacterRefWeb(q).catch(() => null);
+  return fetched ? { file: fetched.file, mode: fetched.mode } : null;
 }
 
 /** Extra system-prompt block enabling the LLM's autonomous admin mode. */
@@ -549,6 +568,7 @@ export async function POST(req: NextRequest) {
         type?: unknown;
         prompt?: unknown;
         text?: unknown;
+        ref?: unknown;
         skill?: unknown;
         city?: unknown;
         app?: unknown;
@@ -557,12 +577,15 @@ export async function POST(req: NextRequest) {
       };
       if (a.type === "image" && typeof a.prompt === "string" && a.prompt.trim()) {
         try {
+          const explicitRef = typeof a.ref === "string" && a.ref.trim() ? a.ref.trim() : "";
+          const reference = await resolveImageReference(explicitRef || visibleText, Boolean(explicitRef));
           image = await generateImage(
             a.prompt.trim(),
             {
               text: typeof a.text === "string" && a.text.trim() ? a.text.trim() : extractCaptionText(visibleText),
               localTags,
               forceLocal: gemini.provider !== "gemini",
+              ...(reference ? { reference } : {}),
             },
             gemini.key,
           );
@@ -698,12 +721,14 @@ export async function POST(req: NextRequest) {
     const fallbackPrompt = extractImagePrompt(visibleText);
     if (fallbackPrompt) {
       try {
+        const reference = await resolveImageReference(visibleText, false);
         const image = await generateImage(
           fallbackPrompt,
           {
             text: extractCaptionText(visibleText),
             localTags,
             forceLocal: gemini.provider !== "gemini",
+            ...(reference ? { reference } : {}),
           },
           gemini.key,
         );

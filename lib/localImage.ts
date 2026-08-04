@@ -1,11 +1,14 @@
 /**
  * Local image generation via ComfyUI (server-side only).
  *
- * ComfyUI runs locally on the user's GPU (http://127.0.0.1:8188) with a
- * text-to-image checkpoint (SDXL-Turbo by default). This module:
+ * ComfyUI runs locally on the user's GPU (http://127.0.0.1:8188) with an
+ * SDXL text-to-image checkpoint (RealVisXL V5.0 by default; Animagine XL 4.0
+ * for anime-style prompts). This module:
  *   1. fast-probes whether ComfyUI is reachable (cached, like the Ollama probe)
- *   2. loads comfy/text2img.json (an API-format workflow template), injects the
- *      prompt/size/seed, and POSTs it to /prompt
+ *   2. loads an API-format workflow template (comfy/text2img.json, or
+ *      comfy/ref2img.json / comfy/faceid2img.json when a reference image is
+ *      provided), injects prompt/size/seed (+ IPAdapter reference), POSTs it
+ *      to /prompt
  *   3. polls /history/{prompt_id} until the image is done, then downloads it.
  *
  * This is the "unlimited, free, local" tier of the image cascade:
@@ -30,12 +33,30 @@ export interface LocalImageOptions {
   text?: string;
   /** Hidden EN tags re-injected from the sanitizer — LOCAL prompt only. */
   inject?: string[];
+  /** Reference image (basename inside ComfyUI input/refs/) that steers the
+   *  result. "style" → IPAdapter (anime/art characters), "face" → FaceID
+   *  (real people). */
+  reference?: { file: string; mode: "style" | "face" };
+  /** IPAdapter weight override (defaults: style 0.7, face 0.85). */
+  weight?: number;
 }
 
 const COMFY_URL = process.env.COMFY_URL || "http://127.0.0.1:8188";
 const COMFY_CHECKPOINT = process.env.COMFY_CHECKPOINT || "RealVisXL_V5.0_fp16.safetensors";
+const COMFY_ANIME_CHECKPOINT = process.env.COMFY_ANIME_CHECKPOINT || "animagine-xl-4.0.safetensors";
 const COMFY_UPSCALE_MODEL = process.env.COMFY_UPSCALE_MODEL || "4x-UltraSharp.pth";
 const PROBE_TTL = 15_000;
+
+/** Anime/manhua requests pick the dedicated anime checkpoint (Animagine XL).
+ *  Matches on the RU/EN words the assistant hears most often. */
+export function isAnimePrompt(prompt: string): boolean {
+  const p = prompt.toLowerCase();
+  const words = [
+    "аниме", "anime", "манга", "manga", "маньхуа", "manhwa", "манхуа", "манхва",
+    "вей у сянь", "вейвус", "wei wuxian", "каваи", "кавай", "мультяшн", "cell",
+  ];
+  return words.some((w) => p.includes(w));
+}
 
 let probeState: { reachable: boolean; checkedAt: number } = { reachable: false, checkedAt: 0 };
 
@@ -82,22 +103,34 @@ export async function generateImageLocal(prompt: string, opts?: LocalImageOption
   // Gemini/Pollinations tiers never see them.
   const finalPrompt = opts?.inject?.length ? composeFullPrompt(prompt, opts.inject) : prompt;
 
+  // Reference-driven generations use the IPAdapter/FaceID templates and pick
+  // the anime checkpoint for anime-ish prompts (Animagine is a tag model, so
+  // its quality tags are prepended).
+  const ref = opts?.reference;
+  const anime = isAnimePrompt(finalPrompt);
+  const templateName = !ref ? "text2img.json" : ref.mode === "face" ? "faceid2img.json" : "ref2img.json";
+  const checkpoint = anime ? COMFY_ANIME_CHECKPOINT : COMFY_CHECKPOINT;
+  const ipadapterWeight = opts?.weight ?? (ref?.mode === "face" ? 0.85 : 0.7);
+  const animePrefix = anime ? "masterpiece, best quality, very aesthetic, absurdres, anime style, " : "";
+
   // The template has unquoted numeric placeholders (__WIDTH__, __HEIGHT__,
   // __SEED__), so it's NOT valid JSON until they're substituted. Replace on the
   // raw text first (keeping string placeholders quoted, numbers bare), then
   // parse. Injected strings are JSON-escaped so quotes/newlines can't break it.
   const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r?\n/g, "\\n");
-  const template = await fs.readFile(path.join(process.cwd(), "comfy", "text2img.json"), "utf8");
+  const template = await fs.readFile(path.join(process.cwd(), "comfy", templateName), "utf8");
   const raw = template
-    .replaceAll("__CHECKPOINT__", esc(COMFY_CHECKPOINT))
-    .replaceAll("__PROMPT__", esc(finalPrompt))
+    .replaceAll("__CHECKPOINT__", esc(checkpoint))
+    .replaceAll("__PROMPT__", esc(animePrefix + finalPrompt))
     .replaceAll("__NEGATIVE__", "")
     .replaceAll("__WIDTH__", String(width))
     .replaceAll("__HEIGHT__", String(height))
     .replaceAll("__UPSCALE_MODEL__", esc(COMFY_UPSCALE_MODEL))
     .replaceAll("__UPSCALE_W__", String(width * 2))
     .replaceAll("__UPSCALE_H__", String(height * 2))
-    .replaceAll("__SEED__", String(seed));
+    .replaceAll("__SEED__", String(seed))
+    .replaceAll("__REFERENCE__", ref ? esc(`refs/${ref.file}`) : "")
+    .replaceAll("__IPADAPTER_WEIGHT__", String(ipadapterWeight));
   const workflow = JSON.parse(raw) as Record<string, unknown>;
 
   const promptRes = await fetch(`${COMFY_URL}/prompt`, {

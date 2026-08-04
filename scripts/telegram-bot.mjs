@@ -1366,6 +1366,46 @@ async function handleCallback(query) {
 async function handleMessage(msg) {
   const chatId = msg.chat?.id;
   const text = (msg.text ?? "").trim();
+
+  // Photo with a «запомни как <имя>» caption → register a manual character
+  // reference so future generations can steer by this face (FaceID).
+  if (chatId !== undefined && !text && (msg.photo?.length || msg.document?.mime_type?.startsWith("image/"))) {
+    const photo = msg.photo?.length ? msg.photo[msg.photo.length - 1] : msg.document;
+    const caption = (msg.caption ?? "").trim();
+    const m = caption.match(/запомни\s+(?:как\s+)?(.+)/i);
+    const name = m?.[1]?.trim();
+    if (name && photo?.file_id) {
+      if (isAllowed(msg.from)) {
+        try {
+          const f = await apiCall("getFile", { file_id: photo.file_id });
+          const filePath = f?.result?.file_path;
+          if (filePath) {
+            const fileRes = await fetch(`${API}/file/${filePath}`);
+            const bytes = Buffer.from(await fileRes.arrayBuffer());
+            const post = await fetch(`${SERVER}/api/characters`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ name, b64: bytes.toString("base64"), mode: "face" }),
+            });
+            const res = await post.json().catch(() => ({}));
+            if (post.ok && res.ok) {
+              console.log(`[bot] референс «${name}» сохранён (${res.file})`);
+              await sendHtml(chatId, `📎 Сохранил референс «${esc(name)}» (лицо).`);
+            } else {
+              await sendHtml(chatId, `⚠️ Не удалось сохранить референс: ${res.error ?? post.status}.`);
+            }
+          }
+        } catch (e) {
+          console.warn("[bot] photo ref error:", e);
+          await sendHtml(chatId, "⚠️ Ошибка при сохранении референса.");
+        }
+      } else {
+        console.log(`[bot] референс от неавторизованного id=${chatId}`);
+      }
+      return;
+    }
+  }
+
   if (chatId === undefined || !text) return;
   registerUser(msg.from);
   if (!isAllowed(msg.from)) {
