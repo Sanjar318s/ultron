@@ -1664,8 +1664,44 @@ async function handleCallback(query) {
 // Message dispatch
 // ---------------------------------------------------------------------------
 
+/** Download a Telegram voice/audio file and transcribe it via /api/transcribe. */
+async function transcribeVoice(chatId, voice) {
+  try {
+    const f = await apiCall("getFile", { file_id: voice.file_id });
+    const filePath = f?.result?.file_path;
+    if (!filePath) throw new Error("no file_path from getFile");
+    const fileRes = await fetch(`${API}/file/${filePath}`);
+    if (!fileRes.ok) throw new Error(`telegram file ${fileRes.status}`);
+    const bytes = Buffer.from(await fileRes.arrayBuffer());
+    const post = await fetch(`${SERVER}/api/transcribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mime: voice.mime_type ?? "audio/ogg", data: bytes.toString("base64") }),
+    });
+    const res = await post.json().catch(() => ({}));
+    if (!post.ok) throw new Error(res.error ?? `transcribe ${post.status}`);
+    const text = String(res.text ?? "").trim();
+    if (!text) throw new Error("empty transcript");
+    console.log(`[bot] транскрипция ${chatId}: ${text.slice(0, 120)}`);
+    return text;
+  } catch (e) {
+    console.warn("[bot] transcribe error:", e.message ?? e);
+    await sendHtml(chatId, "⚠️ Не удалось распознать голосовое.");
+    return null;
+  }
+}
+
 async function handleMessage(msg) {
   const chatId = msg.chat?.id;
+
+  // Voice/audio message with no text → transcribe it via Gemini and feed the
+  // result into the normal text pipeline below.
+  const voice = msg.voice ?? msg.audio ?? (msg.document?.mime_type?.startsWith("audio/") ? msg.document : null);
+  if (chatId !== undefined && !msg.text && voice?.file_id) {
+    msg.text = (await transcribeVoice(chatId, voice)) ?? "";
+    if (!msg.text) return;
+  }
+
   const text = (msg.text ?? "").trim();
 
   // Photo with a «запомни как <имя>» caption → register a manual character
@@ -1782,7 +1818,8 @@ async function main() {
           continue;
         }
         const msg = update.message;
-        if (!msg || !msg.text) continue;
+        const isAudio = !!(msg && (msg.voice || msg.audio || msg.document?.mime_type?.startsWith("audio/")));
+        if (!msg || (!msg.text && !isAudio)) continue;
         await handleMessage(msg);
       }
     } catch (err) {

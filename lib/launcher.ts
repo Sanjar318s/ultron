@@ -11,6 +11,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { dedupeApps, findBestApp, isReasonableApp, matchAppScore, normForMatch, scanInstalledApps } from "@/lib/installedApps";
@@ -93,9 +94,104 @@ export function resolveSettingsUri(name: string): string | null {
  * `cmd /c start` for Start Menu paths with spaces (Node escapes embedded
  * quotes as \" which cmd misparses). Handles .lnk, .exe, https:// and app
  * protocols (steam:// …). Fire-and-forget.
+ *
+ * http(s):// targets are routed through `openUrlInternal` first: if the system
+ * https URL association is broken (common after a browser reinstall — the
+ * ProgId in HKCU UserChoice no longer exists), we fall back to launching a
+ * known installed browser directly with the URL as an argument.
  */
 export function openViaShell(target: string): void {
+  if (SAFE_URL.test(target)) {
+    void openUrlInternal(target);
+    return;
+  }
   const command = `Start-Process -FilePath '${target.replace(/'/g, "''")}' -ErrorAction SilentlyContinue`;
+  const encoded = Buffer.from(command, "utf16le").toString("base64");
+  spawn(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
+    { detached: true, stdio: "ignore", windowsHide: true },
+  ).unref();
+}
+
+// --- https URL opening with broken-association fallback ---------------------
+
+let assocCache: { ok: boolean; ts: number } | null = null;
+
+/**
+ * Whether the system https URL association is resolvable — i.e. the ProgId
+ * stored in HKCU UserChoice actually has a shell\open\command registration.
+ */
+async function urlAssociationOk(): Promise<boolean> {
+  if (assocCache && Date.now() - assocCache.ts < 60_000) return assocCache.ok;
+  const script = [
+    "$ProgressPreference='SilentlyContinue';",
+    "$c = Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\UserChoice' -ErrorAction SilentlyContinue;",
+    "if (-not $c -or -not $c.ProgId) { Write-Output '0'; exit };",
+    "$k = 'Registry::HKEY_CLASSES_ROOT\\' + $c.ProgId + '\\shell\\open\\command';",
+    "if (Test-Path $k) { Write-Output '1' } else { Write-Output '0' }",
+  ].join(" ");
+  const out = await runPs(script, 15_000).catch(() => "0");
+  const ok = out.includes("1");
+  assocCache = { ok, ts: Date.now() };
+  return ok;
+}
+
+/** Well-known browser install paths (most common first). */
+const BROWSER_PATHS = [
+  "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+  "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+  "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+  "C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe",
+  "C:\\Program Files\\Yandex\\YandexBrowser\\Application\\browser.exe",
+  "C:\\Program Files (x86)\\Yandex\\YandexBrowser\\Application\\browser.exe",
+  "C:\\Users\\%USERNAME%\\AppData\\Local\\Yandex\\YandexBrowser\\Application\\browser.exe",
+  "C:\\Users\\%USERNAME%\\AppData\\Local\\Programs\\Opera\\opera.exe",
+];
+
+let browserCache: string | null | undefined;
+
+/** First existing browser executable (cached per process lifetime). */
+export function findBrowser(): string | null {
+  if (browserCache !== undefined) return browserCache;
+  const user = process.env.USERNAME ?? "";
+  for (const raw of BROWSER_PATHS) {
+    const p = raw.replace("%USERNAME%", user);
+    try {
+      if (existsSync(p)) {
+        browserCache = p;
+        return p;
+      }
+    } catch { /* path too long / invalid */ }
+  }
+  browserCache = null;
+  return null;
+}
+
+/** Open an https URL: prefer the system association, else a real browser. */
+async function openUrlInternal(url: string): Promise<void> {
+  if (!SAFE_URL.test(url) || url.length > 512) return;
+  const assocOk = await urlAssociationOk();
+  if (assocOk) {
+    const command = `Start-Process -FilePath '${url.replace(/'/g, "''")}' -ErrorAction SilentlyContinue`;
+    const encoded = Buffer.from(command, "utf16le").toString("base64");
+    spawn(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
+      { detached: true, stdio: "ignore", windowsHide: true },
+    ).unref();
+    return;
+  }
+  const browser = findBrowser();
+  if (browser) {
+    console.warn(`[launcher] https association broken — opening via ${browser}`);
+    spawn(browser, [url], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    return;
+  }
+  // No browser found either — last resort: shell it anyway.
+  const command = `Start-Process -FilePath '${url.replace(/'/g, "''")}' -ErrorAction SilentlyContinue`;
   const encoded = Buffer.from(command, "utf16le").toString("base64");
   spawn(
     "powershell.exe",
