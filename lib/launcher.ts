@@ -35,7 +35,58 @@ export const APPS: Record<string, { command: string; args: string[] }> = {
   "спотифай": { command: "cmd.exe", args: ["/c", "start", "", "spotify:"] },
   "спотифей": { command: "cmd.exe", args: ["/c", "start", "", "spotify:"] },
   "spotify": { command: "cmd.exe", args: ["/c", "start", "", "spotify:"] },
+  // Windows 11 system settings (ms-settings: URI schemes)
+  "настройки": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:"] },
+  "параметры": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:"] },
+  "приложения по умолчанию": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:defaultapps"] },
+  "приложения": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:appsfeatures"] },
+  "диспетчер устройств": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:device-manager"] },
+  "сеть": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:network"] },
+  "интернет": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:network-status"] },
+  "wifi": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:network-wifi"] },
+  "звук": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:sound"] },
+  "дисплей": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:display"] },
+  "монитор": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:display"] },
+  "экран": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:display"] },
+  "принтеры": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:printers"] },
+  "конфиденциальность": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:privacy"] },
+  "обновление": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:windowsupdate"] },
+  "обновления": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:windowsupdate"] },
+  "учётные записи": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:accounts"] },
+  "персонализация": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:personalization"] },
+  "bluetooth": { command: "cmd.exe", args: ["/c", "start", "", "ms-settings:bluetooth"] },
+  "панель управления": { command: "cmd.exe", args: ["/c", "start", "", "shell:ControlPanelFolder"] },
+  "проводник": { command: "explorer.exe", args: [] },
+  "explorer": { command: "explorer.exe", args: [] },
+  "диспетчер задач": { command: "taskmgr.exe", args: [] },
 };
+
+/** Windows 11 ms-settings: URI scheme regex fallback for rare system setting phrases. */
+const SETTINGS_REGEX = /^(?:настройк|параметр).*(?:систем|сеть|звук|дисплей|монитор|экран|принтер|обновлен|конфиден|bluetooth|приложен|персонал|учёт|запомина|default)/i;
+const SETTINGS_URI_MAP: [RegExp, string][] = [
+  [/^(?:приложени|программ).*(?:по умолчанию|default)/i, "ms-settings:defaultapps"],
+  [/^(?:приложени|программ)/i, "ms-settings:appsfeatures"],
+  [/^(?:диспетчер|управлен).*(?:устройств|device)/i, "ms-settings:device-manager"],
+  [/^(?:сеть|интернет|wi-?fi|wifi)/i, "ms-settings:network"],
+  [/^(?:звук|аудио|колонк|динамик|микрофон)/i, "ms-settings:sound"],
+  [/^(?:дисплей|монитор|экран|яркост)/i, "ms-settings:display"],
+  [/^(?:принтер|печать)/i, "ms-settings:printers"],
+  [/^(?:конфиденц|приватн|privacy)/i, "ms-settings:privacy"],
+  [/^(?:обновлен|update)/i, "ms-settings:windowsupdate"],
+  [/^(?:учётн|аккаунт|account)/i, "ms-settings:accounts"],
+  [/^(?:персонализа|тем|цвет|wallpaper)/i, "ms-settings:personalization"],
+  [/^(?:bluetooth|блютуз)/i, "ms-settings:bluetooth"],
+  [/^(?:панель управл|control panel)/i, "shell:ControlPanelFolder"],
+];
+
+/** Try to resolve a spoken name as a system settings URI. Returns the URI or null. */
+export function resolveSettingsUri(name: string): string | null {
+  for (const [re, uri] of SETTINGS_URI_MAP) {
+    if (re.test(name)) return uri;
+  }
+  if (SETTINGS_REGEX.test(name)) return "ms-settings:";
+  return null;
+}
 
 /**
  * Launch a target via PowerShell Start-Process. Immune to the quoting bugs of
@@ -405,6 +456,13 @@ export async function launchApp(
       }
     }
     spawn(allowEntry.command, allowEntry.args, { detached: true, stdio: "ignore", windowsHide: true }).unref();
+    return { launched: name, matched: name };
+  }
+
+  // System settings URI fallback (ms-settings: for common phrases).
+  const settingsUri = resolveSettingsUri(name);
+  if (settingsUri) {
+    openViaShell(settingsUri);
     return { launched: name, matched: name };
   }
 

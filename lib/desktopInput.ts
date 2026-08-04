@@ -215,3 +215,87 @@ export async function copySelection(): Promise<void> {
 export async function pasteClipboard(): Promise<void> {
   await sendKeys("^v");
 }
+
+// ---------------------------------------------------------------------------
+// Window management (maximize / minimize / close / restore / toggle-maximize)
+// ---------------------------------------------------------------------------
+
+const WIN_WINDOW = `Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class WinWnd {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+}
+"@
+$SW_MAXIMIZE = 3; $SW_MINIMIZE = 6; $SW_RESTORE = 9; $WM_CLOSE = 0x0010
+function Find-FgWindow {
+  $h = [WinWnd]::GetForegroundWindow()
+  if ($h -ne [IntPtr]::Zero) { return $h }
+  # Fallback: find the most recently focused visible window via EnumWindows
+  $script:lastVisible = [IntPtr]::Zero
+  $cb = [WinWnd+EnumProc]{
+    param($hwnd, $lparam)
+    if ([WinWnd]::IsWindowVisible($hwnd)) { $script:lastVisible = $hwnd }
+    return $true
+  }
+  [WinWnd]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
+  return $script:lastVisible
+}
+`;
+
+/** Maximize the foreground window (or any visible window). */
+export async function maximizeWindow(): Promise<boolean> {
+  const out = await runPs(`${WIN_WINDOW}
+$h = Find-FgWindow
+if ($h -ne [IntPtr]::Zero) { [WinWnd]::ShowWindow($h, $SW_MAXIMIZE) | Out-Null; Write-Output 'OK' }
+else { Write-Output 'FAIL' }`);
+  return out.includes("OK");
+}
+
+/** Minimize the foreground window. */
+export async function minimizeWindow(): Promise<boolean> {
+  const out = await runPs(`${WIN_WINDOW}
+$h = Find-FgWindow
+if ($h -ne [IntPtr]::Zero) { [WinWnd]::ShowWindow($h, $SW_MINIMIZE) | Out-Null; Write-Output 'OK' }
+else { Write-Output 'FAIL' }`);
+  return out.includes("OK");
+}
+
+/** Close the foreground window (PostMessage WM_CLOSE). */
+export async function closeWindow(): Promise<boolean> {
+  const out = await runPs(`${WIN_WINDOW}
+$h = Find-FgWindow
+if ($h -ne [IntPtr]::Zero) { [WinWnd]::PostMessage($h, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null; Write-Output 'OK' }
+else { Write-Output 'FAIL' }`);
+  return out.includes("OK");
+}
+
+/** Restore a maximized or minimized window. */
+export async function restoreWindow(): Promise<boolean> {
+  const out = await runPs(`${WIN_WINDOW}
+$h = Find-FgWindow
+if ($h -ne [IntPtr]::Zero) { [WinWnd]::ShowWindow($h, $SW_RESTORE) | Out-Null; Write-Output 'OK' }
+else { Write-Output 'FAIL' }`);
+  return out.includes("OK");
+}
+
+/** Toggle maximize: if maximized → restore, else → maximize. */
+export async function toggleMaximize(): Promise<boolean> {
+  const out = await runPs(`${WIN_WINDOW}
+$h = Find-FgWindow
+if ($h -ne [IntPtr]::Zero) {
+  if ([WinWnd]::IsZoomed($h)) { [WinWnd]::ShowWindow($h, $SW_RESTORE) | Out-Null }
+  else { [WinWnd]::ShowWindow($h, $SW_MAXIMIZE) | Out-Null }
+  Write-Output 'OK'
+} else { Write-Output 'FAIL' }`);
+  return out.includes("OK");
+}

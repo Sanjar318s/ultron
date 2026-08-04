@@ -521,6 +521,7 @@ const BOT_COMMANDS = [
   { command: "help", description: "Справка" },
   { command: "keys", description: "Статус Gemini-ключей" },
   { command: "id", description: "Ваш числовой id" },
+  { command: "algorithms", description: "Алгоритмы мозга (владелец)" },
 ];
 
 const ADMIN_HELP_HTML = [
@@ -561,6 +562,11 @@ const ADMIN_HELP_HTML = [
   "• /autonomy on|off|status",
   "• /veto &lt;id&gt; — отклонить заявку",
   "• /stop-ai — аварийный стоп автономии",
+  "",
+  "<b>Мета-обучение</b>",
+  "• /algorithms — список алгоритмов мозга",
+  "• /algo-off &lt;id&gt; — отключить алгоритм",
+  "• /algo-on &lt;id&gt; — восстановить алгоритм",
 ].join("\n");
 
 function mainMenuKeyboard(owner) {
@@ -790,6 +796,66 @@ async function renderKeys(chatId, owner) {
 }
 
 // ---------------------------------------------------------------------------
+// Meta-algorithms management
+// ---------------------------------------------------------------------------
+
+async function renderAlgorithms(chatId) {
+  try {
+    const res = await fetch(`${SERVER}/api/meta-analyze`, { signal: AbortSignal.timeout(10_000) });
+    const store = await res.json().catch(() => null);
+    if (!res.ok || !store) throw new Error("bad response");
+
+    const active = (store.algorithms || []).filter(a => a.status === "active");
+    const candidates = (store.algorithms || []).filter(a => a.status === "candidate");
+    const deprecated = (store.algorithms || []).filter(a => a.status === "deprecated");
+
+    let msg = "🧠 <b>Алгоритмы мозга</b>\n\n";
+    msg += `<b>Активные (${active.length}):</b>\n`;
+    if (active.length === 0) msg += "  (пусто)\n";
+    for (const a of active) {
+      msg += `• <code>${a.id}</code> — ${a.name}\n  ${a.description}\n  Точность: ${(a.confidence * 100).toFixed(0)}% | Исп: ${a.uses}\n\n`;
+    }
+    msg += `<b>Кандидаты (${candidates.length}):</b>\n`;
+    if (candidates.length === 0) msg += "  (пусто)\n";
+    for (const a of candidates) {
+      msg += `• <code>${a.id}</code> — ${a.name}\n  ${a.description}\n  Точность: ${(a.confidence * 100).toFixed(0)}% | Источник: ${a.sourceQuery || "—"}\n\n`;
+    }
+    if (deprecated.length > 0) {
+      msg += `<b>Отключённые (${deprecated.length}):</b>\n`;
+      for (const a of deprecated) {
+        msg += `• <code>${a.id}</code> — ${a.name}\n`;
+      }
+    }
+    msg += `\n/stats: ${store.stats?.totalGenerated || 0} сген., ${store.stats?.totalPromoted || 0} развёрнуто, ${store.stats?.totalDeprecated || 0} откл.`;
+    await sendHtml(chatId, msg);
+  } catch {
+    await sendText(chatId, "Не удалось получить алгоритмы (сервер запущен?).");
+  }
+}
+
+async function deactivateAlgorithm(chatId, id) {
+  try {
+    const res = await fetch(`${SERVER}/api/meta-analyze`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, status: "deprecated" }), signal: AbortSignal.timeout(10_000) });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) { await sendText(chatId, `Ошибка: ${data?.error || "неизвестно"}`); return; }
+    await sendText(chatId, `Алгоритм «${data.algo.name}» (${id}) деактивирован.`);
+  } catch (err) {
+    await sendText(chatId, `Ошибка: ${err.message}`);
+  }
+}
+
+async function reactivateAlgorithm(chatId, id) {
+  try {
+    const res = await fetch(`${SERVER}/api/meta-analyze`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, status: "active" }), signal: AbortSignal.timeout(10_000) });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.ok) { await sendText(chatId, `Ошибка: ${data?.error || "неизвестно"}`); return; }
+    await sendText(chatId, `Алгоритм «${data.algo.name}» (${id}) восстановлен.`);
+  } catch (err) {
+    await sendText(chatId, `Ошибка: ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Owner admin commands
 // ---------------------------------------------------------------------------
 
@@ -904,6 +970,23 @@ async function handleCommand(chatId, msg, cmd) {
     }
     case "/keys": {
       await renderKeys(chatId, owner);
+      return;
+    }
+    case "/algorithms": {
+      if (!requireOwner(chatId, owner)) return;
+      await renderAlgorithms(chatId);
+      return;
+    }
+    case "/algo-off": {
+      if (!requireOwner(chatId, owner)) return;
+      if (!rest) { await sendText(chatId, "Укажите id: /algo-off <id>"); return; }
+      await deactivateAlgorithm(chatId, rest.trim());
+      return;
+    }
+    case "/algo-on": {
+      if (!requireOwner(chatId, owner)) return;
+      if (!rest) { await sendText(chatId, "Укажите id: /algo-on <id>"); return; }
+      await reactivateAlgorithm(chatId, rest.trim());
       return;
     }
     case "/screenshot": {

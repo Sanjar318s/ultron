@@ -16,6 +16,7 @@ import {
   listForPrompt,
 } from "@/lib/skillCatalog";
 import { commitBrain, loadBrain } from "@/lib/brainStore";
+import { metaEngine } from "@/lib/metaLearning";
 import { buildStudyNote } from "@/lib/noteBuilder";
 import { extractVideoId, fetchVideoTranscript, isYouTubeUrl } from "@/lib/youtube";
 import { generateImage } from "@/lib/generateImage";
@@ -331,6 +332,52 @@ async function executeHandledAction(
       return { reply: "Выключить жесты можно в веб-интерфейсе (кнопка камеры)." };
     case "stop":
       return { reply: "Стоп (в веб-интерфейсе — пауза навыка)." };
+
+    case "maximize": {
+      const { maximizeWindow } = await import("@/lib/desktopInput");
+      const ok = await maximizeWindow();
+      return { reply: ok ? "Разворачиваю на весь экран." : "Не удалось найти окно." };
+    }
+    case "minimize": {
+      const { minimizeWindow } = await import("@/lib/desktopInput");
+      const ok = await minimizeWindow();
+      return { reply: ok ? "Сворачиваю окно." : "Не удалось найти окно." };
+    }
+    case "close": {
+      const { closeWindow } = await import("@/lib/desktopInput");
+      const ok = await closeWindow();
+      return { reply: ok ? "Закрываю окно." : "Не удалось найти окно." };
+    }
+    case "restore": {
+      const { restoreWindow } = await import("@/lib/desktopInput");
+      const ok = await restoreWindow();
+      return { reply: ok ? "Восстанавливаю окно." : "Не удалось найти окно." };
+    }
+    case "toggle-maximize": {
+      const { toggleMaximize } = await import("@/lib/desktopInput");
+      const ok = await toggleMaximize();
+      return { reply: ok ? "Переключаю размер окна." : "Не удалось найти окно." };
+    }
+    case "chain": {
+      const results: string[] = [];
+      for (const sub of action.actions) {
+        const r = await executeHandledAction(brain, sub, baseUrl, ctx);
+        if (r.reply) results.push(r.reply);
+      }
+      return { reply: results.join(" → ") || "Цепочка выполнена." };
+    }
+    case "file-search": {
+      const { searchFiles, openFile, googleImagesUrl } = await import("@/lib/fileSearch");
+      const { openViaShell: shell } = await import("@/lib/launcher");
+      const matches = await searchFiles(action.query);
+      if (matches.length > 0) {
+        await openFile(matches[0].path);
+        return { reply: `Нашёл ${matches.length} файл(ов). Открываю «${matches[0].name}».` };
+      }
+      const url = googleImagesUrl(action.query);
+      shell(url);
+      return { reply: `Локально ничего не нашёл. Открываю поиск в Google Картинках.` };
+    }
   }
 }
 
@@ -406,6 +453,18 @@ export async function POST(req: NextRequest) {
   // Brain resolved it locally (rule / intent / launch confirm).
   if (outcome.handled) {
     await commitBrain(brain, baseIds);
+
+    // Record meta-algorithm success if the outcome came from a meta-algorithm.
+    if (outcome.action) {
+      const metaAlgos = brain.metaAlgorithmList;
+      for (const algo of metaAlgos) {
+        if (algo.status !== "active") continue;
+        if (algo.action && JSON.stringify(algo.action) === JSON.stringify(outcome.action)) {
+          metaEngine.recordSuccess(algo.id);
+          break;
+        }
+      }
+    }
 
     // Learn a URL server-side (Telegram path). YouTube links use the full
     // transcript (chunked, everything said in the video); other pages get the

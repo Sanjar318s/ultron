@@ -172,7 +172,18 @@ function describeStep(step: SkillStep): string {
       return `копировать (Ctrl+C)`;
     case "paste":
       return `вставить (Ctrl+V)`;
+    case "maximize":
+      return `развернуть окно на весь экран`;
+    case "minimize":
+      return `свернуть окно`;
+    case "close":
+      return `закрыть окно`;
+    case "restore":
+      return `восстановить окно`;
+    case "toggle-maximize":
+      return `переключить размер окна`;
   }
+  return "выполнить действие";
 }
 
 /**
@@ -615,6 +626,21 @@ export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantAp
         setSkills(brain.skillList);
         push("ai", outcome.reply);
         speakRef.current(outcome.reply);
+
+        // Periodic audit: 10% of brain-handled queries get compared with LLM (fire-and-forget).
+        if (Math.random() < 0.1 && outcome.action) {
+          void fetch("/api/meta-analyze", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              query: trimmed,
+              brainHandled: true,
+              brainReply: outcome.reply,
+              brainAction: outcome.action ?? null,
+              llmReply: "", // server will call LLM for comparison
+            }),
+          }).catch(() => {});
+        }
         if (outcome.action) {
           switch (outcome.action.kind) {
             case "start-lesson":
@@ -674,6 +700,18 @@ export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantAp
         const finalReply = added > 0 ? `${reply} Запомнил.` : reply;
         push("ai", finalReply);
         speakRef.current(finalReply);
+
+        // Meta-learning: send interaction data for algorithm generation (fire-and-forget).
+        void fetch("/api/meta-analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query: trimmed,
+            brainHandled: false,
+            llmReply: reply,
+            llmAction: action ?? null,
+          }),
+        }).catch(() => {});
 
         const generated =
           typeof parsed?.generate === "string" && parsed.generate.trim() ? parsed.generate.trim() : "";

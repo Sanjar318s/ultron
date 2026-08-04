@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { AssistantBrain, type BrainIdSet, type BrainSnapshot, snapshotIds } from "@/lib/assistantBrain";
+import { readMetaStore } from "@/lib/metaLearning";
 
 /**
  * Durable brain storage (data/brain.json) with a lossless sync protocol.
@@ -72,6 +73,11 @@ export async function loadBrain(): Promise<AssistantBrain> {
   const brain = new AssistantBrain();
   const snapshot = await readSnapshot();
   if (snapshot) brain.hydrate(snapshot);
+  // Load active meta-algorithms into the brain.
+  try {
+    const metaStore = await readMetaStore();
+    brain.setMetaAlgorithms(metaStore.algorithms);
+  } catch { /* meta store not yet created */ }
   return brain;
 }
 

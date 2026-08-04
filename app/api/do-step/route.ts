@@ -3,14 +3,19 @@ import { launchApp, launchAndFocus, openViaShell, runPs, SAFE_URL } from "@/lib/
 import {
   clearField,
   clickAt,
+  closeWindow,
   copySelection,
   dragTo,
   focusWindow,
+  maximizeWindow,
+  minimizeWindow,
   moveTo,
   pasteClipboard,
+  restoreWindow,
   scrollBy,
   sendKeys,
   toSendKeys,
+  toggleMaximize,
   typeText,
 } from "@/lib/desktopInput";
 import type { SkillStepAction } from "@/lib/assistantBrain";
@@ -44,6 +49,7 @@ export async function POST(req: NextRequest) {
     "launch", "url", "type", "key", "wait", "click",
     "double-click", "right-click", "move", "drag", "scroll",
     "focus", "clear", "smart-type", "copy", "paste",
+    "maximize", "minimize", "close", "restore", "toggle-maximize",
   ];
   const action = typeof body?.action === "string" ? body.action : "";
   if (!allowed.includes(action as SkillStepAction)) {
@@ -112,6 +118,27 @@ export async function POST(req: NextRequest) {
       case "paste": {
         await pasteClipboard();
         return NextResponse.json({ ok: true });
+      }
+
+      case "maximize": {
+        const ok = await maximizeWindow();
+        return ok ? NextResponse.json({ ok: true }) : NextResponse.json({ error: "окно не найдено" }, { status: 404 });
+      }
+      case "minimize": {
+        const ok = await minimizeWindow();
+        return ok ? NextResponse.json({ ok: true }) : NextResponse.json({ error: "окно не найдено" }, { status: 404 });
+      }
+      case "close": {
+        const ok = await closeWindow();
+        return ok ? NextResponse.json({ ok: true }) : NextResponse.json({ error: "окно не найдено" }, { status: 404 });
+      }
+      case "restore": {
+        const ok = await restoreWindow();
+        return ok ? NextResponse.json({ ok: true }) : NextResponse.json({ error: "окно не найдено" }, { status: 404 });
+      }
+      case "toggle-maximize": {
+        const ok = await toggleMaximize();
+        return ok ? NextResponse.json({ ok: true }) : NextResponse.json({ error: "окно не найдено" }, { status: 404 });
       }
 
       case "wait": {

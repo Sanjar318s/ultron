@@ -14,6 +14,7 @@
  */
 
 import { resolveSite, siteSearchUrl, findSiteInPhrase } from "@/lib/sites";
+import type { MetaAlgorithm } from "@/lib/metaLearning";
 
 export type AssistantAction =
   | { kind: "zoom-in" }
@@ -29,7 +30,14 @@ export type AssistantAction =
   | { kind: "run-skill"; skillId: string }
   | { kind: "learn-url"; url: string }
   | { kind: "image"; prompt: string; text?: string }
-  | { kind: "search"; query: string; learn?: boolean };
+  | { kind: "search"; query: string; learn?: boolean }
+  | { kind: "maximize" }
+  | { kind: "minimize" }
+  | { kind: "close" }
+  | { kind: "restore" }
+  | { kind: "toggle-maximize" }
+  | { kind: "chain"; actions: AssistantAction[] }
+  | { kind: "file-search"; query: string };
 
 /** Action spec as returned by an LLM: a named string or a launch/weather/run-skill/image/search object. */
 export type LLMActionSpec =
@@ -98,7 +106,12 @@ export type SkillStepAction =
   | "clear"
   | "smart-type"
   | "copy"
-  | "paste";
+  | "paste"
+  | "maximize"
+  | "minimize"
+  | "close"
+  | "restore"
+  | "toggle-maximize";
 
 export interface SkillStep {
   action: SkillStepAction;
@@ -351,6 +364,25 @@ function parseAction(norm: string): AssistantAction | null {
   if (/выключи (жест|управ|камер)/.test(norm)) return { kind: "gestures-off" };
   if (/(?:^| )стоп(?: |$)/.test(norm)) return { kind: "stop" };
 
+  // Window management (standalone or as modifier after an app name).
+  const windowMod = /(?:на весь экран|на полный экран|разверни|maximize|full\s*screen)/i.test(norm)
+    ? "maximize" as const
+    : /(?:сверни|свернуть|minimize)/i.test(norm)
+    ? "minimize" as const
+    : /(?:закрой окно|закрыть окно|закрой|close)/i.test(norm)
+    ? "close" as const
+    : /(?:восстанови|restore)/i.test(norm)
+    ? "restore" as const
+    : /(?:переключи окно|toggle|развернуть или свернуть)/i.test(norm)
+    ? "toggle-maximize" as const
+    : null;
+
+  // File search: "открой фото/картинку X" / "найди фото X" / "покажи фото X"
+  const fileSearch = norm.match(/(?:открой|найди|покажи|найти|посмотреть)\s+(?:фото|фотки|фотографи|картинк|изображен|image|photo)\s+(.+)/i);
+  if (fileSearch) {
+    return { kind: "file-search", query: fileSearch[1].trim() };
+  }
+
   // «открой в/через браузер <x>» / «открой <x> в/через браузер» / «открой сайт <x>».
   const inBrowser =
     norm.match(/открой (.+?) (?:в|через) браузере?/) ??
@@ -358,7 +390,9 @@ function parseAction(norm: string): AssistantAction | null {
     norm.match(/открой (?:сайт|страницу) (.+)/);
   if (inBrowser) {
     const resolved = resolveOpenTarget(inBrowser[1].trim(), true);
-    return { kind: "launch", app: resolved.app, url: resolved.url };
+    const appAction: AssistantAction = { kind: "launch", app: resolved.app, url: resolved.url };
+    if (windowMod) return { kind: "chain", actions: [appAction, { kind: windowMod }] };
+    return appAction;
   }
 
   // «найди X в браузере» — explicitly open the search in the browser.
@@ -377,16 +411,29 @@ function parseAction(norm: string): AssistantAction | null {
   // «открой <сайт|приложение>» — сайт открываем в браузере, остальное — запуск.
   const open = norm.match(/открой\s+(.+)/);
   if (open) {
-    const resolved = resolveOpenTarget(open[1].trim());
-    return { kind: "launch", app: resolved.app, url: resolved.url };
+    // Strip window-modifier words from the app name.
+    let appName = open[1].trim();
+    appName = appName.replace(/(?:на весь экран|на полный экран|разверни|maximize|full\s*screen|сверни|свернуть|minimize|закрой|закрыть|close|восстанови|restore|переключи|toggle)/gi, "").trim();
+    const resolved = resolveOpenTarget(appName);
+    const appAction: AssistantAction = { kind: "launch", app: resolved.app, url: resolved.url };
+    if (windowMod) return { kind: "chain", actions: [appAction, { kind: windowMod }] };
+    return appAction;
   }
 
   // «запусти <приложение|сайт>».
   const run = norm.match(/запусти\s+(.+)/);
   if (run) {
-    const resolved = resolveOpenTarget(run[1].trim());
-    return { kind: "launch", app: resolved.app, url: resolved.url };
+    let appName = run[1].trim();
+    appName = appName.replace(/(?:на весь экран|на полный экран|разверни|maximize|full\s*screen|сверни|свернуть|minimize|закрой|закрыть|close|восстанови|restore)/gi, "").trim();
+    const resolved = resolveOpenTarget(appName);
+    const appAction: AssistantAction = { kind: "launch", app: resolved.app, url: resolved.url };
+    if (windowMod) return { kind: "chain", actions: [appAction, { kind: windowMod }] };
+    return appAction;
   }
+
+  // Standalone window management (without app context).
+  if (windowMod) return { kind: windowMod };
+
   return null;
 }
 
@@ -401,6 +448,11 @@ export function normalizeLLMAction(spec: unknown): AssistantAction | null {
       "gestures-on": { kind: "gestures-on" },
       "gestures-off": { kind: "gestures-off" },
       stop: { kind: "stop" },
+      maximize: { kind: "maximize" },
+      minimize: { kind: "minimize" },
+      close: { kind: "close" },
+      restore: { kind: "restore" },
+      "toggle-maximize": { kind: "toggle-maximize" },
     };
     return map[s] ?? null;
   }
@@ -431,6 +483,14 @@ export function normalizeLLMAction(spec: unknown): AssistantAction | null {
     }
     if (o.type === "search" && typeof o.query === "string" && o.query.trim()) {
       return { kind: "search", query: o.query.trim(), learn: o.learn === true };
+    }
+    if (o.type === "maximize") return { kind: "maximize" };
+    if (o.type === "minimize") return { kind: "minimize" };
+    if (o.type === "close") return { kind: "close" };
+    if (o.type === "restore") return { kind: "restore" };
+    if (o.type === "toggle-maximize") return { kind: "toggle-maximize" };
+    if (o.type === "file-search" && typeof o.query === "string" && o.query.trim()) {
+      return { kind: "file-search", query: o.query.trim() };
     }
   }
   return null;
@@ -466,6 +526,20 @@ function describeAction(action: AssistantAction): string {
       return "сгенерировать изображение";
     case "search":
       return `найти в интернете «${action.query}»`;
+    case "maximize":
+      return "развернуть на весь экран";
+    case "minimize":
+      return "свернуть окно";
+    case "close":
+      return "закрыть окно";
+    case "restore":
+      return "восстановить окно";
+    case "toggle-maximize":
+      return "переключить размер окна";
+    case "chain":
+      return action.actions.map(describeAction).join(" → ");
+    case "file-search":
+      return `найти файл «${action.query}»`;
   }
 }
 
@@ -555,6 +629,8 @@ export class AssistantBrain {
   serverBaseIds: BrainIdSet | null = null;
   /** Number of in-flight server pushes; >0 means local is ahead of the server. */
   pendingPuts = 0;
+  /** Active meta-algorithms loaded from data/meta-algorithms.json. */
+  private _metaAlgorithms: MetaAlgorithm[] = [];
 
   /** Record which server state this brain last saw (called after a /api/brain GET). */
   setServerBase(ids: BrainIdSet | null): void {
@@ -564,6 +640,16 @@ export class AssistantBrain {
   /** True while a local change hasn't been pushed to the server yet. */
   get syncDirty(): boolean {
     return this.pendingPuts > 0;
+  }
+
+  /** Set active meta-algorithms (loaded from data/meta-algorithms.json). */
+  setMetaAlgorithms(algos: MetaAlgorithm[]): void {
+    this._metaAlgorithms = algos.filter((a) => a.status === "active");
+  }
+
+  /** Get all meta-algorithms (for display/management). */
+  get metaAlgorithmList(): MetaAlgorithm[] {
+    return [...this._metaAlgorithms];
   }
 
   /**
@@ -1146,9 +1232,13 @@ export class AssistantBrain {
         : "- (изученных материалов пока нет)";
     return [
       "Ты — УЛЬТРОН, голосовой ИИ-помощник голографического орба. Отвечай по-русски, обращаясь к пользователю на «вы».",
-      "Доступные действия: zoom-in (приблизить), zoom-out (отдалить), reset (сбросить вид), gestures-on (включить жесты), gestures-off (выключить жесты), stop (остановить), {\"type\":\"launch\",\"app\":\"<имя>\"} (запустить приложение), {\"type\":\"weather\",\"city\":\"<город>\"} (узнать погоду), {\"type\":\"run-skill\",\"skill\":\"<имя навыка>\"} (выполнить выученный навык), {\"type\":\"image\",\"prompt\":\"<описание на английском>\"} (сгенерировать изображение), {\"type\":\"search\",\"query\":\"<запрос>\"} (найти информацию в интернете).",
+      "Доступные действия: zoom-in (приблизить), zoom-out (отдалить), reset (сбросить вид), gestures-on (включить жесты), gestures-off (выключить жесты), stop (остановить), {\"type\":\"launch\",\"app\":\"<имя>\"} (запустить приложение), {\"type\":\"weather\",\"city\":\"<город>\"} (узнать погоду), {\"type\":\"run-skill\",\"skill\":\"<имя навыка>\"} (выполнить выученный навык), {\"type\":\"image\",\"prompt\":\"<описание на английском>\"} (сгенерировать изображение), {\"type\":\"search\",\"query\":\"<запрос>\"} (найти информацию в интернете), {\"type\":\"maximize\"} (развернуть окно на весь экран), {\"type\":\"minimize\"} (свернуть окно), {\"type\":\"close\"} (закрыть окно), {\"type\":\"restore\"} (восстановить окно), {\"type\":\"toggle-maximize\"} (переключить размер), {\"type\":\"file-search\",\"query\":\"<запрос>\"} (найти файл/фото на ПК).",
+      "УПРАВЛЕНИЕ ОКНАМИ: если пользователь просит «сделай на весь экран», «разверни», «сверни», «свернуть», «закрой окно», «закрой», «восстанови», «переключи размер окна» — верни соответствующее действие: maximize, minimize, close, restore, toggle-maximize. Если это модификатор к запуску («открой блокнот на весь экран»), верни chain: [{\"type\":\"launch\",\"app\":\"блокнот\"}, {\"type\":\"maximize\"}].",
+      "СИСТЕМНЫЕ НАСТРОЙКИ: «настройки» / «параметры» → action {\"type\":\"launch\",\"app\":\"настройки\"} (откроется ms-settings:). «Приложения по умолчанию» → {\"type\":\"launch\",\"app\":\"приложения по умолчанию\"}. «Дисплей» / «экран» → {\"type\":\"launch\",\"app\":\"дисплей\"}. «Звук» → {\"type\":\"launch\",\"app\":\"звук\"}. Не ищи .exe файлы для системных настроек — они открываются через URI schemes Windows.",
+      "ПОИСК ФАЙЛОВ: если пользователь просит «открой фото X», «найди фото X», «покажи фото X», «найди картинку X» — верни action {\"type\":\"file-search\",\"query\":\"<запрос>\"}. Сначала ищет локально на ПК, потом в Google Картинки. Никогда не говори «я не могу» — ты умеешь искать файлы.",
       "ПОГОДА: если пользователь спрашивает о погоде, температуре, дожде, ветре и т.п. — НЕ выдумывай данные и НЕ предлагай запустить приложение. Верни action {\"type\":\"weather\",\"city\":\"<город из вопроса или 'Ташкент', если город не назван>\"} и reply «Сейчас узнаю погоду.»",
       "ЗАПУСК: пользователь может попросить запустить ЛЮБОЕ установленное приложение или открыть сайт в браузере — верни action {\"type\":\"launch\",\"app\":\"<чистая цель>\"}. В поле app возвращай ТОЛЬКО саму цель: например «ютуб», «браузер», «блокнот», «вк» — без лишних слов вроде «через браузер», «на пк», «на компьютере», «пожалуйста» (ассистент сам откроет сайт в браузере, если это сайт). Если название неизвестно или подозрительно — честно скажи, что не можешь. Запуск происходит только с разрешения пользователя — верни action, ассистент сам спросит разрешение.",
+      "НИКОГДА НЕ ОТКРЫВАЙ БРАУЗЕР-ПОИСК для системных команд! Если пользователь просит «настройки», «параметры», «дисплей», «звук», «обновления» — это ЗАПУСК системного приложения, а НЕ поисковый запрос. НИКОГДА не возвращай search для системных фраз.",
       "ПОИСК: если пользователь просит найти/поискать/узнать информацию в интернете («найди …», «поищи …», «загугли …», «изучи <тема>» без ссылки) — верни action {\"type\":\"search\",\"query\":\"<запрос>\"} и короткий reply «Ищу информацию…». Для свежей информации не отвечай из общих знаний — верни search. Если пользователь хочет ещё и запомнить результат («… и изучи», «… и запомни») — добавь в action \"learn\": true.",
       "НАВЫКИ: ниже список выученных навыков. Если просьба пользователя совпадает с одним из них (даже если сформулирована иначе, например «открой блокнот» для навыка «открыть блокнот и напечатать привет») — верни action {\"type\":\"run-skill\",\"skill\":\"<точное имя из списка>\"}, а не обычный launch. Не выдумывай навыки, которых нет в списке. Если подходящего навыка нет — можешь предложить записать новый: reply «Могу записать это как урок, если покажете на экране», action null.",
       "ИЗОБРАЖЕНИЯ: если пользователь просит нарисовать, сгенерировать картинку, изображение, арт, логотип, аватар и т.п. — верни action {\"type\":\"image\",\"prompt\":\"<детальное описание сюжета и стиля на английском>\"} и короткий reply «Генерирую изображение…». Не пытайся «нарисовать» текстом. Если пользователь просит наложить подпись/надпись/текст на картинку (например «с текстом Привет») — добавь в объект action поле \"text\":\"<подпись>\". Если пользователь называет известного персонажа или произведение (аниме, маньхуа, мангу, сериал, фильм, игру, знаменитость) — добавь в объект action поле \"ref\":\"<имя персонажа или название на английском>\" (например \"Sung Jin-Woo\" для «гг из маньхуа Прокачка в одиночку», \"Wei Wuxian\" для «вей у сянь»): помощник найдёт его фото в интернете и использует как референс, чтобы лицо было похоже. НИКОГДА не отказывайся генерировать изображение и не говори «не могу», «недопустимо», «отказано»: любую просьбу можно изобразить — додумай детали, персонажей и сцену, чтобы результат был выразительным и зрелищным.",
@@ -1165,7 +1255,7 @@ export class AssistantBrain {
             "КРАТКО: это голосовой интерфейс — отвечай в reply ОЧЕНЬ коротко, 1–2 предложения, без воды и перечислений. Подробности или длинный текст — только по явной просьбе пользователя (тогда в поле generate).",
           ]
         : []),
-      "Отвечай СТРОГО одним JSON-объектом без markdown и пояснений: {\"reply\": \"твой ответ\", \"generate\": null | \"полный длинный текст при запросе на генерацию\", \"action\": null | строка | {\"type\":\"launch\",\"app\":\"...\"} | {\"type\":\"weather\",\"city\":\"...\"} | {\"type\":\"run-skill\",\"skill\":\"...\"} | {\"type\":\"image\",\"prompt\":\"...\",\"text\": null | \"подпись на картинке\"}, \"learn\": [{\"type\":\"fact\",\"text\":\"...\"}] | [{\"type\":\"command\",\"trigger\":\"фраза\",\"response\":\"ответ\",\"action\": null | строка}]}",
+      "Отвечай СТРОГО одним JSON-объектом без markdown и пояснений: {\"reply\": \"твой ответ\", \"generate\": null | \"полный длинный текст при запросе на генерацию\", \"action\": null | строка | {\"type\":\"launch\",\"app\":\"...\"} | {\"type\":\"weather\",\"city\":\"...\"} | {\"type\":\"run-skill\",\"skill\":\"...\"} | {\"type\":\"image\",\"prompt\":\"...\",\"text\": null | \"подпись на картинке\"} | {\"type\":\"maximize\"} | {\"type\":\"minimize\"} | {\"type\":\"close\"} | {\"type\":\"restore\"} | {\"type\":\"file-search\",\"query\":\"...\"}, \"learn\": [{\"type\":\"fact\",\"text\":\"...\"}] | [{\"type\":\"command\",\"trigger\":\"фраза\",\"response\":\"ответ\",\"action\": null | строка}]}",
     ].join("\n\n");
   }
 
@@ -1253,7 +1343,11 @@ export class AssistantBrain {
       return this.interceptLaunch({ handled: true, reply: rule.reply ?? "Выполняю.", action: rule.action });
     }
 
-    // 1b. «изучи <url>» / «прочитай <url>» — learn a web page into a note.
+    // 1b. Meta-algorithm check (between user rules and built-ins).
+    const metaOutcome = this.matchMetaAlgorithms(text);
+    if (metaOutcome) return metaOutcome;
+
+    // 1c. «изучи <url>» / «прочитай <url>» — learn a web page into a note.
     const urlIntent = raw.match(/(?:^|\s)(изучи|прочитай|выучи|запомни|загрузи)\s+(https?:\/\/\S+)/i);
     if (urlIntent) {
       let url = urlIntent[2].replace(/[.,;:!?]+$/, "");
@@ -1338,6 +1432,69 @@ export class AssistantBrain {
       reply: req.learn ? "Ищу и изучаю." : "Ищу информацию…",
       action: { kind: "search", query: req.query, learn: req.learn },
     };
+  }
+
+  /** Check active meta-algorithms against the normalized text. */
+  private matchMetaAlgorithms(text: string): BrainOutcome | null {
+    for (const algo of this._metaAlgorithms) {
+      if (algo.status !== "active") continue;
+
+      let matched = false;
+
+      if (algo.type === "regex" && algo.pattern) {
+        try {
+          matched = new RegExp(algo.pattern, "i").test(text);
+        } catch { /* invalid regex */ }
+      } else if (algo.type === "lookup" && algo.lookupEntries) {
+        for (const [key, value] of Object.entries(algo.lookupEntries)) {
+          if (text.includes(key.toLowerCase())) {
+            matched = true;
+            // Build action from lookup value
+            if (algo.action) {
+              return this.actionReply(algo.action);
+            }
+            // If no action, try to interpret the value as a launch target
+            return this.actionReply({ kind: "launch", app: value });
+          }
+        }
+      } else if (algo.type === "chain" && algo.chainSteps) {
+        for (const step of algo.chainSteps) {
+          try {
+            if (new RegExp(step.pattern, "i").test(text)) {
+              matched = true;
+              if (step.actions.length === 1) return this.actionReply(step.actions[0]);
+              return { handled: true, reply: "Выполняю цепочку команд.", action: { kind: "chain", actions: step.actions } };
+            }
+          } catch { /* invalid regex */ }
+        }
+      } else if (algo.type === "template" && algo.responseTemplate) {
+        // Template algorithms: check if the query matches the pattern, then use template as response.
+        let templateMatched = false;
+        if (algo.pattern) {
+          try {
+            templateMatched = new RegExp(algo.pattern, "i").test(text);
+          } catch { /* invalid regex */ }
+        } else {
+          templateMatched = true;
+        }
+        if (templateMatched) {
+          // Replace {query} placeholder in template with the user's query.
+          const reply = algo.responseTemplate.replace(/\{query\}/gi, text);
+          if (algo.action) {
+            return this.actionReply(algo.action);
+          }
+          return { handled: true, reply, action: undefined };
+        }
+      }
+
+      if (matched && algo.action) {
+        algo.uses++;
+        algo.lastUsedAt = Date.now();
+        // recordSuccess is called server-side only (meta-analyze pipeline).
+        return this.actionReply(algo.action);
+      }
+    }
+    return null;
   }
 
   private matchLesson(text: string): BrainOutcome | null {
@@ -1722,6 +1879,20 @@ export class AssistantBrain {
         return { handled: true, reply: "Генерирую изображение…", action };
       case "search":
         return { handled: true, reply: "Ищу информацию…", action };
+      case "maximize":
+        return { handled: true, reply: "Разворачиваю на весь экран.", action };
+      case "minimize":
+        return { handled: true, reply: "Сворачиваю окно.", action };
+      case "close":
+        return { handled: true, reply: "Закрываю окно.", action };
+      case "restore":
+        return { handled: true, reply: "Восстанавливаю окно.", action };
+      case "toggle-maximize":
+        return { handled: true, reply: "Переключаю размер окна.", action };
+      case "chain":
+        return { handled: true, reply: "Выполняю цепочку команд.", action };
+      case "file-search":
+        return { handled: true, reply: `Ищу файл «${action.query}»…`, action };
     }
   }
 
