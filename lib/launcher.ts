@@ -15,6 +15,7 @@ import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { dedupeApps, findBestApp, isReasonableApp, matchAppScore, normForMatch, scanInstalledApps } from "@/lib/installedApps";
+import { steamAliasName } from "@/lib/commandSplit";
 import { findSiteInPhrase, resolveSite } from "@/lib/sites";
 
 /** Safe charset for a URL (https/http only, no quotes/semicolons/whitespace). */
@@ -467,6 +468,21 @@ export async function matchSteamGame(query: string): Promise<SteamGame | null> {
   const games = await listSteamGames();
   let best: SteamGame | null = null;
   let bestScore = 60;
+  // Spoken aliases («кс 2», «контра») → canonical library title, so the fuzzy
+  // match below has something real to compare against instead of falling back
+  // to the Windows Start-menu search (which opens the Xbox app for game names).
+  const aliasTitle = steamAliasName(query);
+  if (aliasTitle) {
+    const aliasNorm = normForMatch(aliasTitle);
+    for (const g of games) {
+      const score = matchAppScore(aliasNorm, g.name);
+      if (score > bestScore) {
+        bestScore = score;
+        best = g;
+      }
+    }
+    if (best) return best;
+  }
   for (const g of games) {
     const score = matchAppScore(q, g.name);
     if (score > bestScore) {
@@ -562,6 +578,15 @@ export async function launchApp(
     return { launched: name, matched: name };
   }
 
+  // Installed Steam game («запусти кс 2» → steam://rungameid/730). Checked
+  // BEFORE the installed-app scan: game names must never be shadowed by a
+  // Windows app (e.g. the Xbox Game Bar surfacing for «кс 2»).
+  const game = await matchSteamGame(name);
+  if (game) {
+    openViaShell(`steam://rungameid/${game.appid}`);
+    return { launched: name, matched: game.name };
+  }
+
   const installed = findBestApp(
     name,
     dedupeApps((await scanInstalledApps()).filter((a) => isReasonableApp(a.name))),
@@ -570,13 +595,6 @@ export async function launchApp(
     if (focus) await launchAndFocus(installed.path, installed.name);
     else openViaShell(installed.path);
     return { launched: name, matched: installed.name };
-  }
-
-  // Installed Steam game («запусти кс го» → steam://rungameid/730).
-  const game = await matchSteamGame(name);
-  if (game) {
-    openViaShell(`steam://rungameid/${game.appid}`);
-    return { launched: name, matched: game.name };
   }
 
   if (/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(name)) {

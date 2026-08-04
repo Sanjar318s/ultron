@@ -14,6 +14,7 @@
  */
 
 import { resolveSite, siteSearchUrl, findSiteInPhrase } from "@/lib/sites";
+import { isCompoundCommand, splitLaunchChain } from "@/lib/commandSplit";
 import type { MetaAlgorithm } from "@/lib/metaLearning";
 
 export type AssistantAction =
@@ -355,9 +356,19 @@ function resolveOpenTarget(raw: string, forceBrowser = false): { app: string; ur
   return { app: target };
 }
 
+/**
+ * Split a compound launch phrase into individual launch actions
+ * («открой стим и запусти кс 2» → two launches). Single part → one action.
+ */
+function launchParts(appName: string): AssistantAction[] {
+  return splitLaunchChain(appName).map((p) => {
+    const r = resolveOpenTarget(p);
+    return { kind: "launch", app: r.app, url: r.url } as AssistantAction;
+  });
+}
+
 /** Map a phrase to an executable action (the "reflex" layer). */
-function parseAction(norm: string): AssistantAction | null {
-  if (/(?:^| )сброс(?: |$)|сбросить|верни вид/.test(norm)) return { kind: "reset" };
+function parseAction(norm: string): AssistantAction | null {  if (/(?:^| )сброс(?: |$)|сбросить|верни вид/.test(norm)) return { kind: "reset" };
   if (/приблиз|увелич|зум ?в|зум ?\+/.test(norm)) return { kind: "zoom-in" };
   if (/отдали|уменьш|зум ?аут|зум ?-/.test(norm)) return { kind: "zoom-out" };
   if (/включи (жест|управ|камер)/.test(norm)) return { kind: "gestures-on" };
@@ -414,10 +425,10 @@ function parseAction(norm: string): AssistantAction | null {
     // Strip window-modifier words from the app name.
     let appName = open[1].trim();
     appName = appName.replace(/(?:на весь экран|на полный экран|разверни|maximize|full\s*screen|сверни|свернуть|minimize|закрой|закрыть|close|восстанови|restore|переключи|toggle)/gi, "").trim();
-    const resolved = resolveOpenTarget(appName);
-    const appAction: AssistantAction = { kind: "launch", app: resolved.app, url: resolved.url };
-    if (windowMod) return { kind: "chain", actions: [appAction, { kind: windowMod }] };
-    return appAction;
+    const parts = launchParts(appName);
+    if (windowMod) return { kind: "chain", actions: [...parts, { kind: windowMod }] };
+    if (parts.length > 1) return { kind: "chain", actions: parts };
+    return parts[0];
   }
 
   // «запусти <приложение|сайт>».
@@ -425,10 +436,10 @@ function parseAction(norm: string): AssistantAction | null {
   if (run) {
     let appName = run[1].trim();
     appName = appName.replace(/(?:на весь экран|на полный экран|разверни|maximize|full\s*screen|сверни|свернуть|minimize|закрой|закрыть|close|восстанови|restore)/gi, "").trim();
-    const resolved = resolveOpenTarget(appName);
-    const appAction: AssistantAction = { kind: "launch", app: resolved.app, url: resolved.url };
-    if (windowMod) return { kind: "chain", actions: [appAction, { kind: windowMod }] };
-    return appAction;
+    const parts = launchParts(appName);
+    if (windowMod) return { kind: "chain", actions: [...parts, { kind: windowMod }] };
+    if (parts.length > 1) return { kind: "chain", actions: parts };
+    return parts[0];
   }
 
   // Standalone window management (without app context).
@@ -465,11 +476,23 @@ export function normalizeLLMAction(spec: unknown): AssistantAction | null {
       text?: unknown;
       query?: unknown;
       learn?: unknown;
+      actions?: unknown;
     };
     if (o.type === "launch" && typeof o.app === "string" && o.app.trim()) {
-      const app = o.app.trim();
-      const url = resolveSite(app);
-      return url ? { kind: "launch", app, url } : { kind: "launch", app };
+      const parts = splitLaunchChain(o.app.trim()).map(
+        (p): AssistantAction => {
+          const url = resolveSite(p);
+          return url ? { kind: "launch", app: p, url } : { kind: "launch", app: p };
+        },
+      );
+      if (parts.length > 1) return { kind: "chain", actions: parts };
+      return parts[0];
+    }
+    if (o.type === "chain" && Array.isArray(o.actions)) {
+      const actions = o.actions
+        .map((a) => normalizeLLMAction(a))
+        .filter((a): a is AssistantAction => a !== null);
+      if (actions.length > 0) return { kind: "chain", actions };
     }
     if (o.type === "weather" && typeof o.city === "string" && o.city.trim()) {
       return { kind: "weather", city: o.city.trim() };
@@ -1234,6 +1257,7 @@ export class AssistantBrain {
       "Ты — УЛЬТРОН, голосовой ИИ-помощник голографического орба. Отвечай по-русски, обращаясь к пользователю на «вы».",
       "Доступные действия: zoom-in (приблизить), zoom-out (отдалить), reset (сбросить вид), gestures-on (включить жесты), gestures-off (выключить жесты), stop (остановить), {\"type\":\"launch\",\"app\":\"<имя>\"} (запустить приложение), {\"type\":\"weather\",\"city\":\"<город>\"} (узнать погоду), {\"type\":\"run-skill\",\"skill\":\"<имя навыка>\"} (выполнить выученный навык), {\"type\":\"image\",\"prompt\":\"<описание на английском>\"} (сгенерировать изображение), {\"type\":\"search\",\"query\":\"<запрос>\"} (найти информацию в интернете), {\"type\":\"maximize\"} (развернуть окно на весь экран), {\"type\":\"minimize\"} (свернуть окно), {\"type\":\"close\"} (закрыть окно), {\"type\":\"restore\"} (восстановить окно), {\"type\":\"toggle-maximize\"} (переключить размер), {\"type\":\"file-search\",\"query\":\"<запрос>\"} (найти файл/фото на ПК).",
       "УПРАВЛЕНИЕ ОКНАМИ: если пользователь просит «сделай на весь экран», «разверни», «сверни», «свернуть», «закрой окно», «закрой», «восстанови», «переключи размер окна» — верни соответствующее действие: maximize, minimize, close, restore, toggle-maximize. Если это модификатор к запуску («открой блокнот на весь экран»), верни chain: [{\"type\":\"launch\",\"app\":\"блокнот\"}, {\"type\":\"maximize\"}].",
+      "СОСТАВНЫЕ КОМАНДЫ: если в одной просьбе несколько действий через «и», «затем», «потом», запятую или точку с запятой — верни chain с последовательными действиями, а НЕ одно действие с общим названием. Пример: «открой стим и запусти кс 2» → {\"type\":\"chain\",\"actions\":[{\"type\":\"launch\",\"app\":\"стим\"},{\"type\":\"launch\",\"app\":\"кс 2\"}]}. «включи ютуб и поставь музыку» → chain из launch(\"ютуб\") и launch(\"музыка\"). Никогда не возвращай app вида «стим и запусти кс 2».",
       "СИСТЕМНЫЕ НАСТРОЙКИ: «настройки» / «параметры» → action {\"type\":\"launch\",\"app\":\"настройки\"} (откроется ms-settings:). «Приложения по умолчанию» → {\"type\":\"launch\",\"app\":\"приложения по умолчанию\"}. «Дисплей» / «экран» → {\"type\":\"launch\",\"app\":\"дисплей\"}. «Звук» → {\"type\":\"launch\",\"app\":\"звук\"}. Не ищи .exe файлы для системных настроек — они открываются через URI schemes Windows.",
       "ПОИСК ФАЙЛОВ: если пользователь просит «открой фото X», «найди фото X», «покажи фото X», «найди картинку X» — верни action {\"type\":\"file-search\",\"query\":\"<запрос>\"}. Сначала ищет локально на ПК, потом в Google Картинки. Никогда не говори «я не могу» — ты умеешь искать файлы.",
       "ПОГОДА: если пользователь спрашивает о погоде, температуре, дожде, ветре и т.п. — НЕ выдумывай данные и НЕ предлагай запустить приложение. Верни action {\"type\":\"weather\",\"city\":\"<город из вопроса или 'Ташкент', если город не назван>\"} и reply «Сейчас узнаю погоду.»",

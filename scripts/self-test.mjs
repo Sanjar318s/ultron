@@ -3,6 +3,8 @@ import { mkdtempSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { splitLaunchChain, steamAliasName } from "../lib/commandSplit.ts";
+import { findSiteInPhrase, resolveSite } from "../lib/sites.ts";
 
 /**
  * Self-test suite for the ULTRON PC-control surface.
@@ -82,6 +84,21 @@ export async function runSelfTests({ live = false } = {}) {
   for (const f of scripts) {
     check(`syntax ${f}`, await execFileP("node", ["--check", fileURLToPath(new URL(f, import.meta.url))]));
   }
+
+  // 1b. Pure command/site resolution checks (no side effects, no server needed).
+  const pureChecks = [
+    ["site yandex-music", resolveSite("яндекс музыка") === "https://music.yandex.ru"],
+    ["site yandex-music phrase", findSiteInPhrase("яндекс музыку") === "https://music.yandex.ru"],
+    ["site plain yandex stays ya.ru", findSiteInPhrase("яндекс") === "https://ya.ru"],
+    [
+      "split compound command",
+      JSON.stringify(splitLaunchChain("открой стим и запусти кс 2")) === JSON.stringify(["стим", "кс 2"]),
+    ],
+    ["split single command", splitLaunchChain("блокнот").length === 1],
+    ["steam alias cs2", steamAliasName("кс 2") === "Counter-Strike 2"],
+    ["steam alias kontra in phrase", steamAliasName("запусти контра") === "Counter-Strike 2"],
+  ];
+  for (const [name, ok] of pureChecks) check(`pure ${name}`, ok);
 
   // 2. Server reachability.
   const probe = await http("GET", `${SERVER}/api/tts`);

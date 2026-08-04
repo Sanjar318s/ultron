@@ -26,6 +26,12 @@ export const SITE_ALIASES: Record<string, string> = {
   wikipedia: "https://ru.wikipedia.org",
   яндекс: "https://ya.ru",
   yandex: "https://ya.ru",
+  "яндекс музыка": "https://music.yandex.ru",
+  "яндексмузыка": "https://music.yandex.ru",
+  "музыка": "https://music.yandex.ru",
+  "музыку": "https://music.yandex.ru",
+  "музыки": "https://music.yandex.ru",
+  "музыка яндекс": "https://music.yandex.ru",
   почта: "https://mail.google.com",
   gmail: "https://mail.google.com",
   авито: "https://www.avito.ru",
@@ -78,6 +84,9 @@ export function findSiteInPhrase(raw: string): string | null {
   if (!q) return null;
   const exact = SITE_ALIASES[q];
   if (exact) return exact;
+  // Stem check FIRST so «яндекс музыку/музыкой/музыке» wins over the generic
+  // «яндекс → ya.ru» token (aliases only cover a few inflections).
+  if (q.includes("музык")) return "https://music.yandex.ru";
   for (const [alias, url] of Object.entries(SITE_ALIASES)) {
     if (hasWordToken(q, alias)) return url;
   }
