@@ -13,6 +13,23 @@ function psQuote(text: string): string {
   return text.replace(/'/g, "''");
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Run a window operation with automatic retries. Foreground/active-window
+ * state races with the OS (app still starting, animation in flight), so a
+ * single-shot probe can miss an OK that a retry 300ms later would catch.
+ * Returns whether any attempt reported OK.
+ */
+async function runWindowOp(script: string, attempts = 3, delayMs = 300): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    const out = await runPs(script, 20_000).catch(() => "");
+    if (out.includes("OK")) return true;
+    if (i < attempts - 1) await sleep(delayMs);
+  }
+  return false;
+}
+
 /** Known-key → SendKeys token map (lowercase). */
 const SENDKEYS: Record<string, string> = {
   enter: "{ENTER}",
@@ -201,7 +218,6 @@ Chord @(0x11, 0x56)`);
 export async function focusWindow(title: string, app?: string): Promise<boolean> {
   return focusWindowByTitle(title, app);
 }
-
 /** Clear the focused text field (Ctrl+A + Delete). */
 export async function clearField(): Promise<void> {
   await sendKeys("^a");
@@ -254,48 +270,43 @@ function Find-FgWindow {
 
 /** Maximize the foreground window (or any visible window). */
 export async function maximizeWindow(): Promise<boolean> {
-  const out = await runPs(`${WIN_WINDOW}
+  return runWindowOp(`${WIN_WINDOW}
 $h = Find-FgWindow
 if ($h -ne [IntPtr]::Zero) { [WinWnd]::ShowWindow($h, $SW_MAXIMIZE) | Out-Null; Write-Output 'OK' }
 else { Write-Output 'FAIL' }`);
-  return out.includes("OK");
 }
 
 /** Minimize the foreground window. */
 export async function minimizeWindow(): Promise<boolean> {
-  const out = await runPs(`${WIN_WINDOW}
+  return runWindowOp(`${WIN_WINDOW}
 $h = Find-FgWindow
 if ($h -ne [IntPtr]::Zero) { [WinWnd]::ShowWindow($h, $SW_MINIMIZE) | Out-Null; Write-Output 'OK' }
 else { Write-Output 'FAIL' }`);
-  return out.includes("OK");
 }
 
 /** Close the foreground window (PostMessage WM_CLOSE). */
 export async function closeWindow(): Promise<boolean> {
-  const out = await runPs(`${WIN_WINDOW}
+  return runWindowOp(`${WIN_WINDOW}
 $h = Find-FgWindow
 if ($h -ne [IntPtr]::Zero) { [WinWnd]::PostMessage($h, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null; Write-Output 'OK' }
 else { Write-Output 'FAIL' }`);
-  return out.includes("OK");
 }
 
 /** Restore a maximized or minimized window. */
 export async function restoreWindow(): Promise<boolean> {
-  const out = await runPs(`${WIN_WINDOW}
+  return runWindowOp(`${WIN_WINDOW}
 $h = Find-FgWindow
 if ($h -ne [IntPtr]::Zero) { [WinWnd]::ShowWindow($h, $SW_RESTORE) | Out-Null; Write-Output 'OK' }
 else { Write-Output 'FAIL' }`);
-  return out.includes("OK");
 }
 
 /** Toggle maximize: if maximized → restore, else → maximize. */
 export async function toggleMaximize(): Promise<boolean> {
-  const out = await runPs(`${WIN_WINDOW}
+  return runWindowOp(`${WIN_WINDOW}
 $h = Find-FgWindow
 if ($h -ne [IntPtr]::Zero) {
   if ([WinWnd]::IsZoomed($h)) { [WinWnd]::ShowWindow($h, $SW_RESTORE) | Out-Null }
   else { [WinWnd]::ShowWindow($h, $SW_MAXIMIZE) | Out-Null }
   Write-Output 'OK'
 } else { Write-Output 'FAIL' }`);
-  return out.includes("OK");
 }

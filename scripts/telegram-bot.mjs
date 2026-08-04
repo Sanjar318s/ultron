@@ -21,6 +21,7 @@ import { spawn, execFile } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
+import { runSelfTests } from "./self-test.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -522,6 +523,7 @@ const BOT_COMMANDS = [
   { command: "keys", description: "Статус Gemini-ключей" },
   { command: "id", description: "Ваш числовой id" },
   { command: "algorithms", description: "Алгоритмы мозга (владелец)" },
+  { command: "self-test", description: "Самопроверка бота и ПК (владелец)" },
 ];
 
 const ADMIN_HELP_HTML = [
@@ -551,6 +553,7 @@ const ADMIN_HELP_HTML = [
   "• /restart-server — перезапустить веб-сервер",
   "• /log [n] — хвост логов (next/bot)",
   "• /sysinfo — CPU/RAM/диск/GPU",
+  "• /self-test — самопроверка бота и ПК",
   "",
   "<b>Git и снимки</b>",
   "• /git &lt;аргументы&gt; — git (авторизация через GITHUB_TOKEN)",
@@ -975,6 +978,20 @@ async function handleCommand(chatId, msg, cmd) {
     case "/algorithms": {
       if (!requireOwner(chatId, owner)) return;
       await renderAlgorithms(chatId);
+      return;
+    }
+    case "/self-test": {
+      if (!requireOwner(chatId, owner)) return;
+      await sendText(chatId, "🧪 Запускаю самопроверку…");
+      try {
+        const results = await runSelfTests({ live: false });
+        const failed = results.filter((r) => !r.ok);
+        const lines = results.map((r) => `${r.ok ? "✅" : "❌"} ${r.name} — ${r.detail}`);
+        const head = `🧪 Самопроверка: ${results.length - failed.length}/${results.length} OK`;
+        await sendHtml(chatId, `<b>${head}</b>\n${lines.join("\n")}`);
+      } catch (e) {
+        await sendText(chatId, `⚠️ Самопроверка не запустилась: ${String(e?.message ?? e).slice(0, 300)}`);
+      }
       return;
     }
     case "/algo-off": {
@@ -1532,30 +1549,26 @@ async function tryNlAdmin(chatId, msg, text) {
     /очи(ст|ш|сти|стить|щай|стить)\s+(временн|темп|temp)|почист(и|ь)\s+(временн|темп|temp)|чистк(а|ой)\s+темп|удали\s+временн/.test(lower)
   ) {
     await sendText(chatId, "🧹 Чищу временные файлы…");
-    const before = await runCmd(
-      ps(
-        `$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ([math]::Round($s/1MB,1))`,
-      ),
-      { timeout: 60_000 },
-    );
-    const r = await runCmd(
-      ps(
-        `$ErrorActionPreference='SilentlyContinue'; Get-ChildItem $env:TEMP -Recurse -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue`,
-      ),
-      { timeout: 180_000 },
-    );
-    const after = await runCmd(
-      ps(
-        `$s=(Get-ChildItem $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; Write-Output ([math]::Round($s/1MB,1))`,
-      ),
-      { timeout: 60_000 },
-    );
-    await sendText(
-      chatId,
-      r.ok === false
-        ? `⚠️ Очистка частично не удалась: ${r.out.slice(0, 500)}`
-        : `✅ Очищено. Было ~${before.out.trim()} MB мусора, осталось ~${after.out.trim()} MB.`,
-    );
+    try {
+      const post = await fetch(`${SERVER}/api/clean-temp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+        signal: AbortSignal.timeout(200_000),
+      });
+      const r = await post.json().catch(() => ({}));
+      if (post.ok) {
+        const skipped = r.failedCount > 0 ? `\nПропущено ${r.failedCount} шт. — используются запущенными программами.` : "";
+        await sendText(
+          chatId,
+          `✅ Очистка завершена. Освобождено ~${Number(r.freedMB ?? 0).toFixed(1)} MB (${r.removedCount ?? 0} файлов).${skipped}`,
+        );
+      } else {
+        await sendText(chatId, `⚠️ Очистка не удалась: ${String(r.error ?? post.status).slice(0, 300)}`);
+      }
+    } catch (e) {
+      await sendText(chatId, `⚠️ Очистка не удалась: ${String(e?.message ?? e).slice(0, 300)}`);
+    }
     return true;
   }
   return false;
@@ -1820,7 +1833,12 @@ async function main() {
         const msg = update.message;
         const isAudio = !!(msg && (msg.voice || msg.audio || msg.document?.mime_type?.startsWith("audio/")));
         if (!msg || (!msg.text && !isAudio)) continue;
-        await handleMessage(msg);
+        try {
+          await handleMessage(msg);
+        } catch (e) {
+          console.error("[bot] handleMessage error:", e?.stack ?? e?.message ?? e);
+          audit({ action: "handleMessage-error", chatId: msg.chat?.id, error: String(e?.message ?? e).slice(0, 300) });
+        }
       }
     } catch (err) {
       console.error("[bot] polling error:", err.message ?? err);

@@ -263,3 +263,35 @@ On top of the orb there is a voice/text assistant with its own architecture
     py7zr can't unpack ComfyUI's BCJ2-encoded 7z — setup installs 7-Zip
     silently to `C:\7Zip` (no admin) and moves the `ComfyUI_windows_portable`
     folder up a level.
+
+## Robustness protocol (PC control)
+
+Non-negotiable rules for every system/PC operation, so partial failures never
+surface as scary errors and regressions get caught before the owner sees them:
+
+1. **Per-item I/O.** Any bulk operation over files/processes/registry must
+   isolate each item in its own try/catch. One locked or access-denied file
+   must never abort the whole run — it is skipped and counted. See
+   `lib/tempCleanup.ts` (per-item `Remove-Item -ErrorAction Stop` inside
+   `ForEach-Object { try { … } catch { $failed++ } }`, script ALWAYS `exit 0`).
+2. **Partial success = success.** A cleanup/launch/focus that mostly worked
+   must report the positive result with the skipped count, never a red "failed"
+   banner. Real failures (nothing happened at all, infrastructure down) are the
+   only case for a negative report.
+3. **Retry transient OS races.** Window/foreground state races with the OS —
+   always retry (see `runWindowOp` in `lib/desktopInput.ts`: 3 attempts, 300ms
+   apart; `launchAndFocus` in `lib/launcher.ts` polls up to 12×350ms).
+4. **Structured results.** Operations return typed results (`CleanupResult`,
+   `LaunchOutcome`) instead of raw exit codes/strings; callers render them into
+   Telegram reports.
+5. **Never 500 on bad input.** Routes must validate payloads and return clean
+   `4xx`; guard localhost-only routes with the host check pattern from
+   `app/api/do-step/route.ts`.
+6. **Self-test before commit.** After any PC-control change, run
+   `npm run self-test` (syntax + route schema + PowerShell bridge + cleanup
+   sandbox; `--live` adds a TTS→transcribe roundtrip). Fix failures before
+   committing. The bot exposes the same suite as the owner-only `/self-test`.
+7. **Log bot crashes.** Unexpected exceptions in the bot's message handling are
+   caught and written to `data/admin-log.jsonl` (see the `handleMessage` try/
+   catch in the polling loop) — they must never die silently in the console.
+

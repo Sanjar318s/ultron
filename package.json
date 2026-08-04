@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "bot": "node scripts/telegram-bot.mjs"
+    "bot": "node scripts/telegram-bot.mjs",
+    "self-test": "node scripts/self-test.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^0.10.35",
