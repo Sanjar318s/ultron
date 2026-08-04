@@ -22,7 +22,7 @@ const MAX_JSON_STEPS = 20;
 const LEARN_SYSTEM_PROMPT = [
   "Ты — система, обучающаяся на демонстрации экрана.",
   "Пользователь показал, как выполняется задача, на серии скриншотов (по порядку, между кадрами 2-3 секунды).",
-  "Возможные действия: launch (запустить приложение или открыть URL, params.app), url (открыть URL, params.url), type (ввести текст, params.text), key (нажать клавишу, params.key: Enter, Tab, Escape, Ctrl+V, Delete...), wait (подождать, params.ms), click (кликнуть по координатам экрана, params.x и params.y — ОБЯЗАТЕЛЬНО относительные 0..1, где 0 — левый/верхний край, 1 — правый/нижний).",
+  "Возможные действия: launch (запустить приложение или открыть URL, params.app), url (открыть URL, params.url), type (ввести текст, params.text), key (нажать клавишу, params.key: Enter, Tab, Escape, Ctrl+V, Delete...), wait (подождать, params.ms), click (кликнуть по координатам экрана, params.x и params.y — ОБЯЗАТЕЛЬНО относительные 0..1, где 0 — левый/верхний край, 1 — правый/нижний), double-click (двойной клик, params.x/y), right-click (клик правой кнопкой, params.x/y), move (навести курсор без клика, params.x/y), drag (перетащить от params.x1,y1 к params.x2,y2), scroll (прокрутить: params.dir = up|down|left|right, params.lines — сколько «колесиком»), focus (сфокусировать окно: params.title или params.app), clear (очистить поле: Ctrl+A + Delete), smart-type (ввести текст и нажать Enter, если params.enter = true), copy (Ctrl+C), paste (Ctrl+V).",
   "Верни ТОЛЬКО валидный JSON без пояснений и без markdown: {\"name\": \"<короткое имя навыка, 2-5 слов>\", \"steps\": [{\"action\": \"...\", \"params\": {...}, \"text\": \"<описание шага для пользователя>\"}, ...]}.",
   "Включай только действия, которые реально видно на кадрах. Для кликов определяй относительные координаты по видимым элементам интерфейса.",
   "Если что-то не видно однозначно — всё равно дай лучшую догадку, не пропускай шаг.",
@@ -42,7 +42,11 @@ function stripFences(text: string): string {
 function coerceStep(raw: unknown): SkillStep | null {
   if (typeof raw !== "object" || raw === null) return null;
   const o = raw as { action?: unknown; params?: unknown; text?: unknown };
-  const allowed: SkillStepAction[] = ["launch", "url", "type", "key", "wait", "click"];
+  const allowed: SkillStepAction[] = [
+    "launch", "url", "type", "key", "wait", "click",
+    "double-click", "right-click", "move", "drag", "scroll",
+    "focus", "clear", "smart-type", "copy", "paste",
+  ];
   const rawAction = typeof o.action === "string" ? o.action : "";
   if (!allowed.includes(rawAction as SkillStepAction)) return null;
   const action = rawAction as SkillStepAction;
@@ -51,6 +55,10 @@ function coerceStep(raw: unknown): SkillStep | null {
 
   const num = (v: unknown): number | null =>
     typeof v === "number" && Number.isFinite(v) ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : null;
+  const coord = (v: unknown): number | null => {
+    const n = num(v);
+    return n === null ? null : Math.min(Math.max(n, 0), 1);
+  };
 
   switch (action) {
     case "launch": {
@@ -65,10 +73,12 @@ function coerceStep(raw: unknown): SkillStep | null {
       params.url = url;
       break;
     }
-    case "type": {
+    case "type":
+    case "smart-type": {
       const text = typeof p.text === "string" ? p.text : "";
       if (!text) return null;
       params.text = text;
+      if (action === "smart-type" && (p.enter === true || p.enter === "true")) params.enter = 1;
       break;
     }
     case "key": {
@@ -82,14 +92,48 @@ function coerceStep(raw: unknown): SkillStep | null {
       params.ms = Math.min(Math.max(Math.round(ms), 100), 30_000);
       break;
     }
-    case "click": {
-      const x = num(p.x);
-      const y = num(p.y);
+    case "click":
+    case "double-click":
+    case "right-click":
+    case "move": {
+      const x = coord(p.x);
+      const y = coord(p.y);
       if (x === null || y === null) return null;
-      params.x = Math.min(Math.max(x, 0), 1);
-      params.y = Math.min(Math.max(y, 0), 1);
+      params.x = x;
+      params.y = y;
       break;
     }
+    case "drag": {
+      const x1 = coord(p.x1);
+      const y1 = coord(p.y1);
+      const x2 = coord(p.x2);
+      const y2 = coord(p.y2);
+      if (x1 === null || y1 === null || x2 === null || y2 === null) return null;
+      params.x1 = x1;
+      params.y1 = y1;
+      params.x2 = x2;
+      params.y2 = y2;
+      break;
+    }
+    case "scroll": {
+      const dir = typeof p.dir === "string" ? p.dir.trim().toLowerCase() : "";
+      if (dir !== "up" && dir !== "down" && dir !== "left" && dir !== "right") return null;
+      params.dir = dir;
+      params.lines = Math.min(Math.max(Math.round(num(p.lines) ?? num(p.amount) ?? 3), 1), 20);
+      break;
+    }
+    case "focus": {
+      const title = typeof p.title === "string" ? p.title.trim() : "";
+      const app = typeof p.app === "string" ? p.app.trim() : "";
+      if (!title && !app) return null;
+      if (title) params.title = title;
+      if (app) params.app = app;
+      break;
+    }
+    case "clear":
+    case "copy":
+    case "paste":
+      break;
   }
 
   const text = typeof o.text === "string" && o.text.trim() ? o.text.trim().slice(0, 200) : undefined;

@@ -82,7 +82,23 @@ export interface BrainOutcome {
 }
 
 /** One executable step of a screen-learned skill. */
-export type SkillStepAction = "launch" | "url" | "type" | "key" | "wait" | "click";
+export type SkillStepAction =
+  | "launch"
+  | "url"
+  | "type"
+  | "key"
+  | "wait"
+  | "click"
+  | "double-click"
+  | "right-click"
+  | "move"
+  | "drag"
+  | "scroll"
+  | "focus"
+  | "clear"
+  | "smart-type"
+  | "copy"
+  | "paste";
 
 export interface SkillStep {
   action: SkillStepAction;

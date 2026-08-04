@@ -246,7 +246,7 @@ function runCmd(cmd, opts = {}) {
     const child = spawn(cmd, { cwd: opts.cwd ?? ROOT, shell: true, windowsHide: true });
     let out = "";
     const push = (d) => {
-      out += String(d);
+      out += stripClixml(String(d));
       if (out.length > 80_000) out = out.slice(-80_000);
     };
     child.stdout.on("data", push);
@@ -288,9 +288,15 @@ function git(args) {
   });
 }
 
-/** Wrap a PowerShell snippet with UTF-8 output encoding (fixes cp866 mojibake). */
+/** Wrap a PowerShell snippet with UTF-8 output encoding (fixes cp866 mojibake)
+ *  and silent progress (module-load progress is CLIXML noise on stderr). */
 const ps = (cmd) =>
-  `powershell -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ${cmd}"`;
+  `powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ${cmd}"`;
+
+/** Remove PowerShell's CLIXML progress-serialization blocks from mixed output. */
+function stripClixml(text) {
+  return String(text).replace(/#< CLIXML[\s\S]*?<\/Objs>\s*(?:#<\/CLIXML>)?/g, "").trim();
+}
 
 async function waitForServer(port, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -495,12 +501,20 @@ const HELP_HTML = [
   "• /skills — список навыков (запуск в один тап)",
   "• /keys — статус Gemini-ключей",
   "• /id — ваш числовой id",
+  "",
+  "<b>ПК (владелец)</b>",
+  "• /screenshot — скриншот экрана",
+  "• /click &lt;цель&gt; — ИИ-клик (напр. «нажми на капчу»)",
+  "• /grid &lt;цель&gt; — клик по всем подходящим клеткам",
+  "• /drag &lt;цель&gt; — перетащить слайдер",
 ].join("\n");
 
 /** Command list registered via setMyCommands (shown by the «/» menu). */
 const BOT_COMMANDS = [
   { command: "menu", description: "Главное меню" },
   { command: "skills", description: "Мои навыки — список и запуск" },
+  { command: "click", description: "ИИ-клик по экрану: /click <что>" },
+  { command: "screenshot", description: "Скриншот экрана" },
   { command: "memory", description: "Память: правила и заметки" },
   { command: "search", description: "Интернет-поиск" },
   { command: "draw", description: "Генерация изображений" },
@@ -656,6 +670,39 @@ async function renderSkills(chatId, owner, page = 1) {
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: kb },
   });
+}
+
+/** Run a vision-driven click (screenshot → Gemini → mouse) via /api/screen-act. */
+async function aiClickFromTelegram(chatId, prompt, mode) {
+  await typing(chatId);
+  const statusId = await sendStatus(chatId, "👁 Смотрю на экран…");
+  let res;
+  try {
+    res = await fetch(`${SERVER}/api/screen-act`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, mode }),
+      signal: AbortSignal.timeout(120_000),
+    });
+  } catch (err) {
+    await finishStatus(chatId, statusId, `Сбой: ${err.message}. Сервер запущен?`);
+    return;
+  }
+  const data = await res.json().catch(() => null);
+  await finishStatus(chatId, statusId, data?.reply ?? data?.error ?? `Ошибка сервера: ${res.status}.`);
+}
+
+async function screenshotToTelegram(chatId) {
+  let st;
+  try {
+    const res = await fetch(`${SERVER}/api/screenshot`, { signal: AbortSignal.timeout(20_000) });
+    st = await res.json().catch(() => null);
+    if (!res.ok || !st?.b64) throw new Error(st?.error ?? res.status);
+  } catch (err) {
+    await sendText(chatId, `Не удалось сделать скриншот: ${err.message}`);
+    return;
+  }
+  await sendPhoto(chatId, st.b64, st.mime ?? "image/jpeg");
 }
 
 /** Details of one skill (step list for screen skills, description for catalog). */
@@ -857,6 +904,23 @@ async function handleCommand(chatId, msg, cmd) {
     }
     case "/keys": {
       await renderKeys(chatId, owner);
+      return;
+    }
+    case "/screenshot": {
+      if (!requireOwner(chatId, owner)) return;
+      await screenshotToTelegram(chatId);
+      return;
+    }
+    case "/click":
+    case "/grid":
+    case "/drag": {
+      if (!requireOwner(chatId, owner)) return;
+      const mode = name.slice(1);
+      if (!rest) {
+        await sendText(chatId, `Укажите цель: /${mode} <что сделать>`);
+        return;
+      }
+      await aiClickFromTelegram(chatId, rest, mode);
       return;
     }
     case "/search": {

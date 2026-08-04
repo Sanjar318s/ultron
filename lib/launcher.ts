@@ -11,7 +11,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { dedupeApps, findBestApp, isReasonableApp, scanInstalledApps } from "@/lib/installedApps";
+import { readdir, readFile } from "node:fs/promises";
+import path from "node:path";
+import { dedupeApps, findBestApp, isReasonableApp, matchAppScore, normForMatch, scanInstalledApps } from "@/lib/installedApps";
 import { findSiteInPhrase, resolveSite } from "@/lib/sites";
 
 /** Safe charset for a URL (https/http only, no quotes/semicolons/whitespace). */
@@ -51,12 +53,19 @@ export function openViaShell(target: string): void {
   ).unref();
 }
 
+/** Strip PowerShell's CLIXML progress serialization noise («Подготовка модулей…»). */
+function stripClixml(text: string): string {
+  return text.replace(/#< CLIXML[\s\S]*?<\/Objs>\s*(?:#<\/CLIXML>)?/g, "").trim();
+}
+
 /** Await a PowerShell script (hidden window); resolves with trimmed stdout. */
 export function runPs(command: string, timeoutMs = 25_000): Promise<string> {
   return new Promise((resolve, reject) => {
-    // Force UTF-8 on the PS side so Cyrillic output survives the pipe.
+    // Force UTF-8 on the PS side so Cyrillic output survives the pipe, and
+    // disable the progress stream — module-load progress is serialized to
+    // CLIXML on stderr on first run and pollutes the error channel.
     const full =
-      "[Console]::OutputEncoding=[Console]::InputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8;" +
+      "$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[Console]::InputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8;" +
       command;
     const encoded = Buffer.from(full, "utf16le").toString("base64");
     const child = spawn(
@@ -78,8 +87,9 @@ export function runPs(command: string, timeoutMs = 25_000): Promise<string> {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      const cleanErr = stripClixml(err);
       if (code === 0) resolve(out.trim());
-      else reject(new Error(err.trim() || `powerShell exit ${code}`));
+      else reject(new Error(cleanErr || `powerShell exit ${code}`));
     });
   });
 }
@@ -92,40 +102,232 @@ export interface LaunchOutcome {
   url?: string;
 }
 
-/**
- * Launch a target and then bring its window to the foreground, so the next
- * skill step (typing / keys) lands in the right app. Uses ShowWindow +
- * SetForegroundWindow (not AppActivate, which returns true but is blocked by
- * Windows foreground lock for background processes).
- */
-export async function launchAndFocus(target: string): Promise<void> {
-  const command = `Add-Type -TypeDefinition @'
+/** Shared PS: find a window by process name and/or title substring and force
+ *  it to the foreground. Prints FOCUS_OK / FOCUS_FAIL on stdout.
+ *
+ *  SwitchToThisWindow (Alt-Tab semantics) bypasses the Windows foreground lock
+ *  that blocks AppActivate/SetForegroundWindow from background processes — on
+ *  this machine GameInputSvc keeps a fullscreen helper window foreground, so
+ *  even synthetic clicks don't activate anything; SwitchToThisWindow is the
+ *  only thing that moves focus. Falls back to a real click at the window
+ *  center when the switch doesn't stick. */
+function focusScript(procName: string, title: string): string {
+  return `Add-Type @"
 using System;
 using System.Runtime.InteropServices;
-public class WinFocus {
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+using System.Text;
+public class WinEnum {
+  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, int[] rect);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
 }
-'@
-$p = Start-Process -FilePath '${target.replace(/'/g, "''")}' -PassThru -ErrorAction SilentlyContinue
-if ($p) {
-  for ($i = 0; $i -lt 20; $i++) {
-    $p.Refresh()
-    if ($p.MainWindowHandle -ne 0) { break }
-    Start-Sleep -Milliseconds 300
+"@
+$script:procName = '${procName}'
+$script:title = '${title}'
+function Find-TargetWindow {
+  $script:found = [IntPtr]::Zero
+  $cb = [WinEnum+EnumProc]{
+    param($h, $l)
+    if (-not [WinEnum]::IsWindowVisible($h)) { return $true }
+    $s = New-Object System.Text.StringBuilder 256
+    [WinEnum]::GetWindowText($h, $s, 256) | Out-Null
+    $t = $s.ToString()
+    $m2 = $script:title -ne '' -and $t.IndexOf($script:title, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    if ($m2) { $script:found = $h; return $false }
+    if ($script:procName -ne '') {
+      $wp = 0
+      [WinEnum]::GetWindowThreadProcessId($h, [ref]$wp) | Out-Null
+      if ($wp -ne 0) {
+        $pr = Get-Process -Id $wp -ErrorAction SilentlyContinue
+        if ($pr -and $pr.ProcessName -ieq $script:procName) { $script:found = $h; return $false }
+      }
+    }
+    return $true
   }
-  if ($p.MainWindowHandle -ne 0) {
-    [WinFocus]::ShowWindow($p.MainWindowHandle, 9) | Out-Null
-    Start-Sleep -Milliseconds 150
-    [WinFocus]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+  [WinEnum]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
+}
+$script:verdict = 'FOCUS_FAIL'
+for ($try = 0; $try -lt 6; $try++) {
+  Find-TargetWindow
+  if ($script:found -eq [IntPtr]::Zero) { break }
+  [WinEnum]::SwitchToThisWindow($script:found, $true) | Out-Null
+  Start-Sleep -Milliseconds 200
+  if ([WinEnum]::GetForegroundWindow() -eq $script:found) { $script:verdict = 'FOCUS_OK'; break }
+}
+if ($script:verdict -ne 'FOCUS_OK' -and $script:found -ne [IntPtr]::Zero) {
+  $r = New-Object int[] 4
+  [WinEnum]::GetWindowRect($script:found, $r) | Out-Null
+  if ($r[2] -gt $r[0] -and $r[3] -gt $r[1]) {
+    $cx = [int](($r[0] + $r[2]) / 2); $cy = [int](($r[1] + $r[3]) / 2)
+    [WinEnum]::SetCursorPos($cx, $cy) | Out-Null
+    Start-Sleep -Milliseconds 120
+    [WinEnum]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    [WinEnum]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 250
+    [WinEnum]::SwitchToThisWindow($script:found, $true) | Out-Null
+    Start-Sleep -Milliseconds 250
+    if ([WinEnum]::GetForegroundWindow() -eq $script:found) { $script:verdict = 'FOCUS_OK' }
   }
 }
+Write-Output $script:verdict
+`;
+}
+
+/** Bring a window to the foreground by process name and/or title substring.
+ *  True when the foreground window matched the target after forcing. */
+export async function focusWindowByTitle(title: string, app?: string): Promise<boolean> {
+  const procName = (app ?? "").replace(/\.exe$/i, "").toLowerCase();
+  const out = await runPs(
+    focusScript(procName.replace(/'/g, "''"), (title ?? "").replace(/'/g, "''")),
+    20_000,
+  );
+  return out.includes("FOCUS_OK");
+}
+
+/**
+ * Launch a target and then bring its window to the foreground, so the next
+ * skill step (typing / keys) lands in the right app.
+ *
+ * Two stages: (1) focus an ALREADY-running window by process name or title —
+ * found via EnumWindows, activated with SwitchToThisWindow; (2) if nothing
+ * matched, Start-Process a fresh instance and poll for its window to appear.
+ * Returns whether the foreground ended up on the target.
+ */
+export async function launchAndFocus(target: string, titleHint?: string): Promise<boolean> {
+  const procName =
+    target
+      .replace(/\\/g, "/")
+      .split("/")
+      .pop()
+      ?.replace(/\.exe$/i, "")
+      .replace(/:.*$/, "") ?? "";
+  if (await focusWindowByTitle(titleHint ?? "", procName)) return true;
+  await runPs(`Start-Process -FilePath '${target.replace(/'/g, "''")}' -ErrorAction SilentlyContinue`, 15_000).catch(
+    () => {},
+  );
+  for (let i = 0; i < 12; i++) {
+    if (await focusWindowByTitle(titleHint ?? "", procName)) return true;
+    await new Promise((r) => setTimeout(r, 350));
+  }
+  return false;
+}
+
+/**
+ * Last-resort app launch through the Windows Start-menu search: Win key →
+ * type name (clipboard so Cyrillic works) → Enter. Used when the name is a
+ * plausible app name but not found in the installed-app scan.
+ */
+export async function winSearchLaunch(name: string): Promise<boolean> {
+  const safe = name.replace(/'/g, "''");
+  const command = `Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinKeys {
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+}
+"@
+function TapK([byte]$vk) {
+  [WinKeys]::keybd_event($vk, 0, 0, [UIntPtr]::Zero)
+  [WinKeys]::keybd_event($vk, 0, 2, [UIntPtr]::Zero)
+}
+function ChordK([byte[]]$keys) {
+  foreach ($k in $keys) { [WinKeys]::keybd_event($k, 0, 0, [UIntPtr]::Zero) }
+  for ($i = $keys.Length - 1; $i -ge 0; $i--) { [WinKeys]::keybd_event($keys[$i], 0, 2, [UIntPtr]::Zero) }
+}
+Set-Clipboard -Value '${safe}'
+TapK(0x5B)
+Start-Sleep -Milliseconds 500
+ChordK @(0x11, 0x56)
+Start-Sleep -Milliseconds 400
+TapK(0x0D)
 `;
   try {
-    await runPs(command, 15_000);
+    await runPs(command, 10_000);
+    return true;
   } catch (err) {
-    console.warn("[launcher] launchAndFocus failed:", err);
+    console.warn("[launcher] winSearchLaunch failed:", err);
+    return false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Steam games (steam://rungameid/<appid>)
+// ---------------------------------------------------------------------------
+
+const STEAM_ROOTS = [
+  "C:\\Program Files (x86)\\Steam\\steamapps",
+  "C:\\Program Files\\Steam\\steamapps",
+  "C:\\Steam\\steamapps",
+];
+
+let steamCache: { games: SteamGame[]; at: number } | null = null;
+const STEAM_CACHE_TTL = 60_000;
+
+export interface SteamGame {
+  appid: string;
+  name: string;
+}
+
+/** Parse "appid"/"name" out of an appmanifest_*.acf file. */
+function parseAcfGame(raw: string): SteamGame | null {
+  const appid = raw.match(/"appid"\s+"(\d+)"/);
+  const name = raw.match(/"name"\s+"((?:[^"\\]|\\.)*)"/);
+  if (!appid || !name) return null;
+  return { appid: appid[1], name: name[1].replace(/\\(.)/g, "$1") };
+}
+
+/** List installed Steam games from appmanifest_*.acf (cached 60s). */
+export async function listSteamGames(): Promise<SteamGame[]> {
+  if (steamCache && Date.now() - steamCache.at < STEAM_CACHE_TTL) return steamCache.games;
+  const games: SteamGame[] = [];
+  const dirs = new Set<string>(STEAM_ROOTS);
+  for (const root of STEAM_ROOTS) {
+    // libraryfolders.vdf can point to extra library roots with more steamapps/.
+    const vdf = await readFile(path.join(root, "libraryfolders.vdf"), "utf8").catch(() => "");
+    for (const m of vdf.matchAll(/"path"\s+"((?:[^"\\]|\\.)*)"/g)) {
+      dirs.add(path.join(m[1].replace(/\\(.)/g, "$1"), "steamapps"));
+    }
+  }
+  for (const dir of dirs) {
+    let files: string[];
+    try {
+      files = await readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!/^appmanifest_\d+\.acf$/i.test(f)) continue;
+      const raw = await readFile(path.join(dir, f), "utf8").catch(() => "");
+      const game = parseAcfGame(raw);
+      if (game) games.push(game);
+    }
+  }
+  steamCache = { games, at: Date.now() };
+  return games;
+}
+
+/** Best Steam-game match for a spoken name (same scoring as installed apps). */
+export async function matchSteamGame(query: string): Promise<SteamGame | null> {
+  const q = normForMatch(query);
+  if (!q) return null;
+  const games = await listSteamGames();
+  let best: SteamGame | null = null;
+  let bestScore = 60;
+  for (const g of games) {
+    const score = matchAppScore(q, g.name);
+    if (score > bestScore) {
+      bestScore = score;
+      best = g;
+    }
+  }
+  return best;
 }
 
 /** Resolve an allowlist entry to a launchable target string, if it has one. */
@@ -211,14 +413,27 @@ export async function launchApp(
     dedupeApps((await scanInstalledApps()).filter((a) => isReasonableApp(a.name))),
   );
   if (installed) {
-    if (focus) await launchAndFocus(installed.path);
+    if (focus) await launchAndFocus(installed.path, installed.name);
     else openViaShell(installed.path);
     return { launched: name, matched: installed.name };
+  }
+
+  // Installed Steam game («запусти кс го» → steam://rungameid/730).
+  const game = await matchSteamGame(name);
+  if (game) {
+    openViaShell(`steam://rungameid/${game.appid}`);
+    return { launched: name, matched: game.name };
   }
 
   if (/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(name)) {
     openViaShell(`https://${name}`);
     return { launched: name, matched: name };
+  }
+
+  // Last resort: Windows Start-menu search by spoken name (clipboard-safe).
+  if (/^[\p{L}\p{N} _-]{2,40}$/u.test(name)) {
+    const ok = await winSearchLaunch(name);
+    if (ok) return { launched: name, matched: name };
   }
 
   return null;

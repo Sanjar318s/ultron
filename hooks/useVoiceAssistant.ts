@@ -135,6 +135,10 @@ function formatWeatherReply(w: WeatherPayload): string {
 
 /** Human description of a skill step (used for confirmations and the log). */
 function describeStep(step: SkillStep): string {
+  const pt = (v: unknown): string => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n.toFixed(2) : "?";
+  };
   switch (step.action) {
     case "launch":
       return `запустить «${String(step.params.app ?? "")}»`;
@@ -142,15 +146,32 @@ function describeStep(step: SkillStep): string {
       return `открыть «${String(step.params.url ?? "")}»`;
     case "type":
       return `ввести «${String(step.params.text ?? "")}»`;
+    case "smart-type":
+      return `ввести «${String(step.params.text ?? "")}»${step.params.enter ? " и Enter" : ""}`;
     case "key":
       return `нажать ${String(step.params.key ?? "")}`;
     case "wait":
       return `подождать ${Math.round(Number(step.params.ms) || 0)} мс`;
-    case "click": {
-      const x = Number(step.params.x);
-      const y = Number(step.params.y);
-      return `кликнуть (${Number.isFinite(x) ? x.toFixed(2) : "?"}, ${Number.isFinite(y) ? y.toFixed(2) : "?"})`;
-    }
+    case "click":
+      return `кликнуть (${pt(step.params.x)}, ${pt(step.params.y)})`;
+    case "double-click":
+      return `двойной клик (${pt(step.params.x)}, ${pt(step.params.y)})`;
+    case "right-click":
+      return `клик правой (${pt(step.params.x)}, ${pt(step.params.y)})`;
+    case "move":
+      return `навести курсор (${pt(step.params.x)}, ${pt(step.params.y)})`;
+    case "drag":
+      return `перетащить (${pt(step.params.x1)}, ${pt(step.params.y1)}) → (${pt(step.params.x2)}, ${pt(step.params.y2)})`;
+    case "scroll":
+      return `прокрутить ${String(step.params.dir ?? "")} на ${Number(step.params.lines) || 3}`;
+    case "focus":
+      return `сфокусировать окно «${String(step.params.title ?? step.params.app ?? "")}»`;
+    case "clear":
+      return `очистить поле`;
+    case "copy":
+      return `копировать (Ctrl+C)`;
+    case "paste":
+      return `вставить (Ctrl+V)`;
   }
 }
 
