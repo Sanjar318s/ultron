@@ -142,8 +142,8 @@ function score(name: string, query: string): number {
   let hits = 0;
   for (const t of q) if (n.some((w) => tokScore(t, w) > 0)) hits += 1;
   let scoreVal = hits / q.length;
-  if (nLower.includes(qLower)) scoreVal += 1;
-  if (qLower.includes(nLower)) scoreVal += 0.5;
+  if (nLower && nLower.includes(qLower)) scoreVal += 1;
+  if (nLower && qLower.includes(nLower)) scoreVal += 0.5;
   return scoreVal;
 }
 
@@ -156,10 +156,10 @@ try {
 }
 
 /** Best fuzzy match for a loose spoken name; null when nothing fits. */
-export async function fuzzyFind(query: string): Promise<CatalogSkill | null> {
+export async function bestMatch(query: string): Promise<{ skill: CatalogSkill | null; score: number }> {
   const list = await listCatalog();
   let best: CatalogSkill | null = null;
-  let bestScore = 0.2;
+  let bestScore = 0;
   for (const s of list) {
     const raw = ALIASES[s.slug];
     const extra = Array.isArray(raw) ? raw.join(", ") : String(raw ?? "");
@@ -169,27 +169,65 @@ export async function fuzzyFind(query: string): Promise<CatalogSkill | null> {
       bestScore = sc;
     }
   }
-  return best;
+  return { skill: bestScore > 0 ? best : null, score: bestScore };
+}
+
+export async function fuzzyFind(query: string): Promise<CatalogSkill | null> {
+  const { skill, score } = await bestMatch(query);
+  return score > 0.2 ? skill : null;
 }
 
 // ---------------------------------------------------------------------------
 // Sandbox executor
 // ---------------------------------------------------------------------------
 
-const MAX_ROUNDS = 6;
+const MAX_ROUNDS = 8;
 const CMD_TIMEOUT_MS = 120_000;
 const OUTPUT_CAP = 20_000;
+/** Command length cap (base64 content rides in the args; Windows arg limit is ~32K). */
+const MAX_CMD_LEN = 8000;
 const ALLOWED_BINS = new Set(["python", "py", "node", "pip", "pip3"]);
-const BLOCKED_FRAGMENTS = ["..", ";", "&&", "||", "`", ">", "<", "|", "*", "$(", "rm -rf", "cmd.exe", "powershell", "git ", "curl "];
+// No shell is used (spawn with argv array), so `*` is a literal arg character —
+// it must stay ALLOWED because --raw script content legitimately contains it
+// (`x**2`, `2**100`). Shell metacharacters that could inject via a future
+// shell-based path remain blocked.
+const BLOCKED_FRAGMENTS = ["..", ";", "&&", "||", "`", ">", "<", "|", "$(", "rm -rf", "cmd.exe", "powershell", "git ", "curl "];
+/** Sandbox file-writer (scripts/sandbox-write.mjs), path shown JSON-safe (forward slashes). */
+const WRITE_HELPER = path.join(process.cwd(), "scripts", "sandbox-write.mjs").replace(/\\/g, "/");
 
 export function workDirFor(chatId: string): string {
   return path.join(process.cwd(), "data", "skill-work", String(chatId).replace(/[^a-z0-9_-]/gi, ""));
 }
 
+/** Command with quoted sections blanked — shell metacharacters inside `--raw`
+ *  content (e.g. a `>` in the phrase to write) are DATA, not operators: spawn
+ *  runs without a shell, so only unquoted occurrences are dangerous. */
+function unquotedView(cmd: string): string {
+  let out = "";
+  let quote: string | null = null;
+  for (let i = 0; i < cmd.length; i += 1) {
+    const ch = cmd[i];
+    if (quote) {
+      if (ch === "\\" && i + 1 < cmd.length && cmd[i + 1] === quote) {
+        i += 1;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 function validateCommand(cmd: string): string | null {
-  const trimmed = cmd.trim();
-  if (!trimmed || trimmed.length > 512) return "пустая или слишком длинная команда";
-  const lower = trimmed.toLowerCase();
+  const trimmed = normalizeCommand(cmd).trim();
+  if (!trimmed || trimmed.length > MAX_CMD_LEN) return `пустая или слишком длинная команда (лимит ${MAX_CMD_LEN} симв.)`;
+  const lower = unquotedView(trimmed).toLowerCase();
   for (const f of BLOCKED_FRAGMENTS) {
     if (lower.includes(f)) return `запрещённый фрагмент «${f}»`;
   }
@@ -198,9 +236,72 @@ function validateCommand(cmd: string): string | null {
   return null;
 }
 
+/**
+ * Collapse shell-style line continuations (backslash-newline) and bare newlines.
+ * The executor model sometimes emits `node \` + newline (or a trailing `\` cut
+ * off at the JSON string end), which spawn (no shell) cannot handle. Keeps
+ * spaces inside quoted arguments untouched.
+ */
+function normalizeCommand(cmd: string): string {
+  return cmd
+    .replace(/\\\s*\r?\n/g, " ")
+    .replace(/\s*\r?\n/g, " ")
+    .replace(/\\+\s*$/, "")
+    .trim();
+}
+
+/**
+ * Split a command into argv respecting double/single quotes. spawn() runs without
+ * a shell on Windows, so literal quotes in args are NOT stripped automatically
+ * and would end up embedded in the path — strip them here.
+ */
+function splitArgs(cmd: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let quote: string | null = null;
+  const s = normalizeCommand(cmd);
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (quote) {
+      // Backslash escapes inside quoted args: `\"` is a literal quote (not a
+      // terminator), `\\` stays two chars, `\n`/`\u…` pass through for the
+      // --raw helper to decode. `spawn` runs without a shell, so this must be
+      // resolved here or `matplotlib.use(\"Agg\")` splits into junk args.
+      if (ch === "\\" && i + 1 < s.length) {
+        const nx = s[i + 1];
+        if (nx === quote) {
+          cur += quote;
+          i += 1;
+        } else {
+          cur += ch + nx;
+          i += 1;
+        }
+        continue;
+      }
+      if (ch === quote) quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      if (cur) {
+        out.push(cur);
+        cur = "";
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
 function runSandboxed(cmd: string, cwd: string): Promise<{ ok: boolean; code: number | null; out: string }> {
   return new Promise((resolve) => {
-    const parts = cmd.trim().split(/\s+/);
+    const parts = splitArgs(cmd);
     const bin = parts.shift() as string;
     const resolvedBin = bin === "python" || bin === "py" ? process.env.SKILL_PYTHON || "python" : bin === "pip" || bin === "pip3" ? process.env.SKILL_PIP || "pip" : bin;
     const child = spawn(resolvedBin, parts, { cwd, windowsHide: true, env: { ...process.env, PATH: SANDBOX_PATH } });
@@ -239,23 +340,40 @@ export interface ExecuteOptions {
   chatId: string;
 }
 
-const EXEC_RE = /\{[\s\S]*?\}/;
+const EXEC_RE = /\{[\s\S]*\}/;
 const DONE_RE = /"done"\s*:\s*true/i;
-const RESULT_RE = /"result"\s*:\s*"([\s\S]*?)"\s*}/;
-const CMD_RE = /"cmd"\s*:\s*"([\s\S]*?)"/;
+// Quote-aware fallbacks for malformed JSON: stop at an UNescaped closing quote.
+const RESULT_RE = /"result"\s*:\s*"((?:[^"\\]|\\.)*)"\s*}/;
+const CMD_RE = /"cmd"\s*:\s*"((?:[^"\\]|\\.)*)"/;
+
+function unescapeCmd(s: string): string {
+  return s.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+}
 
 function parseExecReply(text: string): { done: boolean; result?: string; cmd?: string } | null {
   const match = text.match(EXEC_RE);
   if (!match) return null;
   const obj = match[0];
+  try {
+    const parsed = JSON.parse(obj) as { done?: boolean; result?: string; cmd?: string };
+    if (parsed && parsed.done === true) return { done: true, result: parsed.result ?? "" };
+    if (parsed && typeof parsed.cmd === "string") return { done: false, cmd: parsed.cmd };
+  } catch {
+    // fall through to the tolerant regexes (unbalanced quotes / stray text)
+  }
   if (DONE_RE.test(obj)) {
     const r = obj.match(RESULT_RE);
-    return { done: true, result: r?.[1] ?? "" };
+    return { done: true, result: r ? unescapeCmd(r[1]) : "" };
   }
   const c = obj.match(CMD_RE);
-  if (c) return { done: false, cmd: c[1] };
+  if (c) return { done: false, cmd: unescapeCmd(c[1]) };
   return null;
 }
+
+// A "done" that asks the user for the task / announces readiness / runs a
+// hello-world instead of solving is a refusal, not a result.
+const REFUSAL_RE =
+  /укаж(и|ите|ишь).{0,24}задач|задай(те)?\s+задач|какую.{0,24}задач|сред\w*.{0,40}готов|готов.{0,40}задач|тестов\w*\s+скрипт|настроен\s+и\s+работает|проверк\w*\s+сред\w*|working\s+(correctly|fine|great)/i;
 
 /** Run the skill against the user's request using an LLM-in-the-loop executor. */
 export async function execute(
@@ -265,6 +383,8 @@ export async function execute(
 ): Promise<ExecuteResult> {
   const workdir = workDirFor(opts.chatId || "general");
   await fs.mkdir(workdir, { recursive: true });
+  const runLog = (line: string) =>
+    fs.appendFile(path.join(workdir, ".run.log"), `${line}\n`).catch(() => {});
 
   if (!skill.safe) {
     return {
@@ -278,9 +398,13 @@ export async function execute(
   const system = [
     "Ты — агент-исполнитель навыка в песочнице. Ниже — полное руководство навыка (SKILL.md) и запрос пользователя.",
     "Отвечай СТРОГО одним JSON-объектом без markdown. Чтобы выполнить команду: {\"cmd\":\"<команда>\",\"explain\":\"<кратко зачем>\"}. Когда задача выполнена: {\"done\":true,\"result\":\"<итог для пользователя: что сделано и путь к файлу>\"}.",
+    "Задача УЖЕ дана ниже — не приветствуй, не спрашивай задачу, не описывай окружение. Твой ПЕРВЫЙ ответ — команда, решающая задачу ({\"cmd\":\"...\"}).",
     `Рабочая папка: ${workdir} (все файлы создавай только здесь).`,
+    `Чтобы создать файл (скрипт, данные, результат): node "${WRITE_HELPER}" "<относительный_путь>" --raw "<содержимое>". Содержимое передавай ОДНИМ аргументом с JSON-эскейпами: перенос строки как \\n, кавычки внутри как \\", обратный слэш как \\\\. Путь — только относительный. Затем запускай файл: python "<относительный_путь>". Скрипт должен РЕШАТЬ задачу пользователя, а не быть тестом среды. Пример: задача «вычислить 2**100» → создай work.py с содержимым print(2**100), запусти, и в done.result верни ВЫВОД скрипта.`,
     `Скрипты навыка лежат в: ${skill.dir}/scripts/ — вызывай их так: python "${path.join(skill.dir, "scripts", "<файл>")}" <аргументы> (python = ${process.env.SKILL_PYTHON || "python"}).`,
     "Разрешены ТОЛЬКО: python, py, node, pip. Запрещены: git, curl, powershell, cmd, удаление вне рабочей папки, перенаправления, подстановки, точки «..».",
+    "КРИТИЧНО: задача пользователя должна быть РЕАЛЬНО решена — создан скрипт, получен вывод, результат проверен. Команды вроде «python --version» — это лишь проверка среды, это НЕ решение. НЕ возвращай {\"done\":true}, пока не получил конкретный итог по запросу пользователя (число, файл, текст ответа).",
+    "Если ты создал файл-скрипт — ты ОБЯЗАН затем запустить его (python \"<файл>\"), дождаться вывода и привести этот вывод в done.result. Создание файла без запуска — это НЕ результат.",
     "Вывод каждой команды вернётся тебе следующим сообщением. Максимум 6 команд. Действуй пошагово: сначала изучи скрипты и данные, потом выполняй, потом проверь результат.",
     "Если что-то не так — исправь и повтори. В конце верни done с понятным итогом.",
   ].join("\n");
@@ -291,12 +415,16 @@ export async function execute(
     { role: "system", content: sys2 },
     { role: "user", content: `Запрос пользователя: ${query}` },
   ];
+  runLog(`[start] skill=${skill.slug} query=${query.slice(0, 120)}`);
+  let lastRaw = "";
 
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
     let raw: string;
     try {
       raw = await opts.complete(messages);
+      lastRaw = raw;
     } catch (err) {
+      runLog(`[error] ${err instanceof Error ? err.message : String(err)}`);
       return {
         ok: false,
         reply: `Исполнитель навыка не смог получить ответ модели: ${err instanceof Error ? err.message : String(err)}`,
@@ -305,6 +433,7 @@ export async function execute(
     }
     const parsed = parseExecReply(raw);
     if (!parsed) {
+      runLog(`[R${round + 1}] UNPARSED: ${raw.slice(0, 200)}`);
       messages.push({ role: "assistant", content: raw.slice(0, 1000) });
       messages.push({
         role: "user",
@@ -313,17 +442,30 @@ export async function execute(
       continue;
     }
     if (parsed.done) {
+      if (REFUSAL_RE.test(parsed.result ?? "")) {
+        runLog(`[R${round + 1}] DONE-BUT-REFUSAL: ${(parsed.result ?? "").slice(0, 150)}`);
+        messages.push({ role: "assistant", content: raw.slice(0, 1000) });
+        messages.push({
+          role: "user",
+          content:
+            "Ты вернул done, не решив задачу (похоже на приветствие/просьбу уточнить). Задача уже дана. Выполни ПЕРВУЮ команду для её решения прямо сейчас: {\"cmd\":\"...\"}.",
+        });
+        continue;
+      }
+      runLog(`[done] R${round + 1}: ${(parsed.result ?? "").slice(0, 300)}`);
       return { ok: true, reply: parsed.result || "Готово.", rounds: round + 1 };
     }
     const cmd = parsed.cmd ?? "";
     const err = validateCommand(cmd);
     if (err) {
+      runLog(`[R${round + 1}] REJECTED: ${err}`);
       messages.push({ role: "assistant", content: raw.slice(0, 1000) });
       messages.push({ role: "user", content: `Команда отклонена: ${err}. Придумай другую (только python/py/node/pip).` });
       continue;
     }
     const res = await runSandboxed(cmd, workdir);
     const outTail = res.out.length > OUTPUT_CAP ? `${res.out.slice(-OUTPUT_CAP)}\n…[обрезано]` : res.out;
+    runLog(`[R${round + 1}] ${cmd}  exit=${res.code}\n${outTail.slice(0, 500)}`);
     messages.push({ role: "assistant", content: raw.slice(0, 1000) });
     messages.push({
       role: "user",
@@ -331,9 +473,10 @@ export async function execute(
     });
   }
 
+  runLog(`[exhausted] lastRaw=${lastRaw.slice(0, 150)}`);
   return {
     ok: false,
-    reply: "Исчерпан лимит шагов исполнителя (6). Проверьте результат вручную или уточните запрос.",
+    reply: `Исчерпан лимит шагов исполнителя (${MAX_ROUNDS}). Проверьте результат вручную или уточните запрос.`,
     rounds: MAX_ROUNDS,
   };
 }

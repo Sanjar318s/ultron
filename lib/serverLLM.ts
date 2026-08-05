@@ -42,7 +42,12 @@ function toGemini(messages: ChatMessage[]) {
       parts:
         typeof m.content === "string"
           ? [{ text: m.content }]
-          : m.content.filter((p): p is { type: "text"; text: string } => p.type === "text").map((p) => ({ text: p.text })),
+          : m.content.map((p) => {
+              if (p.type === "text") return { text: p.text };
+              // Image parts (base64) → Gemini inline_data. Only Gemini handles
+              // these — other providers flatten via messageText() first.
+              return { inline_data: { mime_type: p.mimeType, data: p.data } };
+            }),
     }));
   return {
     contents,
@@ -51,7 +56,7 @@ function toGemini(messages: ChatMessage[]) {
 }
 
 /** Call a single provider; resolves with the trimmed text or throws. */
-async function callProvider(messages: ChatMessage[], p: { id: string; key?: string }): Promise<string> {
+async function callProvider(messages: ChatMessage[], p: { id: string; key?: string; model?: string }): Promise<string> {
   if (p.id === "ollama") {
     const flat = messages.map((m) => ({ role: m.role, content: messageText(m) }));
     // Native /api/chat (not the OpenAI-compat one): qwen3's thinking mode
@@ -86,7 +91,7 @@ async function callProvider(messages: ChatMessage[], p: { id: string; key?: stri
   if (!p.key) throw new Error(`${p.id} no key`);
   let content: string | undefined;
   if (p.id === "gemini") {
-    const res = await fetch(`${GEMINI_URL}/${MODELS.gemini}:generateContent`, {
+    const res = await fetch(`${GEMINI_URL}/${p.model ?? MODELS.gemini}:generateContent`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": p.key },
       body: JSON.stringify({ ...toGemini(messages), generationConfig: { temperature: 0.3, maxOutputTokens: 2048 } }),
@@ -130,14 +135,15 @@ async function callProvider(messages: ChatMessage[], p: { id: string; key?: stri
 /** Best available model. Falls through providers until one answers. */
 export async function completeCloud(
   messages: ChatMessage[],
-  opts?: { geminiKey?: string },
+  opts?: { geminiKey?: string; model?: string; provider?: "gemini" | "ollama" | "groq" },
 ): Promise<string> {
   let lastError: unknown = null;
-  for (const p of PROVIDERS) {
+  const chain = opts?.provider ? PROVIDERS.filter((p) => p.id === opts.provider) : PROVIDERS;
+  for (const p of chain) {
     const key = p.id === "gemini" ? opts?.geminiKey || p.key : p.key;
     if (p.id !== "ollama" && !key) continue;
     try {
-      return await callProvider(messages, { id: p.id, key });
+      return await callProvider(messages, { id: p.id, key, model: opts?.model });
     } catch (err) {
       lastError = err;
       console.warn(`[assistant] ${p.id} failed:`, err);

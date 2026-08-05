@@ -10,6 +10,8 @@ import {
   stripLaunchQualifiers,
 } from "../lib/commandSplit.ts";
 import { findSiteInPhrase, resolveSite } from "../lib/sites.ts";
+import { bestMatch } from "../lib/skillCatalog.ts";
+import { N8N_ACTIONS } from "../lib/n8n/config.ts";
 
 /**
  * Self-test suite for the ULTRON PC-control surface.
@@ -115,8 +117,28 @@ export async function runSelfTests({ live = false } = {}) {
     ["music 'найди трек'", musicSearchQuery("найди трек imagination") === "imagination"],
     ["music non-music null", musicSearchQuery("открой стим") === null],
     ["music track quote keeps words", musicSearchQuery("включи музыку стану джазом") === "стану джазом"],
+    ["n8n actions non-empty", N8N_ACTIONS.length > 0],
+    ["n8n ids unique", new Set(N8N_ACTIONS.map((a) => a.id)).size === N8N_ACTIONS.length],
+    ["n8n ids prefixed", N8N_ACTIONS.every((a) => a.id.startsWith("n8n-"))],
+    ["n8n schema object", N8N_ACTIONS.every((a) => a.payloadSchema && typeof a.payloadSchema === "object" && Object.keys(a.payloadSchema).length > 0)],
+    ["n8n names non-empty", N8N_ACTIONS.every((a) => typeof a.name === "string" && a.name.trim().length > 0)],
   ];
   for (const [name, ok] of pureChecks) check(`pure ${name}`, ok);
+
+  // Skill routing: semantic match on the user's text must pick the right SKILL.md
+  // even when a weak LLM names the wrong skill. Deterministic, no LLM involved.
+  const matchData = await bestMatch("построй график y=x^2 для x от -5 до 5 и сохрани в png");
+  check(
+    "skill-match plot→data",
+    matchData.skill?.slug === "data",
+    `got ${matchData.skill?.slug ?? "none"} score=${matchData.score.toFixed(2)}`,
+  );
+  const matchPy = await bestMatch("напиши python скрипт который вычислит 2**100 и выведи результат");
+  check(
+    "skill-match python→python",
+    matchPy.skill?.slug === "python",
+    `got ${matchPy.skill?.slug ?? "none"} score=${matchPy.score.toFixed(2)}`,
+  );
 
   // 2. Server reachability.
   const probe = await http("GET", `${SERVER}/api/tts`);

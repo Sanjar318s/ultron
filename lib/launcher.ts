@@ -339,6 +339,53 @@ export async function focusWindowByTitle(title: string, app?: string): Promise<b
   return out.includes("FOCUS_OK");
 }
 
+/** Read the main window title of a process by name (empty string when none).
+ *  Used to poll an app's UI state (e.g. wait until a splash screen changes). */
+export async function getWindowTitle(app?: string): Promise<string> {
+  const procName = (app ?? "").replace(/\.exe$/i, "").toLowerCase();
+  const escaped = procName.replace(/'/g, "''");
+  const script = `Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class TitleGrab {
+  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+}
+"@
+$script:result = ''
+$script:want = '${escaped}'
+$cb = [TitleGrab+EnumProc]{
+  param($h, $l)
+  if (-not [TitleGrab]::IsWindowVisible($h)) { return $true }
+  $wp = 0
+  [TitleGrab]::GetWindowThreadProcessId($h, [ref]$wp) | Out-Null
+  if ($wp -ne 0) {
+    $pr = Get-Process -Id $wp -ErrorAction SilentlyContinue
+    if ($pr -and $pr.ProcessName -ieq $script:want) {
+      $s = New-Object System.Text.StringBuilder 256
+      [TitleGrab]::GetWindowText($h, $s, 256) | Out-Null
+      $script:result = $s.ToString()
+      return $false
+    }
+  }
+  return $true
+}
+[TitleGrab]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Write-Output $script:result
+`;
+  try {
+    const out = await runPs(script, 10_000);
+    return out.replace(/\r?\n$/, "");
+  } catch {
+    return "";
+  }
+}
+
 /**
  * Launch a target and then bring its window to the foreground, so the next
  * skill step (typing / keys) lands in the right app.
@@ -622,6 +669,28 @@ export async function launchApp(
     return { launched: name, matched: clean };
   }
 
+  // Installed app first (desktop apps win over website when both exist).
+  // Checked BEFORE Steam and site matching so a real installed app like
+  // Yandex Music is never shadowed by a Steam alias or a web fallback.
+  const installed = findBestApp(
+    clean,
+    dedupeApps((await scanInstalledApps()).filter((a) => isReasonableApp(a.name))),
+  );
+  if (installed) {
+    if (focus) await launchAndFocus(installed.path, installed.name);
+    else openViaShell(installed.path);
+    return { launched: name, matched: installed.name };
+  }
+
+  // Installed Steam game (steam://rungameid/730). Resolved AFTER the
+  // installed-app scan so a real desktop app isn't shadowed by a spurious
+  // fuzzy match like XboxPcAppCE.
+  const game = await matchSteamGame(clean);
+  if (game) {
+    await launchSteamGame(game.appid);
+    return { launched: name, matched: game.name };
+  }
+
   // Known site inside the phrase («ютуб через браузер на пк» → YouTube) —
   // BEFORE the allowlist token fallback so «браузер» can't steal the intent.
   const siteUrl = resolveSite(clean) ?? findSiteInPhrase(clean);
@@ -650,25 +719,6 @@ export async function launchApp(
   if (settingsUri) {
     openViaShell(settingsUri);
     return { launched: name, matched: clean };
-  }
-
-  // Installed Steam game («запусти кс 2» → steam://rungameid/730). Checked
-  // BEFORE the installed-app scan: game names must never be shadowed by a
-  // Windows app (e.g. the Xbox Game Bar surfacing for «кс 2»).
-  const game = await matchSteamGame(clean);
-  if (game) {
-    await launchSteamGame(game.appid);
-    return { launched: name, matched: game.name };
-  }
-
-  const installed = findBestApp(
-    clean,
-    dedupeApps((await scanInstalledApps()).filter((a) => isReasonableApp(a.name))),
-  );
-  if (installed) {
-    if (focus) await launchAndFocus(installed.path, installed.name);
-    else openViaShell(installed.path);
-    return { launched: name, matched: installed.name };
   }
 
   if (/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(clean)) {

@@ -77,6 +77,10 @@ function installOllama() {
   }
   console.log("\n> ollama pull qwen3:8b   (5.2 ГБ — может занять время)");
   run("ollama", ["pull", "qwen3:8b"], { timeout: 3 * 60 * 60 * 1000 });
+  // Vision for the study engine (image/PDF OCR). qwen2.5vl:7b is the local
+  // fallback behind Gemini; a 0.8–1.4 ГБ GGUF on the CPU — may take a while.
+  console.log("\n> ollama pull qwen2.5vl:7b   (локальная vision-модель для изучения картинок/PDF)");
+  run("ollama", ["pull", "qwen2.5vl:7b"], { timeout: 3 * 60 * 60 * 1000 });
 }
 
 function extractComfy() {

@@ -61,24 +61,28 @@ const LATIN_TO_CYR: Record<string, string> = {
   s: "с", t: "т", u: "у", v: "в", w: "в", x: "кс", y: "й", z: "з",
 };
 
+/** Iotated-vowel digraphs, so «yandex»→«яндекс» (not «йандекс»). */
+const LATIN_DIGRAPHS: Array<[string, string]> = [
+  ["ya", "я"], ["ye", "е"], ["yo", "ё"], ["yu", "ю"], ["yi", "и"],
+];
+
 /** Rough en→ru transliteration of an app name, for edit-distance matching. */
 function toCyrillic(raw: string): string {
-  return raw
-    .toLowerCase()
-    .replace(/ё/g, "е")
-    .split("")
-    .map((c) => LATIN_TO_CYR[c] ?? c)
-    .join("");
+  return applyCyrTransliteration(raw, LATIN_TO_CYR);
 }
 
 /** Soft en→ru variant where c→к and x→к (so «код» matches "code", «клауд» Claude). */
 function toCyrillicSoft(raw: string): string {
   const soft: Record<string, string> = { ...LATIN_TO_CYR, c: "к", x: "к" };
-  return raw
-    .toLowerCase()
-    .replace(/ё/g, "е")
+  return applyCyrTransliteration(raw, soft);
+}
+
+function applyCyrTransliteration(raw: string, map: Record<string, string>): string {
+  let out = raw.toLowerCase().replace(/ё/g, "е");
+  for (const [latin, cyr] of LATIN_DIGRAPHS) out = out.split(latin).join(cyr);
+  return out
     .split("")
-    .map((ch) => soft[ch] ?? ch)
+    .map((ch) => map[ch] ?? ch)
     .join("");
 }
 

@@ -225,17 +225,23 @@ async function sendStatus(chatId, text) {
 }
 
 async function editStatus(chatId, messageId, text) {
-  await apiCall("editMessageText", { chat_id: chatId, message_id: messageId, text }).catch(() => {});
+  try {
+    await apiCall("editMessageText", { chat_id: chatId, message_id: messageId, text, parse_mode: "HTML" });
+  } catch {
+    await apiCall("editMessageText", { chat_id: chatId, message_id: messageId, text }).catch(() => {});
+  }
 }
 
 /** Replace a status message with the final reply, sending overflow as new messages. */
 async function finishStatus(chatId, messageId, reply) {
-  const chunks = splitText(String(reply ?? ""), 4096);
+  const raw = String(reply ?? "");
+  const text = raw && raw.length < 200 ? `${raw}\n\n— 🛸 УЛЬТРОН` : raw;
+  const chunks = splitText(text, 3900);
   if (messageId !== null && chunks.length > 0) {
     await editStatus(chatId, messageId, chunks[0]);
     chunks.shift();
   }
-  for (const c of chunks) await sendText(chatId, c);
+  for (const c of chunks) await sendHtml(chatId, c);
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +385,16 @@ async function rollbackSnapshot(name) {
 /** Local shadow of server-side pending approvals: id → {id, chatId, createdAt}. */
 const pendings = new Map();
 
+/** Chat is waiting for study input («жду ссылку/текст/фото»): chatId → type. */
+const studyAwait = new Map();
+
+/** Chats with an active study poller running. */
+const studyPollers = new Map();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function pendingFor(chatId) {
   for (const p of pendings.values()) if (p.chatId === chatId) return p;
   return null;
@@ -414,7 +430,7 @@ async function chatWithAssistant(chatId, msg, text) {
   const hist = histories.get(String(chatId)) ?? [];
   hist.push({ role: "user", content: text });
   await typing(chatId);
-  const statusId = await sendStatus(chatId, "⏳ Думаю…");
+  const statusId = await sendStatus(chatId, "💭 Думаю…");
   let res;
   try {
     res = await fetch(`${SERVER}/api/assistant`, {
@@ -435,6 +451,16 @@ async function chatWithAssistant(chatId, msg, text) {
   const data = await res.json().catch(() => null);
   if (!res.ok || !data) {
     await finishStatus(chatId, statusId, `Ошибка сервера: ${data?.error ?? res.status}.`);
+    return;
+  }
+
+  // Background study job (site crawl / image) — poll instead of finalizing.
+  if (data.studyJobId) {
+    await finishStatus(chatId, statusId, "📡 Изучаю ваши запросы…");
+    await pollStudy(chatId, data.studyJobId, statusId);
+    hist.push({ role: "assistant", content: data.reply ?? "Изучение запущено." });
+    if (hist.length > 16) hist.splice(0, hist.length - 16);
+    histories.set(String(chatId), hist);
     return;
   }
 
@@ -485,36 +511,34 @@ function parseCommand(text) {
 }
 
 const HELP_HTML = [
-  "<b>УЛЬТРОН — команды бота</b>",
+  "🛸 <b>УЛЬТРОН</b> — команды",
   "",
   "<b>Общение</b>",
-  "• просто пишите — я отвечаю",
-  "• <code>найди {запрос}</code> — поиск в интернете",
-  "• <code>изучи {тема}</code> — поиск и запоминание",
-  "• <code>изучи {ссылка}</code> — прочитать и запомнить",
-  "• <code>напиши статью про…</code> — текст",
-  "• <code>нарисуй …</code> — изображение",
-  "• <code>навыки</code> / <code>какие у тебя навыки</code>",
+  "• просто пиши — отвечу",
+  "• <code>найди {запрос}</code> — интернет",
+  "• <code>изучи {тема}</code> — поиск + запоминание",
+  "• <code>нарисуй {описание}</code> — картинка",
+  "• <code>навыки</code> — список навыков",
   "",
   "<b>Команды</b>",
-  "• /menu — главное меню",
+  "• /menu — меню",
   "• /help — справка",
-  "• /skills — список навыков (запуск в один тап)",
-  "• /keys — статус Gemini-ключей",
-  "• /id — ваш числовой id",
+  "• /skills — навыки",
+  "• /keys — статус ключей",
+  "• /id — ваш id",
   "",
   "<b>ПК (владелец)</b>",
-  "• /screenshot — скриншот экрана",
-  "• /click &lt;цель&gt; — ИИ-клик (напр. «нажми на капчу»)",
-  "• /grid &lt;цель&gt; — клик по всем подходящим клеткам",
+  "• /screenshot — скриншот",
+  "• /click &lt;цель&gt; — клик (напр. «нажми на капчу»)",
+  "• /grid &lt;цель&gt; — клик по всем подходящим",
   "• /drag &lt;цель&gt; — перетащить слайдер",
 ].join("\n");
 
 /** Command list registered via setMyCommands (shown by the «/» menu). */
 const BOT_COMMANDS = [
   { command: "menu", description: "Главное меню" },
-  { command: "skills", description: "Мои навыки — список и запуск" },
-  { command: "click", description: "ИИ-клик по экрану: /click <что>" },
+  { command: "skills", description: "Навыки — список и запуск" },
+  { command: "click", description: "ИИ-клик: /click <что>" },
   { command: "screenshot", description: "Скриншот экрана" },
   { command: "memory", description: "Память: правила и заметки" },
   { command: "search", description: "Интернет-поиск" },
@@ -523,40 +547,37 @@ const BOT_COMMANDS = [
   { command: "keys", description: "Статус Gemini-ключей" },
   { command: "id", description: "Ваш числовой id" },
   { command: "algorithms", description: "Алгоритмы мозга (владелец)" },
-  { command: "self-test", description: "Самопроверка бота и ПК (владелец)" },
+  { command: "selftest", description: "Самопроверка (владелец)" },
 ];
 
 const ADMIN_HELP_HTML = [
-  "<b>УЛЬТРОН — админ-команды владельца</b>",
+  "🛸 <b>УЛЬТРОН</b> — админ-команды владельца",
   "",
   "<b>Доступ</b>",
   "• /users — список допущенных",
-  "• /adduser &lt;username|id&gt; — допустить",
-  "• /rmuser &lt;username|id&gt; — убрать",
+  "• /adduser &lt;имя|id&gt; — допустить",
+  "• /rmuser &lt;имя|id&gt; — убрать",
   "",
-  "<b>Файлы (относительно корня проекта)</b>",
-  "• /ls [папка] — список",
-  "• /tree [папка] — дерево",
-  "• /cat &lt;файл&gt; — показать",
-  "• /find &lt;имя&gt; — поиск файлов",
-  "• /write &lt;файл&gt; [--no-build] + перевод строки + содержимое",
-  "• /replace &lt;файл&gt; &lt;старое&gt; &lt;новое&gt; [--no-build]",
-  "• /append &lt;файл&gt; + перевод строки + текст",
-  "• /rm &lt;файл|папка&gt; • /mkdir &lt;папка&gt;",
-  "• /mv &lt;откуда&gt; &lt;куда&gt; • /cp &lt;откуда&gt; &lt;куда&gt;",
+  "<b>Файлы (от корня проекта)</b>",
+  "• /ls [папка] • /tree [папка]",
+  "• /cat &lt;файл&gt; • /find &lt;имя&gt;",
+  "• /write &lt;файл&gt; [--no-build] + текст",
+  "• /replace &lt;файл&gt; &lt;ст&gt; &lt;нов&gt; [--no-build]",
+  "• /append &lt;файл&gt; + текст",
+  "• /rm • /mkdir • /mv • /cp",
   "",
   "<b>Система</b>",
-  "• /run &lt;команда&gt; — выполнить в корне проекта",
+  "• /run &lt;команда&gt; — выполнить в корне",
   "• /node &lt;файл.js&gt; — запустить node",
   "• /build — npm run build",
-  "• /restart — перезапустить бота",
-  "• /restart-server — перезапустить веб-сервер",
-  "• /log [n] — хвост логов (next/bot)",
+  "• /restart — перезапуск бота",
+  "• /restart-server — перезапуск веб-сервера",
+  "• /log [n] — хвост логов",
   "• /sysinfo — CPU/RAM/диск/GPU",
-  "• /self-test — самопроверка бота и ПК",
+  "• /selftest — самопроверка",
   "",
   "<b>Git и снимки</b>",
-  "• /git &lt;аргументы&gt; — git (авторизация через GITHUB_TOKEN)",
+  "• /git &lt;аргументы&gt; — git",
   "• /snapshot [имя] — снимок состояния",
   "• /snapshots — список снимков",
   "• /rollback [имя] — откат к снимку",
@@ -564,12 +585,11 @@ const ADMIN_HELP_HTML = [
   "<b>Автономия ИИ</b>",
   "• /autonomy on|off|status",
   "• /veto &lt;id&gt; — отклонить заявку",
-  "• /stop-ai — аварийный стоп автономии",
+  "• /stop-ai — аварийный стоп",
   "",
   "<b>Мета-обучение</b>",
-  "• /algorithms — список алгоритмов мозга",
-  "• /algo-off &lt;id&gt; — отключить алгоритм",
-  "• /algo-on &lt;id&gt; — восстановить алгоритм",
+  "• /algorithms — алгоритмы мозга",
+  "• /algo-off &lt;id&gt; • /algo-on &lt;id&gt;",
 ].join("\n");
 
 function mainMenuKeyboard(owner) {
@@ -583,6 +603,10 @@ function mainMenuKeyboard(owner) {
       { text: "🔍 Поиск", callback_data: "cmd:/search" },
       { text: "🖼 Рисовать", callback_data: "cmd:/draw" },
       { text: "🔑 Статус", callback_data: "cmd:/keys" },
+    ],
+    [
+      { text: "📖 Изучить", callback_data: "study:menu" },
+      { text: "⏳ Незавершённое", callback_data: "study:list" },
     ],
   ];
   if (owner) {
@@ -600,7 +624,7 @@ function mainMenuKeyboard(owner) {
 async function sendMenu(chatId, owner) {
   await apiCall("sendMessage", {
     chat_id: chatId,
-    text: "🕹 <b>Главное меню</b>",
+    text: "🛸 <b>Меню УЛЬТРОНА</b>",
     parse_mode: "HTML",
     reply_markup: mainMenuKeyboard(owner),
   });
@@ -753,7 +777,7 @@ async function skillInfo(chatId, id) {
 /** Run a skill (screen id or `cat:<slug>`) via /api/skills and report back. */
 async function runSkillFromTelegram(chatId, id, owner) {
   await typing(chatId);
-  const statusId = await sendStatus(chatId, "▶ Выполняю навык…");
+  const statusId = await sendStatus(chatId, "🧠 Выполняю навык…");
   let res;
   try {
     res = await fetch(`${SERVER}/api/skills`, {
@@ -946,7 +970,7 @@ async function handleCommand(chatId, msg, cmd) {
   switch (name) {
     case "/start": {
       const who = owner ? "Владелец" : isAllowed(msg.from) ? "Гость" : "";
-      await sendHtml(chatId, `Привет! Я <b>УЛЬТРОН</b>${who ? ` (${who})` : ""} — ваш ИИ-ассистент.\n\n${HELP_HTML}`);
+      await sendHtml(chatId, `🛸 <b>УЛЬТРОН</b>${who ? ` (${who})` : ""} online.\nПиши что угодно — помогу. Команды: /help\n\n${HELP_HTML}`);
       await sendMenu(chatId, owner);
       return;
     }
@@ -980,7 +1004,7 @@ async function handleCommand(chatId, msg, cmd) {
       await renderAlgorithms(chatId);
       return;
     }
-    case "/self-test": {
+    case "/selftest": {
       if (!requireOwner(chatId, owner)) return;
       await sendText(chatId, "🧪 Запускаю самопроверку…");
       try {
@@ -1575,6 +1599,270 @@ async function tryNlAdmin(chatId, msg, text) {
 }
 
 // ---------------------------------------------------------------------------
+// Study flow (📖 Изучить: ссылка / сайт / картинка / текст)
+// ---------------------------------------------------------------------------
+
+const STUDY_TYPE_LABEL = {
+  url: "🔗 Ссылка",
+  site: "🌐 Веб-сайт",
+  image: "🖼 Картинка",
+  text: "📝 Текст",
+};
+
+function studyMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "🔗 Ссылка", callback_data: "study:type:url" },
+        { text: "🌐 Веб-сайт", callback_data: "study:type:site" },
+      ],
+      [
+        { text: "🖼 Картинка", callback_data: "study:type:image" },
+        { text: "📝 Текст", callback_data: "study:type:text" },
+      ],
+      [
+        { text: "◀ Назад", callback_data: "menu:main" },
+        { text: "✖ Закрыть", callback_data: "menu:close" },
+      ],
+    ],
+  };
+}
+
+async function sendStudyMenu(chatId) {
+  await apiCall("sendMessage", {
+    chat_id: chatId,
+    text: "📖 <b>Изучение</b>\nЧто изучаем? Выбери — и я попрошу только вход.",
+    parse_mode: "HTML",
+    reply_markup: studyMenuKeyboard(),
+  });
+}
+
+async function fetchStudyJob(jobId, chatId) {
+  const res = await fetch(
+    `${SERVER}/api/study?jobId=${encodeURIComponent(jobId)}&chatId=${encodeURIComponent(String(chatId))}`,
+    { signal: AbortSignal.timeout(15_000) },
+  ).catch(() => null);
+  if (!res) return null;
+  const data = await res.json().catch(() => null);
+  return data?.job ?? null;
+}
+
+async function activeStudyFor(chatId) {
+  const res = await fetch(`${SERVER}/api/study?chatId=${encodeURIComponent(String(chatId))}`, {
+    signal: AbortSignal.timeout(15_000),
+  }).catch(() => null);
+  if (!res) return null;
+  const data = await res.json().catch(() => null);
+  const list = data?.jobs ?? [];
+  return list.find((j) => j.status === "queued" || j.status === "active" || j.status === "waiting") ?? null;
+}
+
+/** Start a study job via /api/study and begin polling it. */
+async function startStudyFromBot(chatId, msg, type, content, image) {
+  const active = await activeStudyFor(chatId);
+  if (active) {
+    await sendHtml(
+      chatId,
+      `⏳ Уже идёт изучение: <b>${esc(active.title)}</b>\n✔ ${active.studied} изучено${active.left ? `, ⏳ ${active.left} осталось` : ""}. Дождитесь завершения или решите его судьбу в «⏳ Незавершённое».`,
+    );
+    return;
+  }
+  const body = { type, content, chatId: String(chatId), isOwner: isOwner(msg?.from) };
+  if (image) body.image = image;
+  try {
+    const res = await fetch(`${SERVER}/api/study`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.job) {
+      await sendHtml(chatId, `⚠️ Не удалось начать изучение: ${esc(data?.error ?? res.status)}.`);
+      return;
+    }
+    studyAwait.delete(String(chatId));
+    const job = data.job;
+    if (job.status === "queued" || job.status === "active") {
+      await pollStudy(chatId, job.id);
+    } else {
+      await sendHtml(chatId, buildStudyReport(job));
+      if (job.status === "waiting") await sendStudyDecision(chatId, job);
+    }
+  } catch (err) {
+    await sendHtml(chatId, `⚠️ Ошибка сервера изучения: ${String(err?.message ?? err).slice(0, 300)}`);
+  }
+}
+
+/** Poll a running study job, reporting progress honestly; no premature «done». */
+async function pollStudy(chatId, jobId, existingStatusId = null) {
+  const key = String(chatId);
+  if (studyPollers.has(key)) return;
+  studyPollers.set(key, true);
+  try {
+    let statusId = existingStatusId;
+    if (statusId === null) statusId = await sendStatus(chatId, "📡 Изучаю ваши запросы…");
+    for (;;) {
+      await sleep(8000);
+      const job = await fetchStudyJob(jobId, chatId);
+      if (!job) {
+        await sendHtml(chatId, "⚠️ Задание изучения не найдено.");
+        return;
+      }
+      if (job.status === "queued" || job.status === "active") {
+        await editStatus(chatId, statusId, `📡 Изучаю ваши запросы…\n✔ ${job.studied} изучено, ⏳ ${job.left} осталось`).catch(() => {});
+        continue;
+      }
+      await finishStatus(chatId, statusId, buildStudyReport(job));
+      if (job.status === "waiting") await sendStudyDecision(chatId, job);
+      return;
+    }
+  } finally {
+    studyPollers.delete(key);
+  }
+}
+
+/** Honest final report: studied / already-known / failed-with-reasons / left. */
+function buildStudyReport(job) {
+  const t = esc(job.title || "");
+  const lines = [];
+  if (job.status === "done") {
+    lines.push(`✅ <b>Изучение завершено.</b>\n📖 <b>${t}</b>`);
+  } else if (job.status === "paused") {
+    lines.push(`⏸ <b>Изучение приостановлено.</b>\n📖 <b>${t}</b>`);
+  } else if (job.status === "waiting") {
+    lines.push(`⏳ <b>Изучение на паузе.</b>\n📖 <b>${t}</b>`);
+  } else if (job.status === "failed") {
+    lines.push(`⚠️ <b>Не удалось изучить.</b>\n📖 <b>${t}</b>`);
+  }
+  lines.push(`✔ Изучено: <b>${job.studied}</b>`);
+  if (job.skipped > 0) lines.push(`⏭ Уже знал: ${job.skipped}`);
+  if (job.failed.length > 0) {
+    const reasons = job.failed
+      .slice(0, 5)
+      .map((f) => `• ${f.url ? esc(f.url) : "—"}: ${esc(f.reason)}`)
+      .join("\n");
+    lines.push(`⚠️ Не удалось: <b>${job.failed.length}</b>\n${reasons}`);
+    if (job.failed.length > 5) lines.push(`… и ещё ${job.failed.length - 5}`);
+    lines.push("Отложено — можно повторить в «⏳ Незавершённое».");
+  }
+  if (job.left > 0) lines.push(`⏳ Осталось не изучено: <b>${job.left}</b>`);
+  return lines.join("\n");
+}
+
+async function sendStudyDecision(chatId, job) {
+  const kb = {
+    inline_keyboard: [
+      [
+        { text: "▶ Продолжить", callback_data: `study:resume:${job.id}` },
+        { text: "✅ Хватит", callback_data: `study:stop:${job.id}` },
+      ],
+    ],
+  };
+  await apiCall("sendMessage", {
+    chat_id: chatId,
+    text: `Лимит ${job.cap} страниц за запуск исчерпан: изучено <b>${job.studied}</b>, осталось <b>${job.left}</b>. Продолжить обход?`,
+    parse_mode: "HTML",
+    reply_markup: kb,
+  });
+}
+
+async function renderUnfinishedStudies(chatId) {
+  const res = await fetch(`${SERVER}/api/study?chatId=${encodeURIComponent(String(chatId))}`, {
+    signal: AbortSignal.timeout(15_000),
+  }).catch(() => null);
+  const data = res ? await res.json().catch(() => null) : null;
+  const jobs = (data?.jobs ?? []).filter((j) => j.status === "paused" || j.status === "waiting");
+  if (jobs.length === 0) {
+    await sendHtml(chatId, "⏳ <b>Незавершённое изучение</b>\n\nПока ничего нет.");
+    return;
+  }
+  const cards = jobs.map((j) => {
+    const when = new Date(j.updatedAt).toLocaleString("ru-RU");
+    const parts = [`<b>${esc(j.title)}</b>`];
+    parts.push(`✔ ${j.studied} изучено${j.left ? ` · ⏳ ${j.left} осталось` : ""}${j.failed.length ? ` · ⚠️ ${j.failed.length} отложено` : ""}`);
+    parts.push(`🕒 ${when}`);
+    return parts.join("\n");
+  });
+  const kb = {
+    inline_keyboard: jobs.map((j) => [
+      { text: "▶ Продолжить", callback_data: `study:resume:${j.id}` },
+      { text: "✖ Убрать", callback_data: `study:delete:${j.id}` },
+    ]),
+  };
+  await apiCall("sendMessage", {
+    chat_id: chatId,
+    text: "⏳ <b>Незавершённое изучение</b>\n\n" + cards.join("\n\n"),
+    parse_mode: "HTML",
+    reply_markup: kb,
+  });
+}
+
+async function studyAction(chatId, jobId, action) {
+  const res = await fetch(`${SERVER}/api/study`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jobId, action, chatId: String(chatId) }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data?.ok) return null;
+  return data.job ?? null;
+}
+
+/** Consume an awaited study input (url/site/text/image). Returns true if handled. */
+async function handleStudyAwaiting(chatId, msg, awaiting, text) {
+  if (!isAllowed(msg?.from)) return false;
+  const lower = text.toLowerCase();
+  if (/^(отмена|отмен|стоп|cancel)([.!]|$)/.test(lower)) {
+    studyAwait.delete(String(chatId));
+    await sendHtml(chatId, "✖ Изучение отменено.");
+    return true;
+  }
+  if (awaiting === "image") {
+    const photo = msg.photo?.length ? msg.photo[msg.photo.length - 1] : null;
+    const docImg = msg.document?.mime_type?.startsWith("image/") ? msg.document : null;
+    const file = photo ?? docImg;
+    if (file) {
+      try {
+        const f = await apiCall("getFile", { file_id: file.file_id });
+        const filePath = f?.result?.file_path;
+        if (!filePath) throw new Error("no file_path");
+        const fileRes = await fetch(`${API}/file/${filePath}`);
+        const bytes = Buffer.from(await fileRes.arrayBuffer());
+        await startStudyFromBot(chatId, msg, "image", "", {
+          b64: bytes.toString("base64"),
+          mime: docImg ? msg.document?.mime_type ?? "image/jpeg" : "image/jpeg",
+        });
+      } catch (e) {
+        await sendHtml(chatId, `⚠️ Не удалось скачать фото: ${String(e?.message ?? e).slice(0, 200)}`);
+      }
+      return true;
+    }
+    if (/^https?:\/\/\S+$/i.test(text)) {
+      await startStudyFromBot(chatId, msg, "image", text);
+      return true;
+    }
+    await sendHtml(chatId, "🖼 Отправьте фото или ссылку на изображение. Отмена — «стоп».");
+    return true;
+  }
+  if (awaiting === "text") {
+    if (text) {
+      await startStudyFromBot(chatId, msg, "text", text);
+      return true;
+    }
+    await sendHtml(chatId, "📝 Отправьте текст для изучения. Отмена — «стоп».");
+    return true;
+  }
+  if (/^https?:\/\/\S+$/i.test(text)) {
+    await startStudyFromBot(chatId, msg, awaiting === "site" ? "site" : "url", text);
+    return true;
+  }
+  await sendHtml(chatId, awaiting === "site" ? "🌐 Отправьте ссылку на сайт. Отмена — «стоп»." : "🔗 Отправьте ссылку на страницу. Отмена — «стоп».");
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Callback (approve / reject buttons)
 // ---------------------------------------------------------------------------
 
@@ -1596,6 +1884,67 @@ async function handleCallback(query) {
   }
   if (verb === "menu" && id === "close") {
     await removeButtons(chatId, query.message?.message_id);
+    return;
+  }
+  if (verb === "menu" && id === "main") {
+    await removeButtons(chatId, query.message?.message_id);
+    await sendMenu(chatId, isOwner(fakeFrom));
+    return;
+  }
+
+  // Study flow buttons are open to anyone allowed to chat.
+  if (verb === "study") {
+    const [sub, ...rest] = data.split(":").slice(1);
+    const arg = rest.join(":");
+    if (!isAllowed(fakeFrom)) {
+      await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: "Только для допущенных." }).catch(() => {});
+      return;
+    }
+    if (sub === "menu") {
+      await sendStudyMenu(chatId);
+      return;
+    }
+    if (sub === "type" && STUDY_TYPE_LABEL[arg]) {
+      studyAwait.set(String(chatId), arg);
+      const asks = {
+        url: "🔗 Отправьте ссылку на страницу.",
+        site: "🌐 Отправьте ссылку на сайт.",
+        image: "🖼 Отправьте фото или ссылку на изображение.",
+        text: "📝 Отправьте текст для изучения.",
+      };
+      await removeButtons(chatId, query.message?.message_id);
+      await sendHtml(chatId, `${asks[arg]}\n<code>стоп</code> — отменить.`);
+      return;
+    }
+    if (sub === "list") {
+      await renderUnfinishedStudies(chatId);
+      return;
+    }
+    if (sub === "resume" && arg) {
+      const job = await studyAction(chatId, arg, "resume");
+      await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: "Продолжаю" }).catch(() => {});
+      if (job) {
+        await removeButtons(chatId, query.message?.message_id);
+        await pollStudy(chatId, job.id);
+      } else {
+        await sendHtml(chatId, "⚠️ Задание не найдено.");
+      }
+      return;
+    }
+    if (sub === "stop" && arg) {
+      const job = await studyAction(chatId, arg, "stop");
+      await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: "Приостановлено" }).catch(() => {});
+      await removeButtons(chatId, query.message?.message_id);
+      if (job) await sendHtml(chatId, `⏸ Изучение приостановлено (✔ ${job.studied} изучено). Продолжить можно в «⏳ Незавершённое».`);
+      return;
+    }
+    if (sub === "delete" && arg) {
+      const ok = await studyAction(chatId, arg, "delete");
+      await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: ok ? "Удалено" : "Ошибка" }).catch(() => {});
+      await removeButtons(chatId, query.message?.message_id);
+      await renderUnfinishedStudies(chatId);
+      return;
+    }
     return;
   }
 
@@ -1717,6 +2066,12 @@ async function handleMessage(msg) {
 
   const text = (msg.text ?? "").trim();
 
+  // Menu-driven study flow: the chat is waiting for a URL / text / photo.
+  if (chatId !== undefined && studyAwait.has(String(chatId))) {
+    const awaiting = studyAwait.get(String(chatId));
+    if (await handleStudyAwaiting(chatId, msg, awaiting, text)) return;
+  }
+
   // Photo with a «запомни как <имя>» caption → register a manual character
   // reference so future generations can steer by this face (FaceID).
   if (chatId !== undefined && !text && (msg.photo?.length || msg.document?.mime_type?.startsWith("image/"))) {
@@ -1832,7 +2187,8 @@ async function main() {
         }
         const msg = update.message;
         const isAudio = !!(msg && (msg.voice || msg.audio || msg.document?.mime_type?.startsWith("audio/")));
-        if (!msg || (!msg.text && !isAudio)) continue;
+        const isPhoto = !!(msg && (msg.photo?.length || msg.document?.mime_type?.startsWith("image/")));
+        if (!msg || (!msg.text && !isAudio && !isPhoto)) continue;
         try {
           await handleMessage(msg);
         } catch (e) {

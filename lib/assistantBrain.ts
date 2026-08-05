@@ -30,6 +30,9 @@ export type AssistantAction =
   | { kind: "stop-lesson" }
   | { kind: "run-skill"; skillId: string }
   | { kind: "learn-url"; url: string }
+  | { kind: "learn-site"; url: string }
+  | { kind: "learn-image"; url: string }
+  | { kind: "learn-text"; text: string }
   | { kind: "image"; prompt: string; text?: string }
   | { kind: "search"; query: string; learn?: boolean }
   | { kind: "maximize" }
@@ -39,7 +42,8 @@ export type AssistantAction =
   | { kind: "toggle-maximize" }
   | { kind: "chain"; actions: AssistantAction[] }
   | { kind: "file-search"; query: string }
-  | { kind: "music-search"; query: string };
+  | { kind: "music-search"; query: string }
+  | { kind: "n8n_trigger"; actionId: string; payload?: Record<string, unknown> };
 
 /** Action spec as returned by an LLM: a named string or a launch/weather/run-skill/image/search object. */
 export type LLMActionSpec =
@@ -49,7 +53,8 @@ export type LLMActionSpec =
   | { type: "run-skill"; skill: string }
   | { type: "image"; prompt: string; text?: string }
   | { type: "search"; query: string; learn?: boolean }
-  | { type: "music-search"; query: string };
+  | { type: "music-search"; query: string }
+  | { type: "n8n_trigger"; actionId: string; payload?: Record<string, unknown> };
 
 export interface LLMLearnItem {
   type: "fact" | "command";
@@ -493,6 +498,8 @@ export function normalizeLLMAction(spec: unknown): AssistantAction | null {
       learn?: unknown;
       actions?: unknown;
       skill?: unknown;
+      actionId?: unknown;
+      payload?: unknown;
     };
     if (o.type === "launch" && typeof o.app === "string" && o.app.trim()) {
       const parts = splitLaunchChain(o.app.trim()).map(
@@ -537,6 +544,13 @@ export function normalizeLLMAction(spec: unknown): AssistantAction | null {
     if (o.type === "file-search" && typeof o.query === "string" && o.query.trim()) {
       return { kind: "file-search", query: o.query.trim() };
     }
+    if (o.type === "n8n_trigger" && typeof o.actionId === "string" && o.actionId.trim()) {
+      const payload =
+        typeof o.payload === "object" && o.payload !== null && !Array.isArray(o.payload)
+          ? (o.payload as Record<string, unknown>)
+          : undefined;
+      return { kind: "n8n_trigger", actionId: o.actionId.trim(), payload };
+    }
   }
   return null;
 }
@@ -567,6 +581,12 @@ function describeAction(action: AssistantAction): string {
       return "выполнить навык";
     case "learn-url":
       return "изучить страницу";
+    case "learn-site":
+      return "изучить весь сайт";
+    case "learn-image":
+      return "изучить изображение";
+    case "learn-text":
+      return "изучить текст";
     case "image":
       return "сгенерировать изображение";
     case "search":
@@ -587,6 +607,8 @@ function describeAction(action: AssistantAction): string {
       return `найти файл «${action.query}»`;
     case "music-search":
       return `найти в музыке «${action.query}»`;
+    case "n8n_trigger":
+      return `запустить сценарий n8n «${action.actionId}»`;
   }
 }
 
@@ -1282,7 +1304,7 @@ export class AssistantBrain {
       "Доступные действия: zoom-in (приблизить), zoom-out (отдалить), reset (сбросить вид), gestures-on (включить жесты), gestures-off (выключить жесты), stop (остановить), {\"type\":\"launch\",\"app\":\"<имя>\"} (запустить приложение), {\"type\":\"weather\",\"city\":\"<город>\"} (узнать погоду), {\"type\":\"run-skill\",\"skill\":\"<имя навыка>\"} (выполнить выученный навык), {\"type\":\"image\",\"prompt\":\"<описание на английском>\"} (сгенерировать изображение), {\"type\":\"search\",\"query\":\"<запрос>\"} (найти информацию в интернете), {\"type\":\"music-search\",\"query\":\"<запрос>\"} (найти песню/трек в Яндекс Музыке), {\"type\":\"maximize\"} (развернуть окно на весь экран), {\"type\":\"minimize\"} (свернуть окно), {\"type\":\"close\"} (закрыть окно), {\"type\":\"restore\"} (восстановить окно), {\"type\":\"toggle-maximize\"} (переключить размер), {\"type\":\"file-search\",\"query\":\"<запрос>\"} (найти файл/фото на ПК).",
       "УПРАВЛЕНИЕ ОКНАМИ: если пользователь просит «сделай на весь экран», «разверни», «сверни», «свернуть», «закрой окно», «закрой», «восстанови», «переключи размер окна» — верни соответствующее действие: maximize, minimize, close, restore, toggle-maximize. Если это модификатор к запуску («открой блокнот на весь экран»), верни chain: [{\"type\":\"launch\",\"app\":\"блокнот\"}, {\"type\":\"maximize\"}].",
       "СОСТАВНЫЕ КОМАНДЫ: если в одной просьбе несколько действий через «и», «затем», «потом», запятую или точку с запятой — верни chain с последовательными действиями, а НЕ одно действие с общим названием. Пример: «открой стим и запусти кс 2» → {\"type\":\"chain\",\"actions\":[{\"type\":\"launch\",\"app\":\"стим\"},{\"type\":\"launch\",\"app\":\"кс 2\"}]}. «включи ютуб и поставь музыку» → chain из launch(\"ютуб\") и launch(\"музыка\"). «открой яндекс музыку и поставь песню салам» → {\"type\":\"chain\",\"actions\":[{\"type\":\"launch\",\"app\":\"яндекс музыка\"},{\"type\":\"music-search\",\"query\":\"Салам\"}]}. Никогда не возвращай app вида «стим и запусти кс 2».",
-      "МУЗЫКА: если пользователь просит «поставь/включи песню X», «поставь/включи трек X», «найди песню X», «поставь X в яндекс музыке» — верни action {\"type\":\"music-search\",\"query\":\"<название песни/трека>\"}. Это открывает поиск в Яндекс Музыке, а НЕ запуск приложения «песню X» и НЕ повторное открытие сайта. Никогда не возвращай launch с app «песню …» или «трек …». Если запрос начинается с «открой/включи яндекс музыку, и поставь …» — верни chain: сначала launch(\"яндекс музыка\"), затем music-search.",
+      "МУЗЫКА: если пользователь просит «поставь/включи песню X», «поставь/включи трек X», «найди песню X», «поставь X в яндекс музыке» — верни action {\"type\":\"music-search\",\"query\":\"<название песни/трека>\"}. Это ищет и запускает воспроизведение в десктоп-приложении Яндекс Музыка (не в браузере). Приложение открывается автоматически если установлено. Никогда не возвращай launch с app «песню …» или «трек …». Если запрос начинается с «открой/включи яндекс музыку, и поставь …» — верни chain: сначала launch(\"яндекс музыка\"), затем music-search. Десктоп-приложение siempre приоритетнее веб-версии.",
       "СИСТЕМНЫЕ НАСТРОЙКИ: «настройки» / «параметры» → action {\"type\":\"launch\",\"app\":\"настройки\"} (откроется ms-settings:). «Приложения по умолчанию» → {\"type\":\"launch\",\"app\":\"приложения по умолчанию\"}. «Дисплей» / «экран» → {\"type\":\"launch\",\"app\":\"дисплей\"}. «Звук» → {\"type\":\"launch\",\"app\":\"звук\"}. Не ищи .exe файлы для системных настроек — они открываются через URI schemes Windows.",
       "ПОИСК ФАЙЛОВ: если пользователь просит «открой фото X», «найди фото X», «покажи фото X», «найди картинку X» — верни action {\"type\":\"file-search\",\"query\":\"<запрос>\"}. Сначала ищет локально на ПК, потом в Google Картинки. Никогда не говори «я не могу» — ты умеешь искать файлы.",
       "ПОГОДА: если пользователь спрашивает о погоде, температуре, дожде, ветре и т.п. — НЕ выдумывай данные и НЕ предлагай запустить приложение. Верни action {\"type\":\"weather\",\"city\":\"<город из вопроса или 'Ташкент', если город не назван>\"} и reply «Сейчас узнаю погоду.»",
@@ -1396,6 +1418,47 @@ export class AssistantBrain {
     const metaOutcome = this.matchMetaAlgorithms(text);
     if (metaOutcome) return metaOutcome;
 
+    // 1c. «запиши заметку: …» / «сохрани в память: …» — save a text note.
+    // NB: `\w` doesn't match Cyrillic without the `u` flag, so use [а-яё]*.
+    const noteIntent = raw.match(
+      /(?:^|\s)(?:запиши|сохрани|добавь)\s+(?:себе\s+)?(?:в\s+)?(?:заметк[а-яё]*|в память|в мозг)\s*[:,\-]?\s*(.+)/i,
+    );
+    if (noteIntent) {
+      const body = noteIntent[1].trim();
+      if (body.length >= 5) {
+        return {
+          handled: true,
+          reply: "Записал заметку.",
+          action: { kind: "learn-text", text: body },
+        };
+      }
+    }
+
+    // 1c. «изучи весь сайт <url>» / «просканируй сайт <url>» — full-site crawl.
+    const siteIntent = raw.match(/(?:^|\s)(изучи весь сайт|просканируй сайт|изучи весь|просканируй)\s+(https?:\/\/\S+)/i);
+    if (siteIntent) {
+      const url = siteIntent[2].replace(/[.,;:!?]+$/, "");
+      return {
+        handled: true,
+        reply: "📡 Изучаю ваш сайт — все страницы и изображения. Это может занять время.",
+        action: { kind: "learn-site", url },
+      };
+    }
+
+    // 1c. «изучи картинку <url>» / «изучи <image-url>» — learn an image.
+    // NB: `\w` doesn't match Cyrillic without the `u` flag, so use [а-яё]*.
+    const imageIntent = raw.match(
+      /(?:^|\s)(?:изучи|прочитай|проанализируй)\s+(?:картинк[а-яё]*|изображени[а-яё]*|фото[а-яё]*)\s+(?:по ссылке\s+)?(https?:\/\/\S+)/i,
+    );
+    if (imageIntent) {
+      const url = imageIntent[1].replace(/[.,;:!?]+$/, "");
+      return {
+        handled: true,
+        reply: "📡 Изучаю изображение…",
+        action: { kind: "learn-image", url },
+      };
+    }
+
     // 1c. «изучи <url>» / «прочитай <url>» — learn a web page into a note.
     const urlIntent = raw.match(/(?:^|\s)(изучи|прочитай|выучи|запомни|загрузи)\s+(https?:\/\/\S+)/i);
     if (urlIntent) {
@@ -1403,6 +1466,13 @@ export class AssistantBrain {
       const opens = (url.match(/\(/g) || []).length;
       const closes = (url.match(/\)/g) || []).length;
       if (closes > opens) url = url.replace(/\)+$/, "");
+      const existing = this.findNoteBySource(url);
+      if (existing) {
+        return {
+          handled: true,
+          reply: `⚠️ Страница уже полностью изучена: «${existing.topic}». Если хотите изучить её заново или весь сайт — скажите «изучи весь сайт ${url}».`,
+        };
+      }
       return {
         handled: true,
         reply: `Изучаю страницу. Это займёт несколько секунд.`,
@@ -1524,7 +1594,10 @@ export class AssistantBrain {
             templateMatched = new RegExp(algo.pattern, "i").test(text);
           } catch { /* invalid regex */ }
         } else {
-          templateMatched = true;
+          // A template with no pattern must NOT act as a catch-all that
+          // matches every query (auto-learned empty patterns swallowed all
+          // skill requests before the executor could run).
+          templateMatched = false;
         }
         if (templateMatched) {
           // Replace {query} placeholder in template with the user's query.
@@ -1811,7 +1884,11 @@ export class AssistantBrain {
         action: { kind: "weather", city: extractWeatherCity(text) },
       };
     }
-    if (/привет|здравствуй|здорово|салют|хай|доброе (утро|день|вечер)/.test(text)) {
+    // Greetings only when the greeting word LEADS the message — otherwise a
+    // task like «напиши скрипт, который запишет фразу "привет"» is swallowed
+    // as a greeting and never reaches the skill executor. Cyrillic has no \b,
+    // so require a non-letter boundary after the greeting.
+    if (/^(?:привет|здравствуй(?:те)?|здорово|салют|хай|доброе\s+(?:утро|день|вечер))(?!\p{L})/iu.test(text)) {
       return { handled: true, reply: pick(["Приветствую, сэр.", "Здравствуйте.", "Рад вас слышать."]) };
     }
     if (/как дела|как ты|как настроение|статус/.test(text)) {
@@ -1924,6 +2001,12 @@ export class AssistantBrain {
         return { handled: true, reply: "Выполняю навык.", action };
       case "learn-url":
         return { handled: true, reply: "Изучаю страницу…", action };
+      case "learn-site":
+        return { handled: true, reply: "📡 Изучаю сайт — это займёт время.", action };
+      case "learn-image":
+        return { handled: true, reply: "📡 Изучаю изображение…", action };
+      case "learn-text":
+        return { handled: true, reply: "Запоминаю текст…", action };
       case "image":
         return { handled: true, reply: "Генерирую изображение…", action };
       case "search":
@@ -1944,6 +2027,8 @@ export class AssistantBrain {
         return { handled: true, reply: `Ищу файл «${action.query}»…`, action };
       case "music-search":
         return { handled: true, reply: `Ищу «${action.query}» в Яндекс Музыке.`, action };
+      case "n8n_trigger":
+        return { handled: true, reply: `Запускаю сценарий n8n «${action.actionId}».`, action };
     }
   }
 

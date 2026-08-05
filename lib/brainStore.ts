@@ -20,6 +20,9 @@ const MAX_BYTES = 5 * 1024 * 1024;
 
 let writeQueue: Promise<unknown> = Promise.resolve();
 
+/** In-memory cache of the latest brain snapshot (avoids repeated disk reads). */
+let brainCache: BrainSnapshot | null = null;
+
 /**
  * Ids (or fact strings) recently deleted by one writer, with timestamps. A
  * stale writer that still holds such an item must not resurrect it, so commits
@@ -58,21 +61,28 @@ function enqueue<T>(task: () => Promise<T>): Promise<T> {
 }
 
 async function readSnapshot(): Promise<BrainSnapshot | null> {
+  if (brainCache) return brainCache;
   try {
     const raw = await fs.readFile(BRAIN_FILE, "utf-8");
     const parsed = JSON.parse(raw) as BrainSnapshot;
-    if (parsed && parsed.version === 1) return parsed;
+    if (parsed && parsed.version === 1) {
+      brainCache = parsed;
+      return parsed;
+    }
   } catch {
     // No file / corrupt — treat as empty.
   }
   return null;
 }
 
-/** Latest brain state from disk (no writes, no merges). */
+/** Latest brain state from disk (no writes, no merges). Returns a clone. */
 export async function loadBrain(): Promise<AssistantBrain> {
   const brain = new AssistantBrain();
   const snapshot = await readSnapshot();
-  if (snapshot) brain.hydrate(snapshot);
+  if (snapshot) {
+    // Return a clone so mutations don't affect the cache
+    brain.hydrate({ ...snapshot, rules: [...snapshot.rules], facts: [...snapshot.facts], skills: [...snapshot.skills], notes: [...snapshot.notes] });
+  }
   // Load active meta-algorithms into the brain.
   try {
     const metaStore = await readMetaStore();
@@ -81,7 +91,7 @@ export async function loadBrain(): Promise<AssistantBrain> {
   return brain;
 }
 
-/** Raw snapshot for /api/brain GET. */
+/** Raw snapshot for /api/brain GET (from cache or disk). */
 export async function readBrainSnapshot(): Promise<BrainSnapshot | null> {
   return readSnapshot();
 }
@@ -93,6 +103,7 @@ async function writeSnapshot(snapshot: BrainSnapshot): Promise<void> {
   }
   await fs.mkdir(path.dirname(BRAIN_FILE), { recursive: true });
   await fs.writeFile(BRAIN_FILE, payload, "utf-8");
+  brainCache = snapshot;
 }
 
 /**

@@ -15,6 +15,7 @@ import {
   fuzzyFind as catalogFuzzyFind,
   listCatalog,
   listForPrompt,
+  bestMatch,
 } from "@/lib/skillCatalog";
 import { commitBrain, loadBrain } from "@/lib/brainStore";
 import { metaEngine } from "@/lib/metaLearning";
@@ -40,6 +41,11 @@ import {
 import { answerAbilityQuery } from "@/lib/serverAbility";
 import { launchApp, openViaShell, SAFE_URL } from "@/lib/launcher";
 import { executeSkill } from "@/lib/skillRunner";
+import { getSystemContext } from "@/lib/systemContext";
+import { N8N_ACTIONS, buildN8nPayload, n8nActionsPrompt } from "@/lib/n8n/config";
+import { triggerN8nWebhook } from "@/lib/n8n/client";
+import { startStudy } from "@/lib/studyJobs";
+import { fetchPageContent } from "@/lib/pageVision";
 
 /**
  * Server-side assistant core (LOCALHOST-only). The Telegram bot POSTs user
@@ -70,7 +76,71 @@ function isLocalRequest(req: NextRequest): boolean {
 }
 
 /** How to call the LLM chain for this request (which Gemini key, if any). */
-export type CloudOpts = { geminiKey?: string; skipGemini?: boolean };
+export type CloudOpts = { geminiKey?: string; skipGemini?: boolean; model?: string; provider?: "gemini" | "ollama" | "groq" };
+
+/** Stronger model for the skill executor loop (flash-lite derails on the JSON contract). */
+const EXECUTOR_MODEL = "gemini-3.5-flash";
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Retry transient 429 rate limits (groq TPM windows free up within seconds).
+ * gemini 429 = exhausted quota, so it is never retried here.
+ */
+async function with429Retry(provider: string, fn: () => Promise<string>): Promise<string> {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const wait = /try again in ([0-9.]+)s/i.exec(msg);
+      if (provider !== "gemini" && attempt < 2 && /429|rate limit|rate_limit|try again in/i.test(msg)) {
+        attempt += 1;
+        await sleep(attempt === 1 ? (wait ? Number(wait[1]) * 1000 + 1000 : 7000) : 15000);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Executor factory with pin-once semantics: the skill loop should run on a
+ * SINGLE provider end-to-end, or round N (a weak model) silently undoes
+ * rounds 1..N-1. Prefer the local unlimited model (ollama / qwen3:14b) for
+ * deterministic latency; groq is the quality fallback; gemini is dead (quota)
+ * and only a last resort. If the pinned provider dies mid-run, the pin is
+ * cleared so the next provider in the order gets a chance instead of throwing
+ * «all providers unavailable» while ollama is still healthy.
+ */
+function makeExecutorComplete(cloudOpts: CloudOpts) {
+  const failed: Set<string> = new Set();
+  let pin: "gemini" | "groq" | "ollama" | undefined;
+  const order: Array<"gemini" | "groq" | "ollama"> = ["ollama", "groq", "gemini"];
+  return async (msgs: Parameters<typeof completeCloud>[0]): Promise<string> => {
+    for (const p of order) {
+      if (pin) {
+        if (p !== pin) continue;
+      } else if (failed.has(p)) {
+        continue;
+      }
+      try {
+        const out = await with429Retry(p, () =>
+          completeCloud(msgs, { ...cloudOpts, model: EXECUTOR_MODEL, provider: p }),
+        );
+        if (!pin) console.log(`[skill-executor] pinned ${p}`);
+        pin = p;
+        return out;
+      } catch (err) {
+        failed.add(p);
+        if (pin === p) pin = undefined;
+        console.warn(`[skill-executor] ${p} failed, switching:`, err);
+      }
+    }
+    throw new Error("все провайдеры исполнителя недоступны");
+  };
+}
 
 /** Executor contexts for catalog skills awaiting owner approval (safe:false). */
 const skillRunContexts = new Map<string, { slug: string; name: string; chatId: string }>();
@@ -79,6 +149,7 @@ const skillRunContexts = new Map<string, { slug: string; name: string; chatId: s
 async function runSkillDispatch(
   brain: AssistantBrain,
   name: string,
+  userText: string,
   baseUrl: string,
   chatKey: string,
   cloudOpts: CloudOpts,
@@ -87,7 +158,14 @@ async function runSkillDispatch(
   if (screen) {
     return { reply: await executeSkill(brain, screen.id, baseUrl) };
   }
-  const cat = await catalogFuzzyFind(name);
+  // The LLM picks the skill name, but it's weak at choosing (gemini quota
+  // dead → groq/ollama). Resolve against the ORIGINAL user text instead,
+  // where the description+aliases overlap is decisive (data vs python).
+  const byQuery = await bestMatch(userText || name);
+  const cat =
+    byQuery.skill && (byQuery.score >= 0.3 || !(await catalogFuzzyFind(name)))
+      ? byQuery.skill
+      : await catalogFuzzyFind(name);
   if (cat) {
     if (!cat.safe) {
       const info = await createPending("run", { cmd: `skill:${cat.slug}`, chatId: chatKey });
@@ -97,9 +175,9 @@ async function runSkillDispatch(
         needsApproval: { id: info.id, description: info.description },
       };
     }
-    const res = await executeCatalogSkill(cat, name, {
+    const res = await executeCatalogSkill(cat, userText || name, {
       chatId: chatKey,
-      complete: (msgs) => completeCloud(msgs as Parameters<typeof completeCloud>[0], cloudOpts),
+      complete: makeExecutorComplete(cloudOpts),
     });
     return { reply: res.reply };
   }
@@ -124,19 +202,50 @@ function parseJSONObject(content: string): Record<string, unknown> | null {
   return null;
 }
 
-function stripHtml(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+/**
+ * Parse JSON from LLM response with one retry on failure. If the first parse
+ * fails, asks the LLM to fix formatting and retries once.
+ */
+async function parseWithRetry(
+  content: string,
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+  cloudOpts: CloudOpts,
+): Promise<Record<string, unknown> | null> {
+  const first = parseJSONObject(content);
+  if (first) return first;
+
+  // Retry: ask LLM to fix the formatting
+  try {
+    const retryMessages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+      ...messages,
+      { role: "user", content: `Исправь форматирование и верни строго валидный JSON. Вот твой предыдущий ответ:\n${content.slice(0, 2000)}` },
+    ];
+    const retryResult = await completeCloud(retryMessages, cloudOpts);
+    return parseJSONObject(retryResult);
+  } catch {
+    return null;
+  }
 }
 
 /** Caption the user wants drawn on the image («с текстом "Привет"» …). */
 function extractCaptionText(raw: string): string | undefined {
   const m = raw.match(/(?:с текстом|с надписью|с подписью|надпись|подпись)\s*(?:["«']?)([^»"'»«\n]{1,60})/i);
   return m?.[1]?.trim() || undefined;
+}
+
+/**
+ * Clamp an LLM-built n8n payload: plain object, at most 20 keys, string values
+ * capped at 400 chars. Blocks runaway/injected bodies while keeping numbers.
+ */
+function sanitizeN8nPayload(payload: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!payload) return {};
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(payload)) {
+    if (Object.keys(out).length >= 20) break;
+    if (typeof v === "string") out[k] = v.slice(0, 400);
+    else if (typeof v === "number" || typeof v === "boolean") out[k] = v;
+  }
+  return out;
 }
 
 /**
@@ -261,7 +370,7 @@ async function executeHandledAction(
   brain: AssistantBrain,
   action: AssistantAction,
   baseUrl: string,
-  ctx: { chatKey: string; cloudOpts: CloudOpts },
+  ctx: { chatKey: string; cloudOpts: CloudOpts; userText?: string },
 ): Promise<{
   reply: string;
   image?: { b64: string; mime: string };
@@ -282,7 +391,14 @@ async function executeHandledAction(
     }
 
     case "run-skill": {
-      const dispatched = await runSkillDispatch(brain, action.skillId, baseUrl, ctx.chatKey, ctx.cloudOpts);
+      const dispatched = await runSkillDispatch(
+        brain,
+        action.skillId,
+        ctx.userText || action.skillId,
+        baseUrl,
+        ctx.chatKey,
+        ctx.cloudOpts,
+      );
       return {
         reply: dispatched.reply,
         ...(dispatched.needsApproval ? { needsApproval: dispatched.needsApproval } : {}),
@@ -310,9 +426,20 @@ async function executeHandledAction(
       return { reply: `Сейчас в ${data.city}: ${data.temp}°, ${data.condition ?? ""}.${feels}` };
     }
 
+    case "learn-text": {
+      const body = action.text.trim();
+      if (body.length < 10) return { reply: "Слишком короткий текст для изучения." };
+      const topic = body.slice(0, 90) + (body.length > 90 ? "…" : "");
+      brain.addNote({ topic, summary: body.slice(0, 3000), keyPoints: [], source: "manual" });
+      await commitBrain(brain, snapshotIds(brain.snapshot()));
+      return { reply: `Запомнил: «${topic}».` };
+    }
+
     case "learn-url":
+    case "learn-site":
+    case "learn-image":
     case "image":
-      // Handled by the caller (learn-url) / only produced by LLM escalation (image).
+      // Handled by the caller (learn-url/site/image) / only produced by LLM escalation (image).
       return { reply: "" };
 
     case "start-lesson":
@@ -360,10 +487,18 @@ async function executeHandledAction(
       return { reply: ok ? "Переключаю размер окна." : "Не удалось найти окно." };
     }
     case "chain": {
+      const MAX_CHAIN = 6;
+      const actions = action.actions.slice(0, MAX_CHAIN);
       const results: string[] = [];
-      for (const sub of action.actions) {
-        const r = await executeHandledAction(brain, sub, baseUrl, ctx);
-        if (r.reply) results.push(r.reply);
+      for (let i = 0; i < actions.length; i++) {
+        if (i > 0) await new Promise((r) => setTimeout(r, 600));
+        try {
+          const r = await executeHandledAction(brain, actions[i], baseUrl, ctx);
+          if (r.reply) results.push(r.reply);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          results.push(`Ошибка шага ${i + 1}: ${msg}`);
+        }
       }
       return { reply: results.join(" → ") || "Цепочка выполнена." };
     }
@@ -380,9 +515,21 @@ async function executeHandledAction(
       return { reply: `Локально ничего не нашёл. Открываю поиск в Google Картинках.` };
     }
     case "music-search": {
-      const url = `https://music.yandex.ru/search?text=${encodeURIComponent(action.query)}`;
-      openViaShell(url);
-      return { reply: `Ищу «${action.query}» в Яндекс Музыке.` };
+      const { playInYandexMusic } = await import("@/lib/musicPlayer");
+      const res = await playInYandexMusic(action.query, baseUrl);
+      return { reply: res.reply };
+    }
+    case "n8n_trigger": {
+      const target = N8N_ACTIONS.find((a) => a.id === action.actionId);
+      if (!target || !target.webhookUrl) {
+        return { reply: `Ошибка: сценарий n8n «${action.actionId}» не найден или не настроен.` };
+      }
+      const payload = sanitizeN8nPayload(action.payload);
+      const result = await triggerN8nWebhook(target.webhookUrl, buildN8nPayload(target.id, payload));
+      if (!result.success) {
+        return { reply: `Не удалось запустить сценарий n8n: ${result.error ?? "неизвестная ошибка"}.` };
+      }
+      return { reply: `Сценарий n8n «${target.name}» успешно запущен.` };
     }
   }
 }
@@ -416,7 +563,7 @@ export async function POST(req: NextRequest) {
       const opts: CloudOpts = g.provider === "gemini" ? { geminiKey: g.key } : { skipGemini: true };
       const res = await executeCatalogSkill(cat, skillCtx.name, {
         chatId: skillCtx.chatId,
-        complete: (msgs) => completeCloud(msgs as Parameters<typeof completeCloud>[0], opts),
+        complete: makeExecutorComplete(opts),
       });
       return NextResponse.json({ reply: res.reply });
     }
@@ -472,6 +619,27 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // Full-site crawl / image study → background job; the bot polls it.
+    if (outcome.action?.kind === "learn-site" || outcome.action?.kind === "learn-image") {
+      try {
+        const job = await startStudy({
+          chatId,
+          isOwner,
+          type: outcome.action.kind === "learn-site" ? "site" : "image",
+          content: outcome.action.url,
+        });
+        return NextResponse.json({
+          reply: outcome.reply,
+          studyJobId: job.id,
+          provider: null,
+          ...(gemini.note ? { note: gemini.note } : {}),
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return NextResponse.json({ reply: `Не удалось запустить изучение: ${message}.`, provider: null });
+      }
+    }
+
     // Learn a URL server-side (Telegram path). YouTube links use the full
     // transcript (chunked, everything said in the video); other pages get the
     // usual page-text compression.
@@ -492,19 +660,9 @@ export async function POST(req: NextRequest) {
           }
         }
         if (!isVideo) {
-          const res = await fetch(outcome.action.url, {
-            signal: AbortSignal.timeout(30_000),
-            cache: "no-store",
-            headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" },
-            redirect: "follow",
-          });
-          if (!res.ok) {
-            console.log("[learn-url] fetch fail", res.status, res.statusText, "url:", res.url, "req:", outcome.action.url);
-            throw new Error(`HTTP ${res.status}`);
-          }
-          const html = await res.text();
-          pageTitle = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/\s+/g, " ").trim() || "";
-          pageText = stripHtml(html);
+          const page = await fetchPageContent(outcome.action.url, { chatId, isOwner });
+          pageText = page.text;
+          pageTitle = page.title ?? "";
         }
         const note = await buildStudyNote({
           text: pageText.slice(0, 400_000),
@@ -545,6 +703,7 @@ export async function POST(req: NextRequest) {
       const executed = await executeHandledAction(brain, outcome.action, baseUrl, {
         chatKey,
         cloudOpts,
+        userText: text,
       });
       await commitBrain(brain, baseIds);
       const reply = executed.image
@@ -564,6 +723,41 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ reply, provider: null });
   }
 
+  // Deterministic skill gate: when the user text strongly matches a sandbox
+  // SKILL.md catalog skill AND the request is an imperative task, dispatch it
+  // WITHOUT asking the LLM escalate (gemini quota dead → groq parrots its
+  // capabilities instead of returning run-skill JSON, so the executor never
+  // fires). Long verbose requests dilute the fuzzy ratio (measured 0.40 for a
+  // full plot request), and meta-questions about skills score identically —
+  // so a bare threshold can't separate them: require a leading task verb too.
+  // Only script skills (python/data) are gated; knowledge skills (pdf/docx/
+  // image-style/…) keep going through the escalate, which knows how to answer.
+  const directSkill = await bestMatch(visibleText);
+  const GATE_SKILLS = new Set(["python", "data"]);
+  const TASK_VERB_RE =
+    /^(?:постро(?:й|ить)|нарису(?:й|ть)|напиш(?:и|ть)|созда(?:й|ть)|сдела(?:й|ть)|вычисл(?:и|ть)|рассчита(?:й|ть)|посчита(?:й|ть)|проанализиру(?:й|ть)|просканиру(?:й|ть)|запиш(?:и|ть)|прочита(?:й|ть)|реш(?:и|ить)|преобразу(?:й|ть)|конвертиру(?:й|ть)|провер(?:ь|ить)|запуст(?:и|ить)|сохран(?:и|ить))(?!\p{L})/iu;
+  if (
+    directSkill.skill &&
+    directSkill.score >= 0.3 &&
+    GATE_SKILLS.has(directSkill.skill.slug) &&
+    TASK_VERB_RE.test(visibleText.trim())
+  ) {
+    const dispatched = await runSkillDispatch(
+      brain,
+      directSkill.skill.name,
+      visibleText,
+      baseUrl,
+      chatKey,
+      cloudOpts,
+    );
+    await commitBrain(brain, baseIds);
+    return NextResponse.json({
+      reply: dispatched.reply,
+      ...(dispatched.needsApproval ? { needsApproval: dispatched.needsApproval } : {}),
+      provider: null,
+    });
+  }
+
   // Unknown → ask the best available local/cloud model, with recent dialog
   // history as context so follow-ups («сделай его сочнее») stay in topic.
   try {
@@ -572,10 +766,12 @@ export async function POST(req: NextRequest) {
     const systemContent =
       brain.buildSystemPrompt(visibleText, { brief: body?.mode === "browser" }) +
       (catalogList
-        ? `\n\nВНЕШНИЕ НАВЫКИ (SKILL.md):\n${catalogList}\nЕсли запрос — работа с файлами/документами (PDF/XLSX/DOCX/PPTX), системный отчёт или стиль изображения — верни action {"type":"run-skill","skill":"<точное имя>"} для подходящего внешнего навыка.`
+        ? `\n\nВНЕШНИЕ НАВЫКИ (SKILL.md):\n${catalogList}\nЕсли запрос — работа с файлами/документами (PDF/XLSX/DOCX/PPTX), системный отчёт, стиль изображения или запуск/написание Python-кода и вычисления — верни action {"type":"run-skill","skill":"<точное имя>"} для подходящего внешнего навыка.`
         : "") +
       (await autonomySystemNote()) +
-      (await learnedFactsSystemNote());
+      (await learnedFactsSystemNote()) +
+      n8nActionsPrompt() +
+      `\n\n${await getSystemContext()}`;
     const messages = [
       { role: "system" as const, content: systemContent },
       ...history.map((h) => ({
@@ -594,7 +790,7 @@ export async function POST(req: NextRequest) {
       }
       throw err;
     }
-    const parsed = parseJSONObject(result);
+    const parsed = await parseWithRetry(result, messages, cloudOpts);
 
     const reply =
       typeof parsed?.reply === "string" && parsed.reply.trim() ? parsed.reply.trim() : "Выполнено.";
@@ -649,7 +845,7 @@ export async function POST(req: NextRequest) {
       } else {
         const llmAction = normalizeLLMAction(parsed.action);
         if (llmAction) {
-          const executed = await executeHandledAction(brain, llmAction, baseUrl, { chatKey, cloudOpts });
+          const executed = await executeHandledAction(brain, llmAction, baseUrl, { chatKey, cloudOpts, userText: text });
           if (executed.reply) actionReply = executed.reply;
           if (executed.needsApproval) needsApproval = executed.needsApproval;
           if (executed.image) image = executed.image;

@@ -60,7 +60,9 @@ function extractJsonObject(text: string): Record<string, unknown> | null {
 
 function num(v: unknown): number | null {
   const n = Number(v);
-  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : null;
+  // Accept relative (0..1) AND absolute pixel coordinates — resolveAndAct
+  // normalizes pixels via the screenshot dimensions right after parsing.
+  return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
 function toPoint(o: unknown): ClickPoint | null {
@@ -111,6 +113,16 @@ export interface AIClickResult {
   raw: string;
 }
 
+/** Normalize pixel coordinates (Gemini often returns pixels, not 0..1)
+ *  using the downscaled screenshot dimensions returned by /api/screenshot. */
+function normalizePoints(points: ClickPoint[], width: number, height: number): ClickPoint[] {
+  if (!width || !height) return points;
+  return points.map((p) => ({
+    x: p.x > 1 ? p.x / (width - 1) : p.x,
+    y: p.y > 1 ? p.y / (height - 1) : p.y,
+  }));
+}
+
 /** Capture screen → ask vision → execute the click(s). */
 export async function resolveAndAct(
   prompt: string,
@@ -118,7 +130,9 @@ export async function resolveAndAct(
   baseUrl: string,
 ): Promise<AIClickResult> {
   const shotRes = await fetch(`${baseUrl}/api/screenshot`, { signal: AbortSignal.timeout(30_000) });
-  const shot = (await shotRes.json().catch(() => null)) as { b64?: string; mime?: string; error?: string } | null;
+  const shot = (await shotRes.json().catch(() => null)) as
+    | { b64?: string; mime?: string; error?: string; width?: number; height?: number }
+    | null;
   if (!shotRes.ok || !shot?.b64) {
     throw new Error(`не удалось сделать скриншот: ${shot?.error ?? shotRes.status}`);
   }
@@ -152,6 +166,13 @@ export async function resolveAndAct(
   const resolved = parseClickReply(data.content, mode);
   if (!resolved) {
     throw new Error(`модель не дала координаты: ${data.content.slice(0, 160)}`);
+  }
+
+  resolved.points = normalizePoints(resolved.points, shot.width ?? 0, shot.height ?? 0);
+  if (resolved.drag) {
+    const norm = normalizePoints([{ x: resolved.drag.x1, y: resolved.drag.y1 }], shot.width ?? 0, shot.height ?? 0);
+    const normEnd = normalizePoints([{ x: resolved.drag.x2, y: resolved.drag.y2 }], shot.width ?? 0, shot.height ?? 0);
+    resolved.drag = { x1: norm[0].x, y1: norm[0].y, x2: normEnd[0].x, y2: normEnd[0].y };
   }
 
   if (mode === "drag" && resolved.drag) {

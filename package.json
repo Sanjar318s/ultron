@@ -10,6 +10,7 @@
     "self-test": "node scripts/self-test.mjs"
   },
   "dependencies": {
+    "@dvxch/yandex-music": "^0.3.0",
     "@mediapipe/tasks-vision": "^0.10.35",
     "@mlc-ai/web-llm": "^0.2.84",
     "edge-tts-universal": "^1.4.0",
