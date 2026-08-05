@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdtempSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, readdirSync, writeFileSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -10,7 +10,7 @@ import {
   stripLaunchQualifiers,
 } from "../lib/commandSplit.ts";
 import { findSiteInPhrase, resolveSite } from "../lib/sites.ts";
-import { bestMatch } from "../lib/skillCatalog.ts";
+import { bestMatch, execute as executeSkill, workDirFor } from "../lib/skillCatalog.ts";
 import { N8N_ACTIONS } from "../lib/n8n/config.ts";
 
 /**
@@ -139,6 +139,89 @@ export async function runSelfTests({ live = false } = {}) {
     matchPy.skill?.slug === "python",
     `got ${matchPy.skill?.slug ?? "none"} score=${matchPy.score.toFixed(2)}`,
   );
+
+  // 1d. Skill executor round-trip with a SCRIPTED mock LLM (no network). Proves:
+  //     - the honest planner: a done claiming a missing file triggers a
+  //       corrective round instead of lying (reply names the real file);
+  //     - `>` inside quoted --raw content is data, not a blocked redirect;
+  //     - a python run's output file lands in artifacts; .run.log never does.
+  const WRITE_HELPER = path.join(process.cwd(), "scripts", "sandbox-write.mjs").replace(/\\/g, "/");
+  const fakeSkill = {
+    slug: "selftest",
+    name: "Самотест",
+    description: "self-test",
+    safe: true,
+    body: "Выполни задачу в рабочей папке.",
+    dir: path.join(process.cwd(), "skills", "python"),
+  };
+  const skillDirs = [];
+
+  const skillChat = (tag) => {
+    const id = `selftest-${tag}-${Date.now()}`;
+    skillDirs.push(workDirFor(id));
+    return id;
+  };
+  try {
+    const stepsHonest = [
+      JSON.stringify({ done: true, result: "создал ghost.txt" }),
+      JSON.stringify({ cmd: `node "${WRITE_HELPER}" "real.txt" --raw "ok"` }),
+      JSON.stringify({ done: true, result: "создал real.txt" }),
+    ];
+    let iHonest = 0;
+    const resHonest = await executeSkill(fakeSkill, "создай real.txt", {
+      chatId: skillChat("honest"),
+      complete: async () => stepsHonest[Math.min(iHonest++, stepsHonest.length - 1)] ?? "{}",
+    });
+    check(
+      "skill honest-planner correction",
+      resHonest.ok &&
+        resHonest.verified === true &&
+        resHonest.artifacts?.some((a) => a.name === "real.txt") &&
+        (resHonest.reply ?? "").includes("real.txt") &&
+        !(resHonest.reply ?? "").includes("ghost.txt"),
+      `ok=${resHonest.ok} verified=${resHonest.verified} rounds=${resHonest.rounds} artifacts=${JSON.stringify(resHonest.artifacts?.map((a) => a.name))} reply=${JSON.stringify((resHonest.reply ?? "").slice(0, 80))}`,
+    );
+
+    const stepsQuote = [
+      JSON.stringify({ cmd: `node "${WRITE_HELPER}" "data.txt" --raw "привет>5"` }),
+      JSON.stringify({ done: true, result: "записал привет>5 в data.txt" }),
+    ];
+    let iQuote = 0;
+    const qChat = skillChat("quote");
+    const resQuote = await executeSkill(fakeSkill, "запиши в data.txt фразу привет>5", {
+      chatId: qChat,
+      complete: async () => stepsQuote[Math.min(iQuote++, stepsQuote.length - 1)] ?? "{}",
+    });
+    const quoteContent = readFileSync(path.join(workDirFor(qChat), "data.txt"), "utf8");
+    check(
+      "skill quote-safe > data",
+      resQuote.ok && quoteContent === "привет>5" && resQuote.artifacts?.some((a) => a.name === "data.txt"),
+      `content=${JSON.stringify(quoteContent)} artifacts=${JSON.stringify(resQuote.artifacts?.map((a) => a.name))}`,
+    );
+
+    const stepsPy = [
+      JSON.stringify({ cmd: `node "${WRITE_HELPER}" "work.py" --raw "open('out.txt','w',encoding='utf-8').write('py-ok')"` }),
+      JSON.stringify({ cmd: `python "work.py"` }),
+      JSON.stringify({ done: true, result: "скрипт выполнен, результат в out.txt" }),
+    ];
+    let iPy = 0;
+    const pyChat = skillChat("py");
+    const resPy = await executeSkill(fakeSkill, "запусти python скрипт который создаст out.txt", {
+      chatId: pyChat,
+      complete: async () => stepsPy[Math.min(iPy++, stepsPy.length - 1)] ?? "{}",
+    });
+    const outArt = resPy.artifacts?.find((a) => a.name === "out.txt");
+    check(
+      "skill python artifact collected",
+      resPy.ok &&
+        Boolean(outArt) &&
+        outArt.rel.startsWith("data/skill-work/") &&
+        !resPy.artifacts?.some((a) => a.name === ".run.log"),
+      `artifacts=${JSON.stringify(resPy.artifacts?.map((a) => a.name))}`,
+    );
+  } finally {
+    for (const dir of skillDirs) rmSync(dir, { recursive: true, force: true });
+  }
 
   // 2. Server reachability.
   const probe = await http("GET", `${SERVER}/api/tts`);

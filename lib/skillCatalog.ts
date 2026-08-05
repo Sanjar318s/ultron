@@ -275,6 +275,46 @@ function artifactKey(f: { rel: string; size: number; mtime: number }): string {
   return `${f.rel}\0${f.size}\0${f.mtime}`;
 }
 
+// --- Honest result verification ---------------------------------------------
+// An executor model sometimes claims files it never created («сохранил в
+// result.csv», but the file isn't there). Before accepting {done}, cross-check
+// every file reference in the result against the actual workdir contents; if a
+// claimed file is missing, send one honest corrective round instead of lying
+// to the user. The final reply lists the files the run REALLY produced.
+
+const DELIVERABLE_EXT = new Set([
+  "png", "jpg", "jpeg", "gif", "webp", "txt", "csv", "md", "json", "html",
+  "pdf", "xlsx", "xls", "pptx", "docx", "zip", "py", "log",
+]);
+
+/** Filenames the model explicitly referenced in its done.result text. */
+function fileRefsFromResult(result: string): string[] {
+  const out = new Set<string>();
+  for (const t of String(result ?? "").split(/[\s,"'():«»“”]+/)) {
+    const clean = t.replace(/\\/g, "/").trim();
+    if (!clean) continue;
+    const base = (clean.split("/").pop() ?? clean).replace(/\.+$/, "");
+    const dot = base.lastIndexOf(".");
+    if (dot <= 0) continue;
+    if (DELIVERABLE_EXT.has(base.slice(dot + 1).toLowerCase())) out.add(base);
+  }
+  return [...out];
+}
+
+/** Which claimed files exist in the workdir (by basename) and which don't. */
+async function verifyResultFiles(workdir: string, result: string): Promise<{ missing: string[]; found: string[] }> {
+  const refs = fileRefsFromResult(result);
+  if (refs.length === 0) return { missing: [], found: [] };
+  const existing = new Set((await listDirFiles(workdir)).map((f) => path.basename(f.rel).toLowerCase()));
+  const missing: string[] = [];
+  const found: string[] = [];
+  for (const r of refs) {
+    if (existing.has(r.toLowerCase())) found.push(r);
+    else missing.push(r);
+  }
+  return { missing, found };
+}
+
 /** Command with quoted sections blanked — shell metacharacters inside `--raw`
  *  content (e.g. a `>` in the phrase to write) are DATA, not operators: spawn
  *  runs without a shell, so only unquoted occurrences are dangerous. */
@@ -418,6 +458,8 @@ export interface ExecuteResult {
   needsApproval?: { description: string };
   /** Files produced during this run (new workdir files, minus .run.log). */
   artifacts?: Artifact[];
+  /** True when every file the model claimed in its result actually exists. */
+  verified?: boolean;
 }
 
 export interface ExecuteOptions {
@@ -539,8 +581,24 @@ export async function execute(
         continue;
       }
       runLog(`[done] R${round + 1}: ${(parsed.result ?? "").slice(0, 300)}`);
+      const resultText = parsed.result || "Готово.";
+      const { missing } = await verifyResultFiles(workdir, resultText);
+      if (missing.length > 0) {
+        runLog(`[R${round + 1}] UNVERIFIED: ${missing.join(", ")}`);
+        messages.push({ role: "assistant", content: raw.slice(0, 1000) });
+        messages.push({
+          role: "user",
+          content: `Ты вернул done и утверждаешь, что создал: ${missing.join(", ")}. В рабочей папке ${workdir} этих файлов НЕТ. Покажи реальное содержимое (python: import os; print(os.listdir('.'))) и СОЗДАЙ недостающие файлы по-настоящему, затем верни done с подтверждением.`,
+        });
+        continue;
+      }
       const artifacts = await collectArtifacts(workdir, before);
-      return { ok: true, reply: parsed.result || "Готово.", rounds: round + 1, artifacts };
+      const unreported = artifacts.filter((a) => !resultText.toLowerCase().includes(a.name.toLowerCase())).map((a) => a.name);
+      let reply = resultText;
+      if (unreported.length > 0) {
+        reply += `\n📎 Созданные файлы: ${unreported.join(", ")}.`;
+      }
+      return { ok: true, reply, rounds: round + 1, artifacts, verified: true };
     }
     const cmd = parsed.cmd ?? "";
     const err = validateCommand(cmd);

@@ -161,7 +161,7 @@ async function runSkillDispatch(
   baseUrl: string,
   chatKey: string,
   cloudOpts: CloudOpts,
-): Promise<{ reply: string; needsApproval?: { id: string; description: string }; files?: WireFile[] }> {
+): Promise<{ reply: string; needsApproval?: { id: string; description: string }; files?: WireFile[]; verified?: boolean }> {
   const screen = brain.findSkill(name);
   if (screen) {
     return { reply: await executeSkill(brain, screen.id, baseUrl) };
@@ -187,7 +187,7 @@ async function runSkillDispatch(
       chatId: chatKey,
       complete: makeExecutorComplete(cloudOpts),
     });
-    return { reply: res.reply, files: res.artifacts };
+    return { reply: res.reply, files: res.artifacts, verified: res.verified };
   }
   return { reply: `Не нашёл навык «${name}». Скажите «какие уроки» — покажу список.` };
 }
@@ -384,6 +384,7 @@ async function executeHandledAction(
   image?: { b64: string; mime: string };
   needsApproval?: { id: string; description: string };
   files?: WireFile[];
+  verified?: boolean;
 }> {
   switch (action.kind) {
     case "launch": {
@@ -412,6 +413,7 @@ async function executeHandledAction(
         reply: dispatched.reply,
         ...(dispatched.needsApproval ? { needsApproval: dispatched.needsApproval } : {}),
         ...(dispatched.files && dispatched.files.length ? { files: dispatched.files } : {}),
+        ...(dispatched.verified !== undefined ? { verified: dispatched.verified } : {}),
       };
     }
 
@@ -575,7 +577,7 @@ export async function POST(req: NextRequest) {
         chatId: skillCtx.chatId,
         complete: makeExecutorComplete(opts),
       });
-      return NextResponse.json({ reply: res.reply, ...(res.artifacts?.length ? { files: res.artifacts } : {}) });
+      return NextResponse.json({ reply: res.reply, ...(res.artifacts?.length ? { files: res.artifacts } : {}), ...(res.verified !== undefined ? { verified: res.verified } : {}) });
     }
     const result = await approvePending(body.id);
     return NextResponse.json({ reply: result.reply });
@@ -765,6 +767,7 @@ export async function POST(req: NextRequest) {
       reply: dispatched.reply,
       ...(dispatched.needsApproval ? { needsApproval: dispatched.needsApproval } : {}),
       ...(dispatched.files && dispatched.files.length ? { files: dispatched.files } : {}),
+      ...(dispatched.verified !== undefined ? { verified: dispatched.verified } : {}),
       provider: null,
     });
   }
@@ -822,6 +825,7 @@ export async function POST(req: NextRequest) {
     let actionReply: string | undefined;
     let needsApproval: { id: string; description: string } | undefined;
     let files: WireFile[] | undefined;
+    let verified: boolean | undefined;
     if (parsed?.action != null) {
       const a = parsed.action as {
         type?: unknown;
@@ -862,6 +866,7 @@ export async function POST(req: NextRequest) {
           if (executed.needsApproval) needsApproval = executed.needsApproval;
           if (executed.image) image = executed.image;
           if (executed.files && executed.files.length) files = executed.files;
+          if (executed.verified !== undefined) verified = executed.verified;
         }
       }
     }
@@ -938,6 +943,7 @@ export async function POST(req: NextRequest) {
       provider: "server",
       needsApproval,
       ...(files && files.length ? { files } : {}),
+      ...(verified !== undefined ? { verified } : {}),
       ...(gemini.note ? { note: gemini.note } : {}),
     });
   } catch (err) {
