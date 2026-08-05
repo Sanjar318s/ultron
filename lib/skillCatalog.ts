@@ -199,6 +199,82 @@ export function workDirFor(chatId: string): string {
   return path.join(process.cwd(), "data", "skill-work", String(chatId).replace(/[^a-z0-9_-]/gi, ""));
 }
 
+/** Cap on files delivered to the user after a successful run. */
+const MAX_ARTIFACTS = 5;
+/** Telegram Bot API upload cap is 50MB; keep a safe margin. */
+const MAX_ARTIFACT_BYTES = 40 * 1024 * 1024;
+
+const ARTIFACT_MIME: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  txt: "text/plain",
+  md: "text/markdown",
+  csv: "text/csv",
+  json: "application/json",
+  html: "text/html",
+  log: "text/plain",
+  pdf: "application/pdf",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xls: "application/vnd.ms-excel",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  zip: "application/zip",
+};
+
+function mimeForRel(rel: string): string {
+  const ext = rel.split(".").pop()?.toLowerCase() ?? "";
+  return ARTIFACT_MIME[ext] ?? "application/octet-stream";
+}
+
+/** Recursive listing of a workdir: relative (slash-separated) paths + size + mtime. */
+async function listDirFiles(dir: string): Promise<Array<{ rel: string; abs: string; size: number; mtime: number }>> {
+  let entries: Array<{ name: string; isFile(): boolean }>;
+  try {
+    entries = await fs.readdir(dir, { recursive: true, withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out: Array<{ rel: string; abs: string; size: number; mtime: number }> = [];
+  for (const e of entries) {
+    if (!e.isFile()) continue;
+    const abs = path.join(dir, e.name);
+    try {
+      const st = await fs.stat(abs);
+      // Root-relative (ROOT = process.cwd()) so the Telegram bot can resolve
+      // the file as path.join(ROOT, rel) — the workdir is inside data/skill-work.
+      out.push({ rel: path.relative(process.cwd(), abs).split(path.sep).join("/"), abs, size: st.size, mtime: st.mtimeMs });
+    } catch {
+      // raced away
+    }
+  }
+  return out;
+}
+
+/** New files produced by this run, newest first, capped by count and size.
+ *  A file counts as new when it didn't exist before OR its size/mtime changed
+ *  (so a re-run overwriting plot.png still delivers the fresh artifact). */
+async function collectArtifacts(workdir: string, before: Set<string>): Promise<Artifact[]> {
+  const after = await listDirFiles(workdir);
+  return after
+    .filter(
+      (f) =>
+        path.basename(f.rel) !== ".run.log" &&
+        !before.has(artifactKey(f)) &&
+        f.size > 0 &&
+        f.size <= MAX_ARTIFACT_BYTES,
+    )
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, MAX_ARTIFACTS)
+    .map((f) => ({ rel: f.rel, name: path.basename(f.abs), size: f.size, mime: mimeForRel(f.rel) }));
+}
+
+function artifactKey(f: { rel: string; size: number; mtime: number }): string {
+  return `${f.rel}\0${f.size}\0${f.mtime}`;
+}
+
 /** Command with quoted sections blanked — shell metacharacters inside `--raw`
  *  content (e.g. a `>` in the phrase to write) are DATA, not operators: spawn
  *  runs without a shell, so only unquoted occurrences are dangerous. */
@@ -327,12 +403,21 @@ function runSandboxed(cmd: string, cwd: string): Promise<{ ok: boolean; code: nu
   });
 }
 
+export interface Artifact {
+  rel: string;
+  name: string;
+  size: number;
+  mime: string;
+}
+
 export interface ExecuteResult {
   ok: boolean;
   reply: string;
   /** Rounds of LLM/command interaction used. */
   rounds: number;
   needsApproval?: { description: string };
+  /** Files produced during this run (new workdir files, minus .run.log). */
+  artifacts?: Artifact[];
 }
 
 export interface ExecuteOptions {
@@ -383,6 +468,7 @@ export async function execute(
 ): Promise<ExecuteResult> {
   const workdir = workDirFor(opts.chatId || "general");
   await fs.mkdir(workdir, { recursive: true });
+  const before = new Set((await listDirFiles(workdir)).map(artifactKey));
   const runLog = (line: string) =>
     fs.appendFile(path.join(workdir, ".run.log"), `${line}\n`).catch(() => {});
 
@@ -405,7 +491,7 @@ export async function execute(
     "Разрешены ТОЛЬКО: python, py, node, pip. Запрещены: git, curl, powershell, cmd, удаление вне рабочей папки, перенаправления, подстановки, точки «..».",
     "КРИТИЧНО: задача пользователя должна быть РЕАЛЬНО решена — создан скрипт, получен вывод, результат проверен. Команды вроде «python --version» — это лишь проверка среды, это НЕ решение. НЕ возвращай {\"done\":true}, пока не получил конкретный итог по запросу пользователя (число, файл, текст ответа).",
     "Если ты создал файл-скрипт — ты ОБЯЗАН затем запустить его (python \"<файл>\"), дождаться вывода и привести этот вывод в done.result. Создание файла без запуска — это НЕ результат.",
-    "Вывод каждой команды вернётся тебе следующим сообщением. Максимум 6 команд. Действуй пошагово: сначала изучи скрипты и данные, потом выполняй, потом проверь результат.",
+    "Вывод каждой команды вернётся тебе следующим сообщением. Максимум " + `${MAX_ROUNDS}` + " команд. Действуй пошагово: сначала изучи скрипты и данные, потом выполняй, потом проверь результат.",
     "Если что-то не так — исправь и повтори. В конце верни done с понятным итогом.",
   ].join("\n");
 
@@ -453,7 +539,8 @@ export async function execute(
         continue;
       }
       runLog(`[done] R${round + 1}: ${(parsed.result ?? "").slice(0, 300)}`);
-      return { ok: true, reply: parsed.result || "Готово.", rounds: round + 1 };
+      const artifacts = await collectArtifacts(workdir, before);
+      return { ok: true, reply: parsed.result || "Готово.", rounds: round + 1, artifacts };
     }
     const cmd = parsed.cmd ?? "";
     const err = validateCommand(cmd);

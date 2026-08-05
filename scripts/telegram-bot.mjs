@@ -175,6 +175,38 @@ async function sendPhoto(chatId, b64, mime) {
   await fetch(`${API}/sendPhoto`, { method: "POST", body: fd });
 }
 
+async function sendDocument(chatId, absPath, name, caption) {
+  const buf = readFileSync(absPath);
+  const fd = new FormData();
+  fd.append("chat_id", String(chatId));
+  if (caption) fd.append("caption", String(caption).slice(0, 1024));
+  fd.append("document", new Blob([buf]), name || path.basename(absPath));
+  await fetch(`${API}/sendDocument`, { method: "POST", body: fd });
+}
+
+/** Deliver skill-run artifacts to the chat: images inline, everything else as documents. */
+async function deliverFiles(chatId, files) {
+  for (const f of Array.isArray(files) ? files.slice(0, 5) : []) {
+    if (!f || typeof f.rel !== "string") continue;
+    const name = f.name || path.basename(f.rel);
+    const abs = path.join(ROOT, f.rel);
+    try {
+      if (!existsSync(abs)) {
+        await sendText(chatId, `⚠️ Файл «${name}» уже удалён с диска (${f.rel}).`).catch(() => {});
+        continue;
+      }
+      const mime = f.mime || "application/octet-stream";
+      if (mime.startsWith("image/")) {
+        await sendPhoto(chatId, readFileSync(abs).toString("base64"), mime);
+      } else {
+        await sendDocument(chatId, abs, name, `📎 ${name}`);
+      }
+    } catch (err) {
+      await sendText(chatId, `⚠️ Не удалось отправить «${name}»: ${err.message}`).catch(() => {});
+    }
+  }
+}
+
 function splitText(text, max) {
   if (text.length <= max) return [text];
   const out = [];
@@ -413,6 +445,7 @@ async function serverControl(payload) {
 async function handleApprove(chatId, id) {
   const data = await serverControl({ action: "approve", id });
   await sendText(chatId, data?.reply ?? "Ошибка одобрения.");
+  if (data?.files?.length) await deliverFiles(chatId, data.files);
 }
 
 async function handleReject(chatId, id) {
@@ -494,6 +527,7 @@ async function chatWithAssistant(chatId, msg, text) {
   const joined = parts.length === 0 ? "Выполнено." : parts.join("\n\n");
   await finishStatus(chatId, statusId, joined);
   if (data.image) await sendPhoto(chatId, data.image.b64, data.image.mime);
+  if (data.files?.length) await deliverFiles(chatId, data.files);
   if (data.note) await sendText(chatId, data.note);
   hist.push({ role: "assistant", content: joined });
   if (hist.length > 16) hist.splice(0, hist.length - 16);

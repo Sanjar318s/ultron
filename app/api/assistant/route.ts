@@ -145,6 +145,14 @@ function makeExecutorComplete(cloudOpts: CloudOpts) {
 /** Executor contexts for catalog skills awaiting owner approval (safe:false). */
 const skillRunContexts = new Map<string, { slug: string; name: string; chatId: string }>();
 
+/** A file produced by a skill run, ready for the Telegram bot to upload. */
+export interface WireFile {
+  rel: string;
+  name: string;
+  size: number;
+  mime: string;
+}
+
 /** Dispatch a run-skill request: screen-learned skill wins, else SKILL.md catalog. */
 async function runSkillDispatch(
   brain: AssistantBrain,
@@ -153,7 +161,7 @@ async function runSkillDispatch(
   baseUrl: string,
   chatKey: string,
   cloudOpts: CloudOpts,
-): Promise<{ reply: string; needsApproval?: { id: string; description: string } }> {
+): Promise<{ reply: string; needsApproval?: { id: string; description: string }; files?: WireFile[] }> {
   const screen = brain.findSkill(name);
   if (screen) {
     return { reply: await executeSkill(brain, screen.id, baseUrl) };
@@ -179,7 +187,7 @@ async function runSkillDispatch(
       chatId: chatKey,
       complete: makeExecutorComplete(cloudOpts),
     });
-    return { reply: res.reply };
+    return { reply: res.reply, files: res.artifacts };
   }
   return { reply: `Не нашёл навык «${name}». Скажите «какие уроки» — покажу список.` };
 }
@@ -375,6 +383,7 @@ async function executeHandledAction(
   reply: string;
   image?: { b64: string; mime: string };
   needsApproval?: { id: string; description: string };
+  files?: WireFile[];
 }> {
   switch (action.kind) {
     case "launch": {
@@ -402,6 +411,7 @@ async function executeHandledAction(
       return {
         reply: dispatched.reply,
         ...(dispatched.needsApproval ? { needsApproval: dispatched.needsApproval } : {}),
+        ...(dispatched.files && dispatched.files.length ? { files: dispatched.files } : {}),
       };
     }
 
@@ -565,7 +575,7 @@ export async function POST(req: NextRequest) {
         chatId: skillCtx.chatId,
         complete: makeExecutorComplete(opts),
       });
-      return NextResponse.json({ reply: res.reply });
+      return NextResponse.json({ reply: res.reply, ...(res.artifacts?.length ? { files: res.artifacts } : {}) });
     }
     const result = await approvePending(body.id);
     return NextResponse.json({ reply: result.reply });
@@ -754,6 +764,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       reply: dispatched.reply,
       ...(dispatched.needsApproval ? { needsApproval: dispatched.needsApproval } : {}),
+      ...(dispatched.files && dispatched.files.length ? { files: dispatched.files } : {}),
       provider: null,
     });
   }
@@ -810,6 +821,7 @@ export async function POST(req: NextRequest) {
     let image: { b64: string; mime: string } | undefined;
     let actionReply: string | undefined;
     let needsApproval: { id: string; description: string } | undefined;
+    let files: WireFile[] | undefined;
     if (parsed?.action != null) {
       const a = parsed.action as {
         type?: unknown;
@@ -849,6 +861,7 @@ export async function POST(req: NextRequest) {
           if (executed.reply) actionReply = executed.reply;
           if (executed.needsApproval) needsApproval = executed.needsApproval;
           if (executed.image) image = executed.image;
+          if (executed.files && executed.files.length) files = executed.files;
         }
       }
     }
@@ -924,6 +937,7 @@ export async function POST(req: NextRequest) {
       image,
       provider: "server",
       needsApproval,
+      ...(files && files.length ? { files } : {}),
       ...(gemini.note ? { note: gemini.note } : {}),
     });
   } catch (err) {
