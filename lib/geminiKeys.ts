@@ -1,11 +1,21 @@
 /**
  * Gemini key pool for the Telegram brain.
  *
- * Env: GEMINI_KEYS_POOL (comma-separated). The FIRST TWO keys belong to the
- * owner (rotation: key #1 → key #2 → unlimited local qwen3). The remaining
- * keys form the free pool handed out to Telegram users first-come (one key
- * per user for life). When no GEMINI_KEYS_POOL is set, the owner falls back
- * to GEMINI_API_KEY and the user pool is empty.
+ * Env: GEMINI_KEYS_POOL (comma-separated). The first GEMINI_SYSTEM_KEYS keys
+ * (default 2) belong to the SYSTEM — they power the owner's chat AND every
+ * file-creation path (skill executor, image generation) via forceSystem,
+ * rotating least-recently-used so a long run spreads across several keys
+ * instead of drowning one. The remaining keys form the free pool handed out
+ * to Telegram users first-come (one key per user for life). When no
+ * GEMINI_KEYS_POOL is set, the system falls back to GEMINI_API_KEY and the
+ * user pool is empty.
+ *
+ * Complexity tiers (GEMINI_SYSTEM_KEYS must be >= 6 for the full ladder):
+ *   tier 0 (easy)    → the first 2 system keys rotate
+ *   tier 1 (medium)  → the first 4 system keys rotate
+ *   tier 2 (heavy)   → the first 6 system keys rotate
+ * If every key in the tier subset is cooling down, any other usable system
+ * key is used rather than going local (resilience over purity).
  *
  * Durable state lives in data/gemini-keys.json (gitignored): exhaustion
  * timestamps, per-user assignments, restore markers and pending note
@@ -60,6 +70,20 @@ interface KeyStateFile {
 
 let loadedState: KeyStateFile | null = null;
 
+/** How many leading pool keys are reserved for the SYSTEM (default 2). */
+export function systemKeyCount(): number {
+  const n = Number(process.env.GEMINI_SYSTEM_KEYS ?? "");
+  return Number.isInteger(n) && n >= 1 ? n : 2;
+}
+
+/** System keys engaged per complexity tier (easy → 2, medium → 4, heavy → 6). */
+export const TIER_KEY_COUNTS = [2, 4, 6] as const;
+
+/** Number of system keys the tier actually uses (capped by the system pool). */
+export function tierKeyCount(tier: 0 | 1 | 2, poolSize: number): number {
+  return Math.min(TIER_KEY_COUNTS[tier] ?? 2, poolSize);
+}
+
 function envPool(): string[] {
   const raw = (process.env.GEMINI_KEYS_POOL ?? "")
     .split(",")
@@ -73,8 +97,9 @@ function envPool(): string[] {
 
 function blankState(): KeyStateFile {
   const pool = envPool();
-  const ownerKeys = pool.slice(0, 2);
-  const userPoolKeys = pool.slice(2);
+  const sysCount = systemKeyCount();
+  const ownerKeys = pool.slice(0, sysCount);
+  const userPoolKeys = pool.slice(sysCount);
   return {
     owner: ownerKeys.map((key) => ({
       key,
@@ -199,17 +224,48 @@ function isUsable(rec: KeyRecord, now: number): boolean {
   return !isExhausted(rec, now) && !isInCooldown(rec, now);
 }
 
+/**
+ * Pick the least-recently-used key among the given records, or null when none
+ * is usable. `lastUsedAt` starts at 0 for fresh keys, so the first request
+ * takes key #1 and subsequent ones round-robin naturally.
+ */
+function pickLeastUsed(list: KeyRecord[], now: number): KeyRecord | null {
+  let chosen: KeyRecord | null = null;
+  for (const rec of list) {
+    if (!isUsable(rec, now)) continue;
+    if (!chosen || rec.lastUsedAt < chosen.lastUsedAt) chosen = rec;
+  }
+  return chosen;
+}
+
+export interface ResolveOptions {
+  /** Complexity tier 0/1/2 → uses only the first 2/4/6 system keys (LRU). */
+  tier?: 0 | 1 | 2;
+  /** Route through the SYSTEM pool even for a non-owner (file work). */
+  forceSystem?: boolean;
+}
+
 /** Pick the best currently-usable key for a chat; emits one-shot notes. */
-export async function resolveKey(chatId: string, isOwner: boolean): Promise<ResolveResult> {
+export async function resolveKey(
+  chatId: string,
+  isOwner: boolean,
+  opts: ResolveOptions = {},
+): Promise<ResolveResult> {
   const st = await loadState();
   const now = Date.now();
+  const useSystem = isOwner || opts.forceSystem === true;
 
-  if (isOwner) {
-    let chosen: KeyRecord | null = null;
+  if (useSystem) {
+    const tierCap = opts.tier ?? 0;
+    const subsetSize = tierKeyCount(tierCap, st.owner.length);
+    const subset = st.owner.slice(0, subsetSize);
+    let chosen = pickLeastUsed(subset, now);
+    // No usable key in the tier subset (all cooling/exhausted) → fall back to
+    // any other usable system key before giving up and going local.
+    if (!chosen) chosen = pickLeastUsed(st.owner, now);
     let allCooling = st.owner.length > 0;
     for (const rec of st.owner) {
       if (isUsable(rec, now)) {
-        chosen = rec;
         allCooling = false;
         break;
       } else if (isExhausted(rec, now)) {
@@ -293,9 +349,14 @@ export async function resolveKey(chatId: string, isOwner: boolean): Promise<Reso
 }
 
 /** Mark a key exhausted after a hard daily/token quota hit (dead until midnight). */
-export async function reportFailure(chatId: string, key: string, isOwner: boolean): Promise<void> {
+export async function reportFailure(
+  chatId: string,
+  key: string,
+  isOwner: boolean,
+  opts: ResolveOptions = {},
+): Promise<void> {
   const st = await loadState();
-  const list = isOwner ? st.owner : st.users;
+  const list = isOwner || opts.forceSystem === true ? st.owner : st.users;
   const rec = list.find((r) => r.key === key);
   if (!rec) return;
   if (!rec.exhaustedAt) rec.exhaustedAt = Date.now();
@@ -314,9 +375,10 @@ export async function reportTransient(
   key: string,
   isOwner: boolean,
   retryAfterSec: number | null,
+  opts: ResolveOptions = {},
 ): Promise<void> {
   const st = await loadState();
-  const list = isOwner ? st.owner : st.users;
+  const list = isOwner || opts.forceSystem === true ? st.owner : st.users;
   const rec = list.find((r) => r.key === key);
   if (!rec || rec.exhaustedAt) return;
   const base = retryAfterSec == null || !Number.isFinite(retryAfterSec) ? 60 : retryAfterSec + 30;

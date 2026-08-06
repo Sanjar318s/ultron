@@ -32,6 +32,7 @@ import {
   isTransientRateLimit,
   isHardExhaustion,
 } from "../lib/geminiKeys.ts";
+import { classifyComplexity } from "../lib/complexity.ts";
 
 /**
  * Self-test suite for the ULTRON PC-control surface.
@@ -191,6 +192,21 @@ export async function runSelfTests({ live = false } = {}) {
     ["client-side limit not hard", isHardExhaustion("gemini rate-limited (client-side 16/min)") === false],
     ["503 high demand is transient", isTransientRateLimit("gemini 503: This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.") === true],
     ["503 high demand NOT hard", isHardExhaustion("gemini 503: This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.") === false],
+    // Complexity tiers: heavy file tasks use the full system pool, greetings stay light.
+    ["complexity pdf is tier 2", classifyComplexity("создай pdf отчёт с таблицей и графиком").tier === 2],
+    ["complexity pdf isFileTask", classifyComplexity("создай pdf отчёт").isFileTask === true],
+    ["complexity docx is tier 2", classifyComplexity("создай резюме в docx").tier === 2],
+    ["complexity xlsx is tier 2", classifyComplexity("сделай таблицу xlsx с формулами").tier === 2],
+    ["complexity script pdf is tier 2", classifyComplexity("напиши скрипт который построит график и сохранит в pdf").tier === 2],
+    ["complexity plain script is tier 1", classifyComplexity("напиши скрипт который вычислит 2**100 и сохрани в файл").tier === 1],
+    ["complexity chart is tier 1", classifyComplexity("нарисуй график y=x^2").tier === 1],
+    ["complexity create file is tier 1", classifyComplexity("создай файл с заметками").tier === 1],
+    ["complexity site is tier 1", classifyComplexity("сделай полноценный сайт с тремя страницами").tier === 1],
+    ["complexity greeting is tier 0", classifyComplexity("привет").tier === 0],
+    ["complexity greeting not heavy", classifyComplexity("привет")?.tooHeavy === false],
+    ["complexity question is tier 0", classifyComplexity("как дела").tier === 0],
+    ["complexity pdf not tooHeavy", classifyComplexity("создай pdf отчёт с таблицей").tooHeavy === false],
+    ["complexity tooHeavy only absurd", classifyComplexity(`создай ${"pdf ".repeat(500)}отчёт с графиком, шаблоном и скриптом для сайта`).tooHeavy === true],
   ];
   for (const [name, ok] of pureChecks) check(`pure ${name}`, ok);
 

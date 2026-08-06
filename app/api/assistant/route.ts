@@ -17,6 +17,7 @@ import {
   resolveKey,
   type ResolveResult,
 } from "@/lib/geminiKeys";
+import { classifyComplexity, type Complexity } from "@/lib/complexity";
 import { Timeline } from "@/lib/timeline";
 import { getLearnedFacts } from "@/lib/lessonStore";
 import {
@@ -88,7 +89,17 @@ function isLocalRequest(req: NextRequest): boolean {
 }
 
 /** How to call the LLM chain for this request (which Gemini key, if any). */
-export type CloudOpts = { geminiKey?: string; skipGemini?: boolean; model?: string; provider?: "gemini" | "ollama"; preset?: ModelPreset };
+export type CloudOpts = {
+  geminiKey?: string;
+  skipGemini?: boolean;
+  model?: string;
+  provider?: "gemini" | "ollama";
+  preset?: ModelPreset;
+  /** Complexity tier → limits which system keys rotate (2/4/6). */
+  tier?: 0 | 1 | 2;
+  /** Route through the SYSTEM pool even for a non-owner (file work). */
+  forceSystem?: boolean;
+};
 
 /** Stronger model for the skill executor loop (flash-lite derails on the JSON contract). */
 const EXECUTOR_MODEL = "gemini-3.5-flash";
@@ -139,12 +150,14 @@ async function reportGeminiFailure(
   key: string,
   isOwner: boolean,
   err: unknown,
+  forceSystem?: boolean,
 ): Promise<void> {
   const msg = err instanceof Error ? err.message : String(err);
+  const opts = { forceSystem };
   if (isHardExhaustion(msg)) {
-    await reportFailure(chatKey, key, isOwner);
+    await reportFailure(chatKey, key, isOwner, opts);
   } else if (isTransientRateLimit(msg)) {
-    await reportTransient(chatKey, key, isOwner, parseRetrySeconds(msg));
+    await reportTransient(chatKey, key, isOwner, parseRetrySeconds(msg), opts);
   }
 }
 
@@ -216,9 +229,21 @@ function makeExecutorComplete(cloudOpts: CloudOpts, chatKey?: string, isOwner?: 
         restart = true;
         timeline?.mark(`executor:${p}:attempt`);
         try {
+          // Re-resolve the Gemini key on EVERY round so a long run spreads
+          // across the tier's system keys (LRU) instead of drowning one key;
+          // a key that was cooling down at request start can rejoin mid-run.
+          let geminiKey = cloudOpts.geminiKey;
+          if (p === "gemini" && chatKey) {
+            const fresh = await resolveKey(chatKey, isOwner === true, {
+              tier: cloudOpts.tier,
+              forceSystem: cloudOpts.forceSystem !== false,
+            });
+            geminiKey = fresh.provider === "gemini" && fresh.key ? fresh.key : undefined;
+          }
           const out = await with429Retry(() =>
             completeCloud(p === "ollama" ? trimMessagesForOllama(msgs) : msgs, {
               ...cloudOpts,
+              geminiKey,
               model: p === "ollama" ? OLLAMA_EXECUTOR_MODEL : EXECUTOR_MODEL,
               provider: p,
             }),
@@ -238,7 +263,7 @@ function makeExecutorComplete(cloudOpts: CloudOpts, chatKey?: string, isOwner?: 
           if (aborted) timeoutAt[p] = Date.now();
           if (pin === p) pin = undefined;
           if (p === "gemini" && chatKey && cloudOpts.geminiKey) {
-            await reportGeminiFailure(chatKey, cloudOpts.geminiKey, !!isOwner, err);
+            await reportGeminiFailure(chatKey, cloudOpts.geminiKey, isOwner === true, err, true);
           }
           console.warn(`[skill-executor] ${p} failed, switching:`, err);
         }
@@ -267,8 +292,17 @@ async function runSkillDispatch(
   baseUrl: string,
   chatKey: string,
   cloudOpts: CloudOpts,
+  isOwner?: boolean,
   timeline?: Timeline,
 ): Promise<{ reply: string; needsApproval?: { id: string; description: string }; files?: WireFile[]; verified?: boolean }> {
+  // Honest capacity boundary: if even the full 6-key pool couldn't deliver,
+  // say so instead of burning a doomed sandbox run.
+  const cx = classifyComplexity(userText || name);
+  if (cx.tooHeavy) {
+    return {
+      reply: `Запрос слишком тяжёлый, чтобы выполнить его надёжно (даже все 6 системных ключей не гарантируют результат). Попробуйте разбить его на части поменьше — например, сначала шаблон, потом текст, потом картинки.`,
+    };
+  }
   const screen = brain.findSkill(name);
   if (screen) {
     return { reply: await executeSkill(brain, screen.id, baseUrl) };
@@ -292,7 +326,7 @@ async function runSkillDispatch(
     }
     const res = await executeCatalogSkill(cat, userText || name, {
       chatId: chatKey,
-      complete: makeExecutorComplete(cloudOpts, chatKey, undefined, timeline),
+      complete: makeExecutorComplete(cloudOpts, chatKey, isOwner, timeline),
     });
     return { reply: res.reply, files: res.artifacts, verified: res.verified };
   }
@@ -485,7 +519,7 @@ async function executeHandledAction(
   brain: AssistantBrain,
   action: AssistantAction,
   baseUrl: string,
-  ctx: { chatKey: string; cloudOpts: CloudOpts; userText?: string; timeline?: Timeline },
+  ctx: { chatKey: string; cloudOpts: CloudOpts; userText?: string; timeline?: Timeline; isOwner?: boolean },
 ): Promise<{
   reply: string;
   image?: { b64: string; mime: string };
@@ -515,6 +549,7 @@ async function executeHandledAction(
         baseUrl,
         ctx.chatKey,
         ctx.cloudOpts,
+        ctx.isOwner,
         ctx.timeline,
       );
       recordProvider("local", ctx.chatKey);
@@ -671,11 +706,15 @@ export async function POST(req: NextRequest) {
   const chatKey = chatId || "anon";
   const preset = getUserPreset(chatKey);
   const timeline = new Timeline("assistant", { chatKey, preset, isOwner });
-  const gemini: ResolveResult = await resolveKey(chatKey, isOwner);
+  const complexity: Complexity = classifyComplexity(text);
+  timeline.mark(`complexity:t${complexity.tier}`);
+  const gemini: ResolveResult = await resolveKey(chatKey, isOwner, { tier: complexity.tier });
   timeline.mark("resolveKey");
   const cloudOpts: CloudOpts = {
     ...(gemini.provider === "gemini" ? { geminiKey: gemini.key } : { skipGemini: true }),
     preset,
+    tier: complexity.tier,
+    forceSystem: complexity.isFileTask,
   };
 
   // Admin control messages from the bot (approve/reject buttons).
@@ -687,8 +726,8 @@ export async function POST(req: NextRequest) {
       await rejectPending(body.id).catch(() => {});
       const cat = (await listCatalog()).find((s) => s.slug === skillCtx.slug);
       if (!cat) return NextResponse.json({ reply: "Навык не найден." });
-      const g = await resolveKey(skillCtx.chatId, isOwner);
-      const opts: CloudOpts = g.provider === "gemini" ? { geminiKey: g.key } : { skipGemini: true };
+      const g = await resolveKey(skillCtx.chatId, isOwner, { tier: complexity.tier, forceSystem: true });
+      const opts: CloudOpts = g.provider === "gemini" ? { geminiKey: g.key, tier: complexity.tier, forceSystem: true } : { skipGemini: true, tier: complexity.tier, forceSystem: true };
       const res = await executeCatalogSkill(cat, skillCtx.name, {
         chatId: skillCtx.chatId,
         complete: makeExecutorComplete(opts, skillCtx.chatId, isOwner),
@@ -838,6 +877,7 @@ export async function POST(req: NextRequest) {
         cloudOpts,
         userText: text,
         timeline,
+        isOwner,
       });
       await commitBrain(brain, baseIds);
       const reply = executed.image
@@ -887,6 +927,7 @@ export async function POST(req: NextRequest) {
       baseUrl,
       chatKey,
       cloudOpts,
+      isOwner,
       timeline,
     );
     await commitBrain(brain, baseIds);
@@ -982,15 +1023,17 @@ export async function POST(req: NextRequest) {
         try {
           const explicitRef = typeof a.ref === "string" && a.ref.trim() ? a.ref.trim() : "";
           const reference = await resolveImageReference(explicitRef || visibleText, Boolean(explicitRef));
+          const imgKeyRes = await resolveKey(chatKey, isOwner, { tier: complexity.tier, forceSystem: true });
+          const imgKey = imgKeyRes.provider === "gemini" ? imgKeyRes.key : undefined;
           image = await generateImage(
             a.prompt.trim(),
             {
               text: typeof a.text === "string" && a.text.trim() ? a.text.trim() : extractCaptionText(visibleText),
               localTags,
-              forceLocal: gemini.provider !== "gemini",
+              forceLocal: !imgKey,
               ...(reference ? { reference } : {}),
             },
-            gemini.key,
+            imgKey,
           );
           actionReply = "Изображение готово.";
         } catch (err) {
@@ -1007,7 +1050,7 @@ export async function POST(req: NextRequest) {
             // Blocked: only the textual reply is shown, nothing executes.
           } else {
             timeline.mark("action");
-            const executed = await executeHandledAction(brain, llmAction, baseUrl, { chatKey, cloudOpts, userText: text, timeline });
+            const executed = await executeHandledAction(brain, llmAction, baseUrl, { chatKey, cloudOpts, userText: text, timeline, isOwner });
             if (executed.reply) actionReply = executed.reply;
             if (executed.needsApproval) needsApproval = executed.needsApproval;
             if (executed.image) image = executed.image;
@@ -1105,15 +1148,17 @@ export async function POST(req: NextRequest) {
     if (fallbackPrompt) {
       try {
         const reference = await resolveImageReference(visibleText, false);
+        const imgKeyRes = await resolveKey(chatKey, isOwner, { tier: complexity.tier, forceSystem: true });
+        const imgKey = imgKeyRes.provider === "gemini" ? imgKeyRes.key : undefined;
         const image = await generateImage(
           fallbackPrompt,
           {
             text: extractCaptionText(visibleText),
             localTags,
-            forceLocal: gemini.provider !== "gemini",
+            forceLocal: !imgKey,
             ...(reference ? { reference } : {}),
           },
-          gemini.key,
+          imgKey,
         );
         return NextResponse.json({ reply: "Изображение готово.", image, provider: null, ...(gemini.note ? { note: gemini.note } : {}) });
       } catch (imgErr) {
