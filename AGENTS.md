@@ -9,7 +9,7 @@
 | Live roundtrip | `npm run self-test -- --live` | Adds Edge TTS → Gemini transcription end-to-end |
 | Dev server | `npm run dev` | http://localhost:3000 |
 | Telegram bot | `npm run bot` | Long-polling bridge to the local server |
-| Local infra setup | `node scripts/setup-local.mjs` | Installs Ollama + qwen3 models, ComfyUI + RealVisXL + 4x-UltraSharp; executor uses `qwen3:14b` |
+| Local infra setup | `node scripts/setup-local.mjs` | Installs Ollama + qwen3 models, ComfyUI + RealVisXL + 4x-UltraSharp; executor uses `qwen3:8b` (see `OLLAMA_EXECUTOR_MODEL`) |
 
 **Run `npm run build` before every commit.** There is no lint script; tsc catches all type errors.
 
@@ -50,7 +50,7 @@ Data flow is one-directional: HandTracker → callbacks → JarvisOrb → OrbSce
 - **ComfyUI**: Local image gen at 127.0.0.1:8188. Probe TTL 15s. Workflow templates in `comfy/`. Anime prompts auto-switch checkpoint.
 - **Image cascade**: Gemini (quota-limited) → ComfyUI (free, unlimited) → Pollinations (keyless fallback).
 - **YouTube transcripts**: yt-dlp only works on this machine (datacenter IP blocks native flow). Binary at `C:\Tools\yt-dlp\yt-dlp.exe`.
-- **Skills sandbox**: Only `python`, `py`, `node`, `pip` allowed. External tools (poppler/pandoc/LibreOffice) appended to PATH from `C:\Tools`. Executor order: `ollama` (qwen3:14b, unlimited) → `gemini` (quality fallback); pin-once per run, but the pin is CLEARED if the pinned provider dies so the next one gets a shot. `OLLAMA_MODEL=qwen3:14b` in `.env.local`.
+- **Skills sandbox**: Only `python`, `py`, `node`, `pip` allowed. External tools (poppler/pandoc/LibreOffice) appended to PATH from `C:\Tools`. Executor order: `ollama` (qwen3:8b, unlimited) → `gemini` (quality fallback); pin-once per run, but the pin is CLEARED if the pinned provider dies so the next one gets a shot. `OLLAMA_MODEL=qwen3:14b` (general chat) and `OLLAMA_EXECUTOR_MODEL=qwen3:8b` (skill executor) in `.env.local`. The 8b is REQUIRED for the executor: qwen3:14b does prompt-eval at ~20 tok/s on this box, so a full SKILL.md body alone blows past the 180s call timeout; the executor also trims the local provider's context (`trimMessagesForOllama`: skill guide to 8KB, round messages to 600 chars, 16 messages cap) while gemini keeps the full guide.
 - **Gemini 429 classification** (`lib/geminiKeys.ts`): a transient per-minute rate limit («retry in <15min» / `free_tier_requests`) sets a SHORT `cooldownUntil` and NEVER kills the key; only hard daily/token exhaustion (daily/PerDay/TPD or retry ≥15min) marks `exhaustedAt` until midnight Pacific. Don't merge the two — a single RPM burst faking a dead account was the original bug.
 - **Timeline**: every `/api/assistant` request records per-phase timings (`resolveKey`, `provider:*`, `escalate`, `parse`, `action`, `executor:*`) in `lib/timeline.ts`, logs `[timeline] …` and exposes the last 50 via GET `/api/timeline` (localhost-only). Consult it before claiming anything about latency.
 - **Meta-algorithms**: a `template`-type meta-algorithm with an EMPTY `pattern` must never match everything (it swallowed every request before the skill executor). Empty pattern → no match. Check `data/meta-algorithms.json` if a request starts returning a canned reply for all inputs.

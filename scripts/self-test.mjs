@@ -11,6 +11,13 @@ import {
 } from "../lib/commandSplit.ts";
 import { findSiteInPhrase, resolveSite } from "../lib/sites.ts";
 import { bestMatch, execute as executeSkill, workDirFor } from "../lib/skillCatalog.ts";
+import {
+  lessonsForPrompt,
+  recordLesson,
+  storedLessons,
+  clearLessons,
+  flushSkillLessons,
+} from "../lib/skillLessons.ts";
 import { N8N_ACTIONS } from "../lib/n8n/config.ts";
 import {
   isExplicitTask,
@@ -301,8 +308,52 @@ export async function runSelfTests({ live = false } = {}) {
       resStuck.ok === false && resStuck.rounds === 3 && (resStuck.reply ?? "").includes("зациклился"),
       `ok=${resStuck.ok} rounds=${resStuck.rounds} reply=${JSON.stringify((resStuck.reply ?? "").slice(0, 80))}`,
     );
+
+    // 1e. Skill lessons: cross-run memory for the executor. Failure modes
+    // (blocked command, unverified claim, stuck loop) are recorded and injected
+    // into the next run's system prompt — deduplicated and capped.
+    await clearLessons("selftest");
+    await flushSkillLessons();
+
+    const stepsBlocked = [JSON.stringify({ cmd: `curl http://x` })];
+    let iBlocked = 0;
+    const resBlocked = await executeSkill(fakeSkill, "сделай что-нибудь", {
+      chatId: skillChat("blocked"),
+      complete: async () => stepsBlocked[Math.min(iBlocked++, stepsBlocked.length - 1)] ?? "{}",
+    });
+    await flushSkillLessons();
+    const lessonsAfter = await storedLessons("selftest");
+    check(
+      "skill lessons recorded (rejected)",
+      resBlocked.ok === false && lessonsAfter.some((l) => /команда отклонена/.test(l)),
+      `lessons=${JSON.stringify(lessonsAfter)}`,
+    );
+
+    let iBlocked2 = 0;
+    await executeSkill(fakeSkill, "сделай что-нибудь ещё", {
+      chatId: skillChat("blocked2"),
+      complete: async () => stepsBlocked[Math.min(iBlocked2++, stepsBlocked.length - 1)] ?? "{}",
+    });
+    await flushSkillLessons();
+    const lessonsDeduped = await storedLessons("selftest");
+    const rejectedCount = lessonsDeduped.filter((l) => /команда отклонена.*curl/.test(l)).length;
+    check("skill lessons dedupe", rejectedCount === 1, `count=${rejectedCount}`);
+
+    for (let i = 0; i < 15; i++) recordLesson("selftest", `синтетический урок номер ${i}`);
+    await flushSkillLessons();
+    const lessonsCapped = await storedLessons("selftest");
+    check("skill lessons cap", lessonsCapped.length === 12, `count=${lessonsCapped.length}`);
+
+    const prompt = await lessonsForPrompt("selftest");
+    check(
+      "skill lessons injected",
+      prompt.startsWith("\n\n## Грабли из прошлых запусков") && prompt.includes("синтетический урок"),
+      prompt ? JSON.stringify(prompt.slice(0, 60)) : "empty",
+    );
   } finally {
     for (const dir of skillDirs) rmSync(dir, { recursive: true, force: true });
+    await clearLessons("selftest").catch(() => {});
+    await flushSkillLessons().catch(() => {});
   }
 
   // 2. Server reachability.

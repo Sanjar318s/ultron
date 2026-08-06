@@ -21,6 +21,7 @@ import { promises as fs, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { getLearnedStyles } from "./lessonStore.ts";
+import { lessonsForPrompt, recordLesson } from "./skillLessons.ts";
 
 export const SKILLS_DIR = path.join(process.cwd(), "skills");
 
@@ -538,9 +539,14 @@ export async function execute(
   ].join("\n");
 
   const sys2 = `РУКОВОДСТВО НАВЫКА «${skill.name}»:\n${skill.body.slice(0, 24_000)}`;
+  const lessons = await lessonsForPrompt(skill.slug);
+  // Lessons stay a SEPARATE system message: the local provider's context is
+  // trimmed to the first 6KB of the skill guide, so appending them to sys2
+  // would silently drop exactly the memory we want the model to see.
   let messages: Array<{ role: "user" | "assistant" | "system"; content: string }> = [
     { role: "system", content: system },
     { role: "system", content: sys2 },
+    ...(lessons ? [{ role: "system" as const, content: lessons }] : []),
     { role: "user", content: `Запрос пользователя: ${query}` },
   ];
   runLog(`[start] skill=${skill.slug} query=${query.slice(0, 120)}`);
@@ -577,6 +583,7 @@ export async function execute(
     if (parsed.done) {
       if (REFUSAL_RE.test(parsed.result ?? "")) {
         runLog(`[R${round + 1}] DONE-BUT-REFUSAL: ${(parsed.result ?? "").slice(0, 150)}`);
+        recordLesson(skill.slug, "вернул done, не решив задачу (refusal)");
         messages.push({ role: "assistant", content: raw.slice(0, 1000) });
         messages.push({
           role: "user",
@@ -590,6 +597,7 @@ export async function execute(
       const { missing } = await verifyResultFiles(workdir, resultText);
       if (missing.length > 0) {
         runLog(`[R${round + 1}] UNVERIFIED: ${missing.join(", ")}`);
+        recordLesson(skill.slug, `утверждал файлы, которых нет: ${missing.join(", ")}`);
         messages.push({ role: "assistant", content: raw.slice(0, 1000) });
         messages.push({
           role: "user",
@@ -609,6 +617,7 @@ export async function execute(
     const err = validateCommand(cmd);
     if (err) {
       runLog(`[R${round + 1}] REJECTED: ${err}`);
+      recordLesson(skill.slug, `команда отклонена: ${err}`);
       messages.push({ role: "assistant", content: raw.slice(0, 1000) });
       messages.push({ role: "user", content: `Команда отклонена: ${err}. Придумай другую (только python/py/node/pip).` });
       continue;
@@ -621,6 +630,7 @@ export async function execute(
     }
     if (sameRun >= 3) {
       runLog(`[R${round + 1}] STUCK (${normCmd} ×3): модель зациклилась на одной команде`);
+      recordLesson(skill.slug, `зациклился на одной команде: ${normCmd}`);
       return {
         ok: false,
         reply: `Исполнитель зациклился на одной и той же команде («${normCmd}» ×3). Проверьте результат вручную или уточните запрос.`,
@@ -638,6 +648,7 @@ export async function execute(
   }
 
   runLog(`[exhausted] lastRaw=${lastRaw.slice(0, 150)}`);
+  recordLesson(skill.slug, "исчерпан лимит шагов исполнителя");
   return {
     ok: false,
     reply: `Исчерпан лимит шагов исполнителя (${MAX_ROUNDS}). Проверьте результат вручную или уточните запрос.`,

@@ -18,6 +18,13 @@ const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen3:8b";
 /**
+ * Local skill-executor model. qwen3:14b does prompt-eval at ~20 tok/s on this
+ * box (a full SKILL.md body alone can exceed the 180s call timeout), while
+ * the 8b sibling answers the same prompt in ~40s — fast enough for multi-round
+ * sandbox loops. 14b (OLLAMA_MODEL) stays the general-chat model.
+ */
+export const OLLAMA_EXECUTOR_MODEL = process.env.OLLAMA_EXECUTOR_MODEL || "qwen3:8b";
+/**
  * How long Ollama keeps the model resident after a request. Long enough that
  * a server restart at night never leaves a cold 9 GB model for the morning's
  * first user request, short enough that Ollama can still gracefully evict the
@@ -81,23 +88,34 @@ function toGemini(messages: ChatMessage[]) {
 async function callProvider(messages: ChatMessage[], p: { id: string; key?: string; model?: string }): Promise<string> {
   if (p.id === "ollama") {
     const flat = messages.map((m) => ({ role: m.role, content: messageText(m) }));
+    // Only an explicit qwen* model (the executor's OLLAMA_EXECUTOR_MODEL)
+    // overrides the default; a preset chain may carry a gemini model name that
+    // ollama must never receive.
+    const model = p.model && p.model.startsWith("qwen") ? p.model : OLLAMA_MODEL;
     // Native /api/chat (not the OpenAI-compat one): qwen3's thinking mode
     // eats the whole budget via the compat endpoint and returns empty content.
     const res = await fetch(`${OLLAMA_URL}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: OLLAMA_MODEL,
+        model,
         messages: flat,
         stream: false,
         think: false,
         // qwen3 sometimes ignores the "return strict JSON" instruction and
         // answers conversationally — structured output forces valid JSON.
         format: "json",
-        options: { temperature: 0.3, num_predict: 2048 },
+        // 1024, not 2048: decode runs at ~30 tok/s on this box, so a long
+        // response eats minutes; executor answers are short JSON and the
+        // escalate step fits easily. The saved budget keeps a round inside
+        // the 180s window.
+        options: { temperature: 0.3, num_predict: 1024 },
         keep_alive: OLLAMA_KEEP_ALIVE,
       }),
-      signal: AbortSignal.timeout(120_000),
+      // 180s, not 120s: a 10GB model evicted under RAM pressure takes ~2min to
+      // cold-load. 120s aborted exactly at the moment the load finished (a
+      // race, not a margin call) and permanently lost the local provider.
+      signal: AbortSignal.timeout(180_000),
     });
     const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
     if (!res.ok) {
@@ -216,9 +234,11 @@ export async function completeCloud(
 }
 
 /**
- * Preload the local model at server boot (via instrumentation.ts) so the first
- * real request never hits a 40-second cold load — which used to surface as an
- * ollama 500. Fire-and-forget; failures only warn, never block startup.
+ * Preload the local executor model at server boot (via instrumentation.ts) so
+ * the first real request never hits a cold load — which used to surface as an
+ * ollama 500 / timeout. The executor is the hot path (every skill run), so we
+ * warm the 8b executor model; OLLAMA_MODEL (14b) is the general-chat fallback
+ * and loads on demand. Fire-and-forget; failures only warn, never block.
  */
 export async function warmupOllama(): Promise<void> {
   try {
@@ -226,7 +246,7 @@ export async function warmupOllama(): Promise<void> {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: OLLAMA_MODEL,
+        model: OLLAMA_EXECUTOR_MODEL,
         prompt: "",
         stream: false,
         keep_alive: OLLAMA_KEEP_ALIVE,
@@ -238,7 +258,7 @@ export async function warmupOllama(): Promise<void> {
       console.warn(`[warmup] ollama preload failed: ${res.status} ${data?.error ?? res.statusText}`);
       return;
     }
-    console.log(`[warmup] ollama preloaded: ${OLLAMA_MODEL} (keep_alive=${OLLAMA_KEEP_ALIVE})`);
+    console.log(`[warmup] ollama preloaded: ${OLLAMA_EXECUTOR_MODEL} (keep_alive=${OLLAMA_KEEP_ALIVE})`);
   } catch (err) {
     console.warn("[warmup] ollama preload error:", err instanceof Error ? err.message : String(err));
   }

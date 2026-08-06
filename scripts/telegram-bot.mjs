@@ -478,10 +478,21 @@ async function chatWithAssistant(chatId, msg, text) {
         chatId: String(chatId),
         isOwner: isOwner(msg?.from),
       }),
-      signal: AbortSignal.timeout(180_000),
+      // Heavy skill runs (multi-round PDF/DOCX generation, cold ollama loads)
+      // routinely exceed a few minutes server-side; 600s matches serverControl.
+      signal: AbortSignal.timeout(600_000),
     });
   } catch (err) {
-    await finishStatus(chatId, statusId, `Сбой обработки: ${err.message}. Сервер запущен?`);
+    // Distinguish OUR OWN timeout from a real network/server failure — the old
+    // blanket «Сервер запущен?» lied every time a slow request outlived 180s.
+    const aborted =
+      (err && (err.name === "TimeoutError" || err.name === "AbortError")) ||
+      /aborted due to timeout|timed out/i.test(err?.message ?? "");
+    await finishStatus(
+      chatId,
+      statusId,
+      aborted ? "Обработка заняла слишком много времени — попробуй ещё раз." : `Сбой обработки: ${err.message}. Сервер запущен?`,
+    );
     return;
   }
   const data = await res.json().catch(() => null);

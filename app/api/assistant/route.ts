@@ -7,7 +7,7 @@ import {
   type AssistantBrain,
   type LLMLearnItem,
 } from "@/lib/assistantBrain";
-import { completeCloud, completeCloudMeta, completeWithProvider } from "@/lib/serverLLM";
+import { completeCloud, completeCloudMeta, completeWithProvider, OLLAMA_EXECUTOR_MODEL } from "@/lib/serverLLM";
 import {
   isHardExhaustion,
   isTransientRateLimit,
@@ -149,42 +149,99 @@ async function reportGeminiFailure(
 }
 
 /**
+ * Local ollama on this box does prompt-eval at ~19 tok/s (qwen3:14b, CPU), so
+ * a full SKILL.md body can take longer than the 180s call timeout before the
+ * model even starts answering — and the round history only grows every pass.
+ * Trim the context the LOCAL provider sees: cap the skill guide, shorten
+ * per-round command/result messages, and drop old rounds. Gemini still gets
+ * the full context (fast remote model, long context window).
+ */
+function trimMessagesForOllama(msgs: Parameters<typeof completeCloud>[0]): Parameters<typeof completeCloud>[0] {
+  const MAX_SKILL_GUIDE = 8_000;
+  const MAX_ROUND_MSG = 600;
+  const MAX_TOTAL = 16;
+  const KEEP_HEAD = 4; // system + skill guide + (lessons) + user
+  const trimmed = msgs.map((m) => {
+    if (typeof m.content === "string" && m.content.startsWith("РУКОВОДСТВО НАВЫКА") && m.content.length > MAX_SKILL_GUIDE) {
+      return { ...m, content: m.content.slice(0, MAX_SKILL_GUIDE) };
+    }
+    if (m.role !== "system" && typeof m.content === "string" && m.content.length > MAX_ROUND_MSG) {
+      return { ...m, content: m.content.slice(0, MAX_ROUND_MSG) };
+    }
+    return m;
+  });
+  if (trimmed.length <= MAX_TOTAL) return trimmed;
+  const head = trimmed.slice(0, KEEP_HEAD);
+  const tail = trimmed.slice(-(MAX_TOTAL - KEEP_HEAD));
+  return head.concat(tail);
+}
+
+/**
  * Executor factory with pin-once semantics: the skill loop should run on a
  * SINGLE provider end-to-end, or round N (a weak model) silently undoes
  * rounds 1..N-1. Prefer the local unlimited model (ollama / qwen3:14b) for
  * deterministic latency; gemini is the quality fallback (transient 429s set a
- * short cooldown instead of killing the key). If the pinned provider dies
- * mid-run, the pin is cleared so the next provider gets a chance instead of
- * throwing «all providers unavailable» while ollama is still healthy.
+ * short cooldown instead of killing the key).
+ *
+ * Each call iterates until no NEW provider is eligible (each provider at most
+ * once per pass): if the PINNED provider dies mid-call, the other provider —
+ * skipped earlier because of the pin — gets its chance on the next pass
+ * WITHOUT a cooldown (an abort that took 180s must not then be blocked by a
+ * 20s cooldown, which is exactly how the third cold-start incident died).
+ * Hard-failed providers (gemini daily/token exhaustion) stay dead for the
+ * run; a provider that ABORTED last round is skipped only at the very start
+ * of the NEXT call (60s backoff) so a hung ollama doesn't burn 180s in every
+ * round — restart passes after a pin-clear are exempt.
  */
 function makeExecutorComplete(cloudOpts: CloudOpts, chatKey?: string, isOwner?: boolean, timeline?: Timeline) {
-  const failed: Set<string> = new Set();
+  const hardFailed: Set<string> = new Set();
+  const timeoutAt: Record<string, number> = {};
+  const TIMEOUT_BACKOFF_MS = 60_000;
   let pin: "gemini" | "ollama" | undefined;
   const order: Array<"gemini" | "ollama"> = ["ollama", "gemini"];
   return async (msgs: Parameters<typeof completeCloud>[0]): Promise<string> => {
-    for (const p of order) {
-      if (pin) {
-        if (p !== pin) continue;
-      } else if (failed.has(p)) {
-        continue;
-      }
-      timeline?.mark(`executor:${p}:attempt`);
-      try {
-        const out = await with429Retry(() =>
-          completeCloud(msgs, { ...cloudOpts, model: EXECUTOR_MODEL, provider: p }),
-        );
-        timeline?.mark(`executor:${p}:ok`);
-        if (!pin) console.log(`[skill-executor] pinned ${p}`);
-        pin = p;
-        return out;
-      } catch (err) {
-        timeline?.mark(`executor:${p}:fail`);
-        failed.add(p);
-        if (pin === p) pin = undefined;
-        if (p === "gemini" && chatKey && cloudOpts.geminiKey) {
-          await reportGeminiFailure(chatKey, cloudOpts.geminiKey, !!isOwner, err);
+    const tried = new Set<string>();
+    let restart = true;
+    while (restart) {
+      restart = false;
+      for (const p of order) {
+        if (tried.has(p)) continue;
+        if (hardFailed.has(p)) continue;
+        if (pin && p !== pin) continue;
+        // Backoff applies only before ANY attempt this call (first pass); a
+        // provider that just timed out shouldn't burn another 180s at the top
+        // of the next round. Restart passes are exempt.
+        if (tried.size === 0 && timeoutAt[p] && Date.now() - timeoutAt[p] < TIMEOUT_BACKOFF_MS) continue;
+        tried.add(p);
+        restart = true;
+        timeline?.mark(`executor:${p}:attempt`);
+        try {
+          const out = await with429Retry(() =>
+            completeCloud(p === "ollama" ? trimMessagesForOllama(msgs) : msgs, {
+              ...cloudOpts,
+              model: p === "ollama" ? OLLAMA_EXECUTOR_MODEL : EXECUTOR_MODEL,
+              provider: p,
+            }),
+          );
+          timeline?.mark(`executor:${p}:ok`);
+          if (!pin) console.log(`[skill-executor] pinned ${p}`);
+          pin = p;
+          return out;
+        } catch (err) {
+          timeline?.mark(`executor:${p}:fail`);
+          const msg = err instanceof Error ? err.message : String(err);
+          const aborted =
+            (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) ||
+            /aborted due to timeout|timed out/i.test(msg);
+          const hard = p === "gemini" && !aborted && !isTransientRateLimit(msg);
+          if (hard) hardFailed.add(p);
+          if (aborted) timeoutAt[p] = Date.now();
+          if (pin === p) pin = undefined;
+          if (p === "gemini" && chatKey && cloudOpts.geminiKey) {
+            await reportGeminiFailure(chatKey, cloudOpts.geminiKey, !!isOwner, err);
+          }
+          console.warn(`[skill-executor] ${p} failed, switching:`, err);
         }
-        console.warn(`[skill-executor] ${p} failed, switching:`, err);
       }
     }
     throw new Error("все провайдеры исполнителя недоступны");
