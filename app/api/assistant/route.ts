@@ -113,11 +113,20 @@ async function with429Retry(fn: () => Promise<string>): Promise<string> {
       const wait = parseRetrySeconds(msg);
       // Only a SHORT server-side wait is worth sleeping mid-request; a long
       // window (≥30s) means "fall through to the next provider now" — the key
-      // gets a cooldown and recovers on its own between requests.
-      if (attempt < 2 && isTransientRateLimit(msg) && wait !== null && wait <= 20) {
-        attempt += 1;
-        await sleep(Math.min(wait * 1000 + 1000, 20_000));
-        continue;
+      // gets a cooldown and recovers on its own between requests. A transient
+      // 503 «high demand» carries no wait hint, so it gets one short retry.
+      if (attempt < 2 && isTransientRateLimit(msg)) {
+        const backoff =
+          wait !== null && wait <= 20
+            ? Math.min(wait * 1000 + 1000, 20_000)
+            : /\b503\b|high demand|overloaded/i.test(msg)
+              ? 2_000
+              : null;
+        if (backoff !== null) {
+          attempt += 1;
+          await sleep(backoff);
+          continue;
+        }
       }
       throw err;
     }
@@ -1055,6 +1064,8 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ reply: `Не удалось сгенерировать изображение: ${message}.`, provider: null, ...(gemini.note ? { note: gemini.note } : {}) });
       }
     }
-    return NextResponse.json({ reply: brain.unknownReply(), provider: null });
+    const failReason = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+    const honestReply = `Извини, сейчас не могу ответить: все провайдеры временно недоступны (${failReason.replace(/^все провайдеры недоступны:\s*/i, "")}). Попробуй ещё раз через минуту.`;
+    return NextResponse.json({ reply: honestReply, provider: null });
   }
 }

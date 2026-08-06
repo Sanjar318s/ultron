@@ -17,6 +17,13 @@ const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen3:8b";
+/**
+ * How long Ollama keeps the model resident after a request. Long enough that
+ * a server restart at night never leaves a cold 9 GB model for the morning's
+ * first user request, short enough that Ollama can still gracefully evict the
+ * model under real memory pressure instead of OOM-ing (see warmupOllama).
+ */
+const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || "24h";
 
 const MODELS: Record<string, string> = {
   openai: "gpt-4.1-mini",
@@ -88,6 +95,7 @@ async function callProvider(messages: ChatMessage[], p: { id: string; key?: stri
         // answers conversationally — structured output forces valid JSON.
         format: "json",
         options: { temperature: 0.3, num_predict: 2048 },
+        keep_alive: OLLAMA_KEEP_ALIVE,
       }),
       signal: AbortSignal.timeout(120_000),
     });
@@ -169,7 +177,7 @@ export async function completeCloudMeta(
     timeline?: Timeline;
   },
 ): Promise<CloudResult> {
-  let lastError: unknown = null;
+  const errors: string[] = [];
   const chain = opts?.provider
     ? PROVIDERS.filter((p) => p.id === opts.provider)
     : opts?.preset
@@ -188,11 +196,14 @@ export async function completeCloudMeta(
       return { text, provider: p.id };
     } catch (err) {
       opts?.timeline?.mark(`provider:${p.id}:fail`);
-      lastError = err;
+      errors.push(err instanceof Error ? err.message : String(err));
       console.warn(`[assistant] ${p.id} failed:`, err);
     }
   }
-  throw lastError ?? new Error("no cloud provider available");
+  if (errors.length > 0) {
+    throw new Error(`все провайдеры недоступны: ${errors.join("; ")}`);
+  }
+  throw new Error("no cloud provider available");
 }
 
 /** Legacy string-returning wrapper (kept for all existing callers). */
@@ -202,6 +213,35 @@ export async function completeCloud(
 ): Promise<string> {
   const r = await completeCloudMeta(messages, opts);
   return r.text;
+}
+
+/**
+ * Preload the local model at server boot (via instrumentation.ts) so the first
+ * real request never hits a 40-second cold load — which used to surface as an
+ * ollama 500. Fire-and-forget; failures only warn, never block startup.
+ */
+export async function warmupOllama(): Promise<void> {
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        prompt: "",
+        stream: false,
+        keep_alive: OLLAMA_KEEP_ALIVE,
+      }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!res.ok) {
+      const data = (await res.json().catch(() => null)) as { error?: string } | null;
+      console.warn(`[warmup] ollama preload failed: ${res.status} ${data?.error ?? res.statusText}`);
+      return;
+    }
+    console.log(`[warmup] ollama preloaded: ${OLLAMA_MODEL} (keep_alive=${OLLAMA_KEEP_ALIVE})`);
+  } catch (err) {
+    console.warn("[warmup] ollama preload error:", err instanceof Error ? err.message : String(err));
+  }
 }
 
 /** Ask a specific provider (e.g. DeepSeek as the "second advisor"). */

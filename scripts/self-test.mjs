@@ -182,6 +182,8 @@ export async function runSelfTests({ live = false } = {}) {
     ["daily keyword is hard", isHardExhaustion("429 RESOURCE_EXHAUSTED: daily tokens per day exhausted") === true],
     ["client-side limit is transient", isTransientRateLimit("gemini rate-limited (client-side 16/min)") === true],
     ["client-side limit not hard", isHardExhaustion("gemini rate-limited (client-side 16/min)") === false],
+    ["503 high demand is transient", isTransientRateLimit("gemini 503: This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.") === true],
+    ["503 high demand NOT hard", isHardExhaustion("gemini 503: This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.") === false],
   ];
   for (const [name, ok] of pureChecks) check(`pure ${name}`, ok);
 

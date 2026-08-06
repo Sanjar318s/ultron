@@ -368,7 +368,10 @@ export function isHardExhaustion(message: string): boolean {
 export function isTransientRateLimit(message: string): boolean {
   if (isHardExhaustion(message)) return false;
   const m = String(message);
-  if (/\b429\b|rate[\s-]*limit|rate_limit|quota/i.test(m)) return true;
+  // 503 «high demand» is the same class as a transient 429 (server-side
+  // overload, not a dead account) — cooldown the key briefly, never kill it.
+  if (/\b429\b|\b503\b|rate[\s-]*limit|rate_limit|quota|high demand|overloaded|temporarily unavailable/i.test(m))
+    return true;
   return parseRetrySeconds(m) !== null;
 }
 

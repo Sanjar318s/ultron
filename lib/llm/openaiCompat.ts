@@ -51,6 +51,8 @@ interface OllamaState {
 }
 
 const OLLAMA_PROBE_TTL = 15_000;
+/** Keep the model resident so the first request after idle isn't a cold load. */
+const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || "24h";
 
 export function createOllamaProvider(
   baseUrl: string,
@@ -98,6 +100,7 @@ export function createOllamaProvider(
             temperature: opts?.temperature ?? 0.3,
             num_predict: opts?.maxTokens ?? 1024,
           },
+          keep_alive: OLLAMA_KEEP_ALIVE,
         }),
       });
       if (!res.ok) {
