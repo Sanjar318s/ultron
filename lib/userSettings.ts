@@ -5,16 +5,16 @@
  * verify the preset→chain mapping.
  *
  * Presets:
- *   ⚡ flash — Gemini Flash-lite, then Groq (fast API), then local Ollama.
- *   🧠 pro   — Gemini Pro, then local Ollama (strong local model), then Groq.
- *   🏠 local — Ollama only chain first, then Groq, then Gemini. Fully offline
- *              answer path, free and unlimited.
+ *   ⚡ flash — Gemini Flash-lite first, then local Ollama.
+ *   🧠 pro   — Gemini Pro first, then local Ollama.
+ *   🏠 local — Ollama first, then Gemini. Fully offline answer path when the
+ *              local model is healthy, free and unlimited.
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 export type ModelPreset = "flash" | "pro" | "local";
-export type PresetProvider = "gemini" | "ollama" | "groq";
+export type PresetProvider = "gemini" | "ollama";
 
 export interface ModelPresetInfo {
   id: ModelPreset;
@@ -33,9 +33,9 @@ export const DEFAULT_PRESET: ModelPreset = "local";
 
 /** Provider order a preset prefers (fallbacks come after the first pick). */
 export const PRESET_CHAIN: Record<ModelPreset, PresetProvider[]> = {
-  flash: ["gemini", "groq", "ollama"],
-  pro: ["gemini", "ollama", "groq"],
-  local: ["ollama", "groq", "gemini"],
+  flash: ["gemini", "ollama"],
+  pro: ["gemini", "ollama"],
+  local: ["ollama", "gemini"],
 };
 
 /** Gemini model to use when the preset's chain reaches Gemini. */

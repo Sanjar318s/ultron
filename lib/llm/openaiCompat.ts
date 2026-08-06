@@ -2,7 +2,7 @@
  * OpenAI-compatible chat-completion client.
  *
  * Covers three providers with one wire protocol (/v1/chat/completions):
- *  - OpenAI & Groq run in the cloud, so their keys must never reach the
+ *  - OpenAI & DeepSeek run in the cloud, so their keys must never reach the
  *    browser — the client posts to our own /api/llm proxy, which injects
  *    the key server-side.
  *  - Ollama runs locally and needs no key, so the client talks to it
@@ -13,13 +13,12 @@ import type { ChatMessage, CompleteOptions, LLMProvider } from "./types";
 
 export interface CloudFlags {
   openai: boolean;
-  groq: boolean;
   deepseek: boolean;
   gemini: boolean;
 }
 
 export function createOpenAICloudProvider(
-  id: "openai" | "groq" | "deepseek",
+  id: "openai" | "deepseek",
   label: string,
   flags: CloudFlags,
 ): LLMProvider {

@@ -5,7 +5,7 @@
  * actually answering.
  */
 
-export type ProviderId = "openai" | "groq" | "deepseek" | "gemini" | "ollama" | "webllm";
+export type ProviderId = "openai" | "deepseek" | "gemini" | "ollama" | "webllm";
 
 /** Plain-text part of a message. */
 export interface TextContentPart {

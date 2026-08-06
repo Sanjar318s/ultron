@@ -195,7 +195,7 @@ function describeStep(step: SkillStep): string {
  * recognized phrase (voice) or submitted line (text box) goes through the
  * brain first: known rules/commands are handled instantly and offline. If the
  * brain doesn't understand, the phrase escalates to the best available model
- * (WebLLM → Ollama → OpenAI → Groq → Gemini), whose JSON reply may carry an
+ * (WebLLM → Ollama → Gemini), whose JSON reply may carry an
  * action to run and facts/commands to memorize.
  */
 export function useVoiceAssistant(handlers: AssistantHandlers): VoiceAssistantApi {

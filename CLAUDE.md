@@ -173,11 +173,14 @@ On top of the orb there is a voice/text assistant with its own architecture
   registry persists to `data/telegram-users.json`; approvals render as inline
   buttons (`approve:<id>` / `reject:<id>`) and execute via the route.
 - **LLM chain (local-first, unlimited):** browser router order
-  `["gemini", "ollama", "groq", "webllm"]` (`lib/llm/router.ts`); server order
-  `[gemini, ollama, groq]` (`lib/serverLLM.ts`). The browser's `gemini`
+  `["ollama", "gemini", "webllm"]` (`lib/llm/router.ts`); server order
+  `[gemini, ollama]` (`lib/serverLLM.ts`). The browser's `gemini`
   provider proxies through `/api/llm`, which rotates the owner's key pool
   (`lib/geminiKeys.ts`) and reports quota failures so the pool cycles keys.
-  OpenAI/DeepSeek are excluded — their keys are unfunded. Ollama MUST use
+  Gemini failures are classified: a transient per-minute 429 only sets a short
+  `cooldownUntil` (key survives); only hard daily/token exhaustion sets
+  `exhaustedAt` until Pacific midnight. OpenAI/DeepSeek are excluded — their
+  keys are unfunded. Ollama MUST use
   the native `/api/chat` endpoint with `think: false` and `format: "json"`:
   qwen3's thinking mode burns the whole token budget via the OpenAI-compat
   endpoint and returns empty content, and forced-JSON needs `format: "json"`

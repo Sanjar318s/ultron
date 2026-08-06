@@ -18,7 +18,6 @@ const PROVIDER_LABEL: Record<string, string> = {
   webllm: "WEBLLM",
   ollama: "OLLAMA",
   openai: "OPENAI",
-  groq: "GROQ",
   gemini: "GEMINI",
 };
 

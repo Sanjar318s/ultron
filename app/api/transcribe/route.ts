@@ -1,5 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { isQuotaError, reportFailure, resolveKey } from "@/lib/geminiKeys";
+import {
+  isHardExhaustion,
+  isTransientRateLimit,
+  parseRetrySeconds,
+  reportFailure,
+  reportTransient,
+  resolveKey,
+} from "@/lib/geminiKeys";
 
 /**
  * Transcribes a short audio clip (Telegram voice/audio) via Gemini
@@ -65,7 +72,11 @@ export async function POST(req: NextRequest) {
 
   if (!res.ok) {
     const message = payload?.error?.message ?? `HTTP ${res.status}`;
-    if (isQuotaError(message)) await reportFailure("transcribe", keyRes.key, true);
+    if (isHardExhaustion(message)) {
+      await reportFailure("transcribe", keyRes.key, true);
+    } else if (isTransientRateLimit(message)) {
+      await reportTransient("transcribe", keyRes.key, true, parseRetrySeconds(message));
+    }
     return NextResponse.json({ error: message }, { status: res.status === 429 ? 429 : 502 });
   }
 

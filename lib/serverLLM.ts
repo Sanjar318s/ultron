@@ -2,17 +2,17 @@
  * Server-side LLM calls for the /api/assistant core and the web-search flow.
  * Unlike the browser router (which proxies through /api/llm and can use
  * WebLLM/Ollama), this talks to providers directly with server-side keys.
- * Priority: Gemini (per-user key from the key pool) → Ollama (local, unlimited)
- * → Groq. OpenAI/DeepSeek keys are currently unfunded, so they are left out
- * of the chain (re-add them to PROVIDERS once the accounts have a balance).
+ * Priority: Gemini (per-user key from the key pool) → Ollama (local, unlimited).
+ * OpenAI/DeepSeek keys are currently unfunded, so they are left out of the
+ * chain (re-add them to PROVIDERS once the accounts have a balance).
  */
 
 import type { ChatMessage } from "./llm/types";
 import { messageText } from "./llm/types";
 import { PRESET_CHAIN, PRESET_GEMINI_MODEL, type ModelPreset } from "./userSettings";
+import type { Timeline } from "./timeline";
 
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
@@ -20,7 +20,6 @@ const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "qwen3:8b";
 
 const MODELS: Record<string, string> = {
   openai: "gpt-4.1-mini",
-  groq: "llama-3.3-70b-versatile",
   deepseek: "deepseek-chat",
   gemini: "gemini-3.1-flash-lite",
 };
@@ -28,8 +27,23 @@ const MODELS: Record<string, string> = {
 const PROVIDERS: Array<{ id: string; key?: string }> = [
   { id: "gemini", key: process.env.GEMINI_API_KEY },
   { id: "ollama" },
-  { id: "groq", key: process.env.GROQ_API_KEY },
 ];
+
+/**
+ * Client-side Gemini burst guard. Free tier allows ~20 requests/min; we keep
+ * a self-imposed ceiling well below it so the code never self-inflicts a 429
+ * and then has to recover from it. Exceeding the window throws a synthetic
+ * skip error that makes the chain fall through to the next provider instantly.
+ */
+const GEMINI_RPM_LIMIT = 16;
+const geminiReqTimes: number[] = [];
+function geminiRateOk(): boolean {
+  const now = Date.now();
+  while (geminiReqTimes.length && now - geminiReqTimes[0] > 60_000) geminiReqTimes.shift();
+  if (geminiReqTimes.length >= GEMINI_RPM_LIMIT) return false;
+  geminiReqTimes.push(now);
+  return true;
+}
 
 function toGemini(messages: ChatMessage[]) {
   const system = messages
@@ -92,6 +106,7 @@ async function callProvider(messages: ChatMessage[], p: { id: string; key?: stri
   if (!p.key) throw new Error(`${p.id} no key`);
   let content: string | undefined;
   if (p.id === "gemini") {
+    if (!geminiRateOk()) throw new Error("gemini rate-limited (client-side 16/min)");
     const res = await fetch(`${GEMINI_URL}/${p.model ?? MODELS.gemini}:generateContent`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": p.key },
@@ -111,7 +126,7 @@ async function callProvider(messages: ChatMessage[], p: { id: string; key?: stri
       .join("")
       .trim();
   } else {
-    const url = p.id === "openai" ? OPENAI_URL : p.id === "groq" ? GROQ_URL : DEEPSEEK_URL;
+    const url = p.id === "openai" ? OPENAI_URL : DEEPSEEK_URL;
     const flat = messages.map((m) => ({ role: m.role, content: messageText(m) }));
     const res = await fetch(url, {
       method: "POST",
@@ -146,7 +161,13 @@ export interface CloudResult {
  */
 export async function completeCloudMeta(
   messages: ChatMessage[],
-  opts?: { geminiKey?: string; model?: string; provider?: "gemini" | "ollama" | "groq"; preset?: ModelPreset },
+  opts?: {
+    geminiKey?: string;
+    model?: string;
+    provider?: "gemini" | "ollama";
+    preset?: ModelPreset;
+    timeline?: Timeline;
+  },
 ): Promise<CloudResult> {
   let lastError: unknown = null;
   const chain = opts?.provider
@@ -161,9 +182,12 @@ export async function completeCloudMeta(
     const key = p.id === "gemini" ? opts?.geminiKey || p.key : p.key;
     if (p.id !== "ollama" && !key) continue;
     try {
+      opts?.timeline?.mark(`provider:${p.id}`);
       const text = await callProvider(messages, { id: p.id, key, model });
+      opts?.timeline?.mark(`provider:${p.id}:ok`);
       return { text, provider: p.id };
     } catch (err) {
+      opts?.timeline?.mark(`provider:${p.id}:fail`);
       lastError = err;
       console.warn(`[assistant] ${p.id} failed:`, err);
     }
@@ -174,7 +198,7 @@ export async function completeCloudMeta(
 /** Legacy string-returning wrapper (kept for all existing callers). */
 export async function completeCloud(
   messages: ChatMessage[],
-  opts?: { geminiKey?: string; model?: string; provider?: "gemini" | "ollama" | "groq"; preset?: ModelPreset },
+  opts?: { geminiKey?: string; model?: string; provider?: "gemini" | "ollama"; preset?: ModelPreset },
 ): Promise<string> {
   const r = await completeCloudMeta(messages, opts);
   return r.text;

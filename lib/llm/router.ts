@@ -3,7 +3,7 @@
  * down the chain on failure. Priority order is configurable at runtime
  * (setPreferred) and defaults to:
  *
- *   Gemini → Ollama → Groq → WebLLM
+ *   Gemini → Ollama → WebLLM
  *
  * (OpenAI/DeepSeek keys exist but are unfunded — removed from the active
  * chain so we don't wait on their timeouts.)
@@ -13,7 +13,7 @@
 
 import type { ChatMessage, CompleteOptions, LLMProvider, LLMResult, ProviderId } from "./types";
 
-export const DEFAULT_ORDER: ProviderId[] = ["gemini", "ollama", "groq", "webllm"];
+export const DEFAULT_ORDER: ProviderId[] = ["gemini", "ollama", "webllm"];
 
 export class LLMRouter {
   private readonly providers = new Map<ProviderId, LLMProvider>();

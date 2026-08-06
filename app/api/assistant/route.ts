@@ -8,7 +8,16 @@ import {
   type LLMLearnItem,
 } from "@/lib/assistantBrain";
 import { completeCloud, completeCloudMeta, completeWithProvider } from "@/lib/serverLLM";
-import { isQuotaError, reportFailure, resolveKey, type ResolveResult } from "@/lib/geminiKeys";
+import {
+  isHardExhaustion,
+  isTransientRateLimit,
+  parseRetrySeconds,
+  reportFailure,
+  reportTransient,
+  resolveKey,
+  type ResolveResult,
+} from "@/lib/geminiKeys";
+import { Timeline } from "@/lib/timeline";
 import { getLearnedFacts } from "@/lib/lessonStore";
 import {
   execute as executeCatalogSkill,
@@ -79,7 +88,7 @@ function isLocalRequest(req: NextRequest): boolean {
 }
 
 /** How to call the LLM chain for this request (which Gemini key, if any). */
-export type CloudOpts = { geminiKey?: string; skipGemini?: boolean; model?: string; provider?: "gemini" | "ollama" | "groq"; preset?: ModelPreset };
+export type CloudOpts = { geminiKey?: string; skipGemini?: boolean; model?: string; provider?: "gemini" | "ollama"; preset?: ModelPreset };
 
 /** Stronger model for the skill executor loop (flash-lite derails on the JSON contract). */
 const EXECUTOR_MODEL = "gemini-3.5-flash";
@@ -87,20 +96,27 @@ const EXECUTOR_MODEL = "gemini-3.5-flash";
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
- * Retry transient 429 rate limits (groq TPM windows free up within seconds).
- * gemini 429 = exhausted quota, so it is never retried here.
+ * Retry TRANSIENT 429 rate limits (a per-minute RPM window usually frees up
+ * within seconds). A retry only fires when the error carries a parseable
+ * server-side wait; a hard daily quota or our own client-side burst guard
+ * falls through immediately. `parseRetrySeconds` understands Google's formats
+ * («Please retry in 30s», «Please try again in 28m6.528s») so we never do the
+ * old blind 7s+15s dead-wait on an unparsed message.
  */
-async function with429Retry(provider: string, fn: () => Promise<string>): Promise<string> {
+async function with429Retry(fn: () => Promise<string>): Promise<string> {
   let attempt = 0;
   for (;;) {
     try {
       return await fn();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const wait = /try again in ([0-9.]+)s/i.exec(msg);
-      if (provider !== "gemini" && attempt < 2 && /429|rate limit|rate_limit|try again in/i.test(msg)) {
+      const wait = parseRetrySeconds(msg);
+      // Only a SHORT server-side wait is worth sleeping mid-request; a long
+      // window (≥30s) means "fall through to the next provider now" — the key
+      // gets a cooldown and recovers on its own between requests.
+      if (attempt < 2 && isTransientRateLimit(msg) && wait !== null && wait <= 20) {
         attempt += 1;
-        await sleep(attempt === 1 ? (wait ? Number(wait[1]) * 1000 + 1000 : 7000) : 15000);
+        await sleep(Math.min(wait * 1000 + 1000, 20_000));
         continue;
       }
       throw err;
@@ -108,19 +124,34 @@ async function with429Retry(provider: string, fn: () => Promise<string>): Promis
   }
 }
 
+/** Classify a gemini failure and update the key pool accordingly. */
+async function reportGeminiFailure(
+  chatKey: string,
+  key: string,
+  isOwner: boolean,
+  err: unknown,
+): Promise<void> {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (isHardExhaustion(msg)) {
+    await reportFailure(chatKey, key, isOwner);
+  } else if (isTransientRateLimit(msg)) {
+    await reportTransient(chatKey, key, isOwner, parseRetrySeconds(msg));
+  }
+}
+
 /**
  * Executor factory with pin-once semantics: the skill loop should run on a
  * SINGLE provider end-to-end, or round N (a weak model) silently undoes
  * rounds 1..N-1. Prefer the local unlimited model (ollama / qwen3:14b) for
- * deterministic latency; groq is the quality fallback; gemini is dead (quota)
- * and only a last resort. If the pinned provider dies mid-run, the pin is
- * cleared so the next provider in the order gets a chance instead of throwing
- * «all providers unavailable» while ollama is still healthy.
+ * deterministic latency; gemini is the quality fallback (transient 429s set a
+ * short cooldown instead of killing the key). If the pinned provider dies
+ * mid-run, the pin is cleared so the next provider gets a chance instead of
+ * throwing «all providers unavailable» while ollama is still healthy.
  */
-function makeExecutorComplete(cloudOpts: CloudOpts) {
+function makeExecutorComplete(cloudOpts: CloudOpts, chatKey?: string, isOwner?: boolean, timeline?: Timeline) {
   const failed: Set<string> = new Set();
-  let pin: "gemini" | "groq" | "ollama" | undefined;
-  const order: Array<"gemini" | "groq" | "ollama"> = ["ollama", "groq", "gemini"];
+  let pin: "gemini" | "ollama" | undefined;
+  const order: Array<"gemini" | "ollama"> = ["ollama", "gemini"];
   return async (msgs: Parameters<typeof completeCloud>[0]): Promise<string> => {
     for (const p of order) {
       if (pin) {
@@ -128,16 +159,22 @@ function makeExecutorComplete(cloudOpts: CloudOpts) {
       } else if (failed.has(p)) {
         continue;
       }
+      timeline?.mark(`executor:${p}:attempt`);
       try {
-        const out = await with429Retry(p, () =>
+        const out = await with429Retry(() =>
           completeCloud(msgs, { ...cloudOpts, model: EXECUTOR_MODEL, provider: p }),
         );
+        timeline?.mark(`executor:${p}:ok`);
         if (!pin) console.log(`[skill-executor] pinned ${p}`);
         pin = p;
         return out;
       } catch (err) {
+        timeline?.mark(`executor:${p}:fail`);
         failed.add(p);
         if (pin === p) pin = undefined;
+        if (p === "gemini" && chatKey && cloudOpts.geminiKey) {
+          await reportGeminiFailure(chatKey, cloudOpts.geminiKey, !!isOwner, err);
+        }
         console.warn(`[skill-executor] ${p} failed, switching:`, err);
       }
     }
@@ -164,14 +201,15 @@ async function runSkillDispatch(
   baseUrl: string,
   chatKey: string,
   cloudOpts: CloudOpts,
+  timeline?: Timeline,
 ): Promise<{ reply: string; needsApproval?: { id: string; description: string }; files?: WireFile[]; verified?: boolean }> {
   const screen = brain.findSkill(name);
   if (screen) {
     return { reply: await executeSkill(brain, screen.id, baseUrl) };
   }
-  // The LLM picks the skill name, but it's weak at choosing (gemini quota
-  // dead → groq/ollama). Resolve against the ORIGINAL user text instead,
-  // where the description+aliases overlap is decisive (data vs python).
+  // The LLM picks the skill name, but it's weak at choosing (gemini quota /
+  // ollama). Resolve against the ORIGINAL user text instead, where the
+  // description+aliases overlap is decisive (data vs python).
   const byQuery = await bestMatch(userText || name);
   const cat =
     byQuery.skill && (byQuery.score >= 0.3 || !(await catalogFuzzyFind(name)))
@@ -188,7 +226,7 @@ async function runSkillDispatch(
     }
     const res = await executeCatalogSkill(cat, userText || name, {
       chatId: chatKey,
-      complete: makeExecutorComplete(cloudOpts),
+      complete: makeExecutorComplete(cloudOpts, chatKey, undefined, timeline),
     });
     return { reply: res.reply, files: res.artifacts, verified: res.verified };
   }
@@ -381,7 +419,7 @@ async function executeHandledAction(
   brain: AssistantBrain,
   action: AssistantAction,
   baseUrl: string,
-  ctx: { chatKey: string; cloudOpts: CloudOpts; userText?: string },
+  ctx: { chatKey: string; cloudOpts: CloudOpts; userText?: string; timeline?: Timeline },
 ): Promise<{
   reply: string;
   image?: { b64: string; mime: string };
@@ -411,6 +449,7 @@ async function executeHandledAction(
         baseUrl,
         ctx.chatKey,
         ctx.cloudOpts,
+        ctx.timeline,
       );
       recordProvider("local", ctx.chatKey);
       return {
@@ -564,8 +603,10 @@ export async function POST(req: NextRequest) {
   const chatId = typeof body?.chatId === "string" ? body.chatId : "";
   const isOwner = body?.isOwner === true;
   const chatKey = chatId || "anon";
-  const gemini: ResolveResult = await resolveKey(chatKey, isOwner);
   const preset = getUserPreset(chatKey);
+  const timeline = new Timeline("assistant", { chatKey, preset, isOwner });
+  const gemini: ResolveResult = await resolveKey(chatKey, isOwner);
+  timeline.mark("resolveKey");
   const cloudOpts: CloudOpts = {
     ...(gemini.provider === "gemini" ? { geminiKey: gemini.key } : { skipGemini: true }),
     preset,
@@ -584,7 +625,7 @@ export async function POST(req: NextRequest) {
       const opts: CloudOpts = g.provider === "gemini" ? { geminiKey: g.key } : { skipGemini: true };
       const res = await executeCatalogSkill(cat, skillCtx.name, {
         chatId: skillCtx.chatId,
-        complete: makeExecutorComplete(opts),
+        complete: makeExecutorComplete(opts, skillCtx.chatId, isOwner),
       });
       return NextResponse.json({ reply: res.reply, ...(res.artifacts?.length ? { files: res.artifacts } : {}), ...(res.verified !== undefined ? { verified: res.verified } : {}) });
     }
@@ -649,6 +690,7 @@ export async function POST(req: NextRequest) {
           type: outcome.action.kind === "learn-site" ? "site" : "image",
           content: outcome.action.url,
         });
+        timeline.finish({ stage: "handled", kind: "study" });
         return NextResponse.json({
           reply: outcome.reply,
           studyJobId: job.id,
@@ -657,6 +699,7 @@ export async function POST(req: NextRequest) {
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        timeline.finish({ stage: "handled", kind: "study", failed: message.slice(0, 120) });
         return NextResponse.json({ reply: `Не удалось запустить изучение: ${message}.`, provider: null });
       }
     }
@@ -711,9 +754,11 @@ export async function POST(req: NextRequest) {
         const reply = isVideo
           ? `Изучил видео (${(pageText.length / 1000).toFixed(1)} тыс. символов, ${chapterCount} ${chWord}): «${note.topic}».`
           : `Изучил: «${note.topic}».`;
+        timeline.finish({ stage: "handled", kind: "learn-url" });
         return NextResponse.json({ reply, provider: null, ...(gemini.note ? { note: gemini.note } : {}) });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        timeline.finish({ stage: "handled", kind: "learn-url", failed: message.slice(0, 120) });
         return NextResponse.json({ reply: `Не удалось изучить страницу: ${message}.`, provider: null, ...(gemini.note ? { note: gemini.note } : {}) });
       }
     }
@@ -721,18 +766,22 @@ export async function POST(req: NextRequest) {
     // Real actions (launch / run-skill / weather / orb / search) — execute
     // and reply. Search+learn mutates the brain, so persist afterwards.
     if (outcome.action) {
+      timeline.mark("action");
       const executed = await executeHandledAction(brain, outcome.action, baseUrl, {
         chatKey,
         cloudOpts,
         userText: text,
+        timeline,
       });
       await commitBrain(brain, baseIds);
       const reply = executed.image
         ? executed.reply || "Изображение готово."
         : executed.reply || outcome.reply;
+      timeline.finish({ stage: "handled", kind: outcome.action.kind });
       return NextResponse.json({ reply, image: executed.image, provider: null, ...(executed.needsApproval ? { needsApproval: executed.needsApproval } : {}), ...(gemini.note ? { note: gemini.note } : {}) });
     }
 
+    timeline.finish({ stage: "handled", kind: "rule" });
     return NextResponse.json({ reply: outcome.reply, provider: null, ...(gemini.note ? { note: gemini.note } : {}) });
   }
 
@@ -741,18 +790,20 @@ export async function POST(req: NextRequest) {
   if (outcome.needsAbilityAnalysis) {
     const reply = await answerAbilityQuery(brain, outcome.abilityQuery ?? "list", outcome.abilityName);
     await commitBrain(brain, baseIds);
+    timeline.finish({ stage: "handled", kind: "ability" });
     return NextResponse.json({ reply, provider: null });
   }
 
   // Deterministic skill gate: when the user text strongly matches a sandbox
   // SKILL.md catalog skill AND the request is an imperative task, dispatch it
-  // WITHOUT asking the LLM escalate (gemini quota dead → groq parrots its
-  // capabilities instead of returning run-skill JSON, so the executor never
-  // fires). Long verbose requests dilute the fuzzy ratio (measured 0.40 for a
-  // full plot request), and meta-questions about skills score identically —
-  // so a bare threshold can't separate them: require a leading task verb too.
-  // Only script skills (python/data) are gated; knowledge skills (pdf/docx/
-  // image-style/…) keep going through the escalate, which knows how to answer.
+  // WITHOUT asking the LLM escalate (the escalate is too weak at choosing —
+  // it parrots capabilities instead of returning run-skill JSON, so the
+  // executor never fires). Long verbose requests dilute the fuzzy ratio
+  // (measured 0.40 for a full plot request), and meta-questions about skills
+  // score identically — so a bare threshold can't separate them: require a
+  // leading task verb too. Only script skills (python/data) are gated;
+  // knowledge skills (pdf/docx/image-style/…) keep going through the escalate,
+  // which knows how to answer.
   const directSkill = await bestMatch(visibleText);
   const GATE_SKILLS = new Set(["python", "data"]);
   const TASK_VERB_RE =
@@ -770,8 +821,10 @@ export async function POST(req: NextRequest) {
       baseUrl,
       chatKey,
       cloudOpts,
+      timeline,
     );
     await commitBrain(brain, baseIds);
+    timeline.finish({ stage: "skill-gate", kind: directSkill.skill.slug });
     return NextResponse.json({
       reply: dispatched.reply,
       ...(dispatched.needsApproval ? { needsApproval: dispatched.needsApproval } : {}),
@@ -795,7 +848,7 @@ export async function POST(req: NextRequest) {
       (await learnedFactsSystemNote()) +
       n8nActionsPrompt() +
       `\n\n${await getSystemContext()}` +
-      `\n\nПРОЗРАЧНОСТЬ ИСТОЧНИКА: ты НЕ знаешь, какой API-провайдер (Gemini/Ollama/Groq) обрабатывает твой ответ — система укажет источник автоматически. Никогда не утверждай, что ответил через конкретный сервис или что использовал/не использовал Gemini.` +
+      `\n\nПРОЗРАЧНОСТЬ ИСТОЧНИКА: ты НЕ знаешь, какой API-провайдер (Gemini/Ollama) обрабатывает твой ответ — система укажет источник автоматически. Никогда не утверждай, что ответил через конкретный сервис или что использовал/не использовал Gemini.` +
       `\n\nТОЧНЫЕ ДАННЫЕ: никогда не выдумывай статистику, цифры, даты и факты об актуальных событиях. Если запрос требует таких данных — верни action {"type":"search","query":"<поисковый запрос>"}. Если данных нет и поиск неуместен — честно скажи, что не знаешь.`;
     const messages = [
       { role: "system" as const, content: systemContent },
@@ -808,18 +861,21 @@ export async function POST(req: NextRequest) {
     let result: string;
     let answerProvider = "ollama";
     try {
-      const cloudResult = await completeCloudMeta(messages, cloudOpts);
+      timeline.mark("escalate");
+      const cloudResult = await completeCloudMeta(messages, { ...cloudOpts, timeline });
       result = cloudResult.text;
       answerProvider = cloudResult.provider;
     } catch (err) {
-      // Gemini quota hit → mark the key exhausted so the pool rotates/reports.
-      if (gemini.key && isQuotaError(err instanceof Error ? err.message : String(err))) {
-        await reportFailure(chatKey, gemini.key, isOwner);
-      }
+      // Classify the failure: a transient rate limit only cools the key down,
+      // a hard daily/token quota marks it exhausted until midnight.
+      timeline.mark("escalate:fail");
+      if (gemini.key) await reportGeminiFailure(chatKey, gemini.key, isOwner, err);
       throw err;
     }
     recordProvider(answerProvider, chatKey);
+    timeline.mark("parse");
     const parsed = await parseWithRetry(result, messages, cloudOpts);
+    timeline.mark("parse:done");
 
     const reply =
       typeof parsed?.reply === "string" && parsed.reply.trim() ? parsed.reply.trim() : "Выполнено.";
@@ -884,7 +940,8 @@ export async function POST(req: NextRequest) {
           if (llmAction.kind === "run-skill" && !isExplicitTask(text)) {
             // Blocked: only the textual reply is shown, nothing executes.
           } else {
-            const executed = await executeHandledAction(brain, llmAction, baseUrl, { chatKey, cloudOpts, userText: text });
+            timeline.mark("action");
+            const executed = await executeHandledAction(brain, llmAction, baseUrl, { chatKey, cloudOpts, userText: text, timeline });
             if (executed.reply) actionReply = executed.reply;
             if (executed.needsApproval) needsApproval = executed.needsApproval;
             if (executed.image) image = executed.image;
@@ -961,6 +1018,7 @@ export async function POST(req: NextRequest) {
 
     await commitBrain(brain, baseIds);
     const providerOut = answerProvider ?? (admin ? "server" : "llm");
+    timeline.finish({ stage: "escalate", provider: providerOut });
     return NextResponse.json({
       reply: actionReply ?? finalReply,
       generate,
@@ -973,6 +1031,7 @@ export async function POST(req: NextRequest) {
     });
   } catch (err) {
     console.warn("[assistant] llm escalation failed:", err);
+    timeline.finish({ stage: "escalate", failed: err instanceof Error ? err.message.slice(0, 150) : String(err) });
     await commitBrain(brain, baseIds);
     // All models down but the phrase was an explicit image request → fall
     // back to the keyless generator so «нарисуй …» still works.

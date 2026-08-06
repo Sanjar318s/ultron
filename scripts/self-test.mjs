@@ -20,6 +20,11 @@ import {
   composeFinalReply,
 } from "../lib/intentGuards.ts";
 import { PRESET_CHAIN, PRESET_GEMINI_MODEL, MODEL_PRESETS, DEFAULT_PRESET } from "../lib/userSettings.ts";
+import {
+  parseRetrySeconds,
+  isTransientRateLimit,
+  isHardExhaustion,
+} from "../lib/geminiKeys.ts";
 
 /**
  * Self-test suite for the ULTRON PC-control surface.
@@ -153,16 +158,30 @@ export async function runSelfTests({ live = false } = {}) {
     // P5: final reply carries NO «Запомнил.» noise, artifact tail is separate.
     ["final reply clean", composeFinalReply("Вот ответ", 3) === "Вот ответ"],
     ["final reply no suffix", !composeFinalReply("Ответ", 1).includes("Запомнил")],
-    // Router presets: preferred chain + model mapping (⚡/🧠/🏠).
+    // Router presets: preferred chain + model mapping (⚡/🧠/🏠). No Groq.
     ["preset local first ollama", PRESET_CHAIN.local[0] === "ollama"],
-    ["preset local falls groq→gemini", JSON.stringify(PRESET_CHAIN.local) === JSON.stringify(["ollama", "groq", "gemini"])],
+    ["preset local second gemini", PRESET_CHAIN.local[1] === "gemini"],
     ["preset flash first gemini", PRESET_CHAIN.flash[0] === "gemini"],
-    ["preset flash groq before ollama", PRESET_CHAIN.flash.indexOf("groq") < PRESET_CHAIN.flash.indexOf("ollama")],
+    ["preset flash second ollama", PRESET_CHAIN.flash[1] === "ollama"],
     ["preset pro first gemini", PRESET_CHAIN.pro[0] === "gemini"],
-    ["preset pro ollama before groq", PRESET_CHAIN.pro.indexOf("ollama") < PRESET_CHAIN.pro.indexOf("groq")],
+    ["preset pro second ollama", PRESET_CHAIN.pro[1] === "ollama"],
+    ["preset no groq anywhere", !Object.values(PRESET_CHAIN).flat().includes("groq")],
     ["preset pro model is deep", PRESET_GEMINI_MODEL.pro !== PRESET_GEMINI_MODEL.flash],
     ["preset default local", DEFAULT_PRESET === "local"],
     ["preset 3 options", Object.keys(MODEL_PRESETS).length === 3],
+    // Gemini error classification: transient RPM must NOT kill the key; a
+    // hard daily/token quota or an absurdly long retry window must.
+    ["rate parse 30s", parseRetrySeconds("Please retry in 30.325598225s") === 30.325598225],
+    ["rate parse compact m+s", parseRetrySeconds("Please try again in 28m6.528s") === 28 * 60 + 6.528],
+    ["rate parse hours+min", parseRetrySeconds("try again in 1h30m") === 5400],
+    ["rate parse unparseable", parseRetrySeconds("Internal server error") === null],
+    ["rate parse missing unit", parseRetrySeconds("retry in 45") === 45],
+    ["429 short wait is transient", isTransientRateLimit("Quota exceeded for metric: generate_content_free_tier_requests, limit: 20. Please retry in 30s") === true],
+    ["429 short wait NOT hard", isHardExhaustion("Quota exceeded for metric: generate_content_free_tier_requests, limit: 20. Please retry in 30s") === false],
+    ["long wait is hard", isHardExhaustion("Quota exceeded. Please retry in 28m6.528s") === true],
+    ["daily keyword is hard", isHardExhaustion("429 RESOURCE_EXHAUSTED: daily tokens per day exhausted") === true],
+    ["client-side limit is transient", isTransientRateLimit("gemini rate-limited (client-side 16/min)") === true],
+    ["client-side limit not hard", isHardExhaustion("gemini rate-limited (client-side 16/min)") === false],
   ];
   for (const [name, ok] of pureChecks) check(`pure ${name}`, ok);
 

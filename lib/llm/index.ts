@@ -1,6 +1,6 @@
 /**
  * createAssistantLLM — assembles the full provider chain + router for the
- * assistant. Cloud providers (OpenAI/Groq/Gemini) read their "configured"
+ * assistant. Cloud providers (OpenAI/DeepSeek/Gemini) read their "configured"
  * flag from a shared CloudFlags object that is refreshed from the server
  * (/api/llm GET) so the browser knows which keys exist without ever seeing
  * the keys themselves.
@@ -19,10 +19,9 @@ export interface AssistantLLM {
 }
 
 export function createAssistantLLM(): AssistantLLM {
-  const cloud: CloudFlags = { openai: false, groq: false, deepseek: false, gemini: false };
+  const cloud: CloudFlags = { openai: false, deepseek: false, gemini: false };
 
   const openai = createOpenAICloudProvider("openai", "OpenAI", cloud);
-  const groq = createOpenAICloudProvider("groq", "Groq", cloud);
   const deepseek = createOpenAICloudProvider("deepseek", "DeepSeek", cloud);
   const gemini = createGeminiProvider(cloud);
   const ollama = createOllamaProvider("http://localhost:11434", "qwen3:8b");
@@ -32,8 +31,8 @@ export function createAssistantLLM(): AssistantLLM {
   // be funded later) but are filtered out of the order, so the router never
   // waits on their timeouts.
   const router = new LLMRouter(
-    [webllm, ollama, openai, groq, deepseek, gemini],
-    ["ollama", "gemini", "groq", "webllm"],
+    [webllm, ollama, openai, deepseek, gemini],
+    ["ollama", "gemini", "webllm"],
   );
 
   const refresh = async () => {
@@ -42,7 +41,6 @@ export function createAssistantLLM(): AssistantLLM {
       if (!res.ok) return;
       const flags = (await res.json()) as Partial<CloudFlags>;
       cloud.openai = Boolean(flags.openai);
-      cloud.groq = Boolean(flags.groq);
       cloud.deepseek = Boolean(flags.deepseek);
       cloud.gemini = Boolean(flags.gemini);
     } catch {

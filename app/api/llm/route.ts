@@ -1,7 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { ContentPart } from "@/lib/llm/types";
 import { messageText } from "@/lib/llm/types";
-import { resolveKey as poolResolveKey, reportFailure as poolReportFailure, isQuotaError as poolIsQuota } from "@/lib/geminiKeys";
+import {
+  resolveKey as poolResolveKey,
+  reportFailure as poolReportFailure,
+  reportTransient as poolReportTransient,
+  isHardExhaustion as poolHard,
+  isTransientRateLimit as poolTransient,
+  parseRetrySeconds,
+} from "@/lib/geminiKeys";
 
 /**
  * Server-side LLM proxy for the cloud providers. Browser code sends
@@ -16,20 +23,17 @@ import { resolveKey as poolResolveKey, reportFailure as poolReportFailure, isQuo
 export const runtime = "nodejs";
 
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
 const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 
 const MODELS: Record<string, string> = {
   openai: "gpt-4.1-mini",
-  groq: "llama-3.3-70b-versatile",
   deepseek: "deepseek-chat",
   gemini: "gemini-3.1-flash-lite",
 };
 
 const KEYS: Record<string, () => string | undefined> = {
   openai: () => process.env.OPENAI_API_KEY,
-  groq: () => process.env.GROQ_API_KEY,
   deepseek: () => process.env.DEEPSEEK_API_KEY,
   gemini: () => process.env.GEMINI_API_KEY,
 };
@@ -129,7 +133,6 @@ async function postJson(url: string, init: RequestInit): Promise<unknown> {
 export async function GET() {
   return NextResponse.json({
     openai: Boolean(process.env.OPENAI_API_KEY),
-    groq: Boolean(process.env.GROQ_API_KEY),
     deepseek: Boolean(process.env.DEEPSEEK_API_KEY),
     gemini: Boolean(process.env.GEMINI_API_KEY),
   });
@@ -179,7 +182,7 @@ export async function POST(req: NextRequest) {
       })) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
       content = data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("").trim();
     } else {
-      const url = provider === "openai" ? OPENAI_URL : provider === "groq" ? GROQ_URL : DEEPSEEK_URL;
+      const url = provider === "openai" ? OPENAI_URL : DEEPSEEK_URL;
       const flat = messages.map((m) => ({ role: m.role, content: messageText(m) }));
       const data = (await postJson(url, {
         method: "POST",
@@ -204,8 +207,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ content });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    if (provider === "gemini" && key && poolIsQuota(message)) {
-      void poolReportFailure("", key, true);
+    if (provider === "gemini" && key) {
+      if (poolHard(message)) {
+        void poolReportFailure("", key, true);
+      } else if (poolTransient(message)) {
+        void poolReportTransient("", key, true, parseRetrySeconds(message));
+      }
     }
     return NextResponse.json({ error: message }, { status: 502 });
   }
