@@ -105,11 +105,11 @@ async function callProvider(messages: ChatMessage[], p: { id: string; key?: stri
         // qwen3 sometimes ignores the "return strict JSON" instruction and
         // answers conversationally — structured output forces valid JSON.
         format: "json",
-        // 1024, not 2048: decode runs at ~30 tok/s on this box, so a long
-        // response eats minutes; executor answers are short JSON and the
-        // escalate step fits easily. The saved budget keeps a round inside
-        // the 180s window.
-        options: { temperature: 0.3, num_predict: 1024 },
+        // 8b (executor) gets 3072: a full reportlab script easily exceeds
+        // 1024 tokens, and truncating mid-`--raw "…"` produced UNPARSED
+        // JSON every round. The 14b general-chat model stays at 1024 — its
+        // decode is slower and its replies are short JSON/plain text.
+        options: { temperature: 0.3, num_predict: model === OLLAMA_EXECUTOR_MODEL ? 3072 : 1024 },
         keep_alive: OLLAMA_KEEP_ALIVE,
       }),
       // 180s, not 120s: a 10GB model evicted under RAM pressure takes ~2min to

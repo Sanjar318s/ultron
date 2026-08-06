@@ -272,6 +272,28 @@ async function collectArtifacts(workdir: string, before: Set<string>): Promise<A
     .map((f) => ({ rel: f.rel, name: path.basename(f.abs), size: f.size, mime: mimeForRel(f.rel) }));
 }
 
+/** True only for genuinely-typed deliverable files: a .pdf must really start
+ *  with "%PDF-" — the executor model once "created" a resume by writing a
+ *  pdfplumber script into a file named resume.pdf, and the name-only check let
+ *  it through. Extend with more magic bytes as new formats are needed. */
+async function isRealDeliverable(workdir: string, name: string): Promise<boolean> {
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".pdf")) {
+    let fh: fs.FileHandle | undefined;
+    try {
+      fh = await fs.open(path.join(workdir, name), "r");
+      const buf = Buffer.alloc(5);
+      const { bytesRead } = await fh.read(buf, 0, 5, 0);
+      return bytesRead >= 5 && buf.toString("latin1").startsWith("%PDF-");
+    } catch {
+      return false;
+    } finally {
+      await fh?.close().catch(() => {});
+    }
+  }
+  return true;
+}
+
 function artifactKey(f: { rel: string; size: number; mtime: number }): string {
   return `${f.rel}\0${f.size}\0${f.mtime}`;
 }
@@ -287,6 +309,28 @@ const DELIVERABLE_EXT = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "txt", "csv", "md", "json", "html",
   "pdf", "xlsx", "xls", "pptx", "docx", "zip", "py", "log",
 ]);
+
+// --- Requested-format check --------------------------------------------------
+// A model can report {done} while delivering a script instead of the artifact
+// the user asked for («сделай резюме в виде pdf» → resume_template.js). If the
+// query names an output format and the run produced NO file of that format,
+// send one corrective round instead of shipping the wrong deliverable.
+const FILE_FORMAT = "(?:pdf|docx|xlsx|xls|pptx|csv|png|jpe?g|gif|webp|txt|md|json|html|zip|py)";
+const REQUESTED_FORMAT_RE = new RegExp(
+  `(?:^|\\s)(?:в виде|в формате|в формат|формат(?:ом)?)\\s+(?:файл(?:а|ов)?\\s+)?(${FILE_FORMAT})\\b` +
+    `|(?:^|\\s)(?:сохрани(?:ть)?|запиши)\\s+(?:в|как)?\\s*(?:файл\\s+)?(${FILE_FORMAT})\\b` +
+    `|(?:^|\\s)(?:создай|сделай)\\b[^.!?\\n]{0,80}\\b(${FILE_FORMAT})\\b`,
+  "i",
+);
+
+/** Output extension the user explicitly asked for; null when the query is
+ *  format-agnostic (no format words → no format gate). */
+function requestedFormatFrom(query: string): string | null {
+  const m = String(query ?? "").match(REQUESTED_FORMAT_RE);
+  if (!m) return null;
+  const fmt = (m[1] ?? m[2] ?? m[3]).toLowerCase();
+  return fmt === "jpg" ? "jpeg" : fmt;
+}
 
 /** Filenames the model explicitly referenced in its done.result text. */
 function fileRefsFromResult(result: string): string[] {
@@ -344,7 +388,14 @@ function unquotedView(cmd: string): string {
 function validateCommand(cmd: string): string | null {
   const trimmed = normalizeCommand(cmd).trim();
   if (!trimmed || trimmed.length > MAX_CMD_LEN) return `пустая или слишком длинная команда (лимит ${MAX_CMD_LEN} симв.)`;
-  const lower = unquotedView(trimmed).toLowerCase();
+  // The sandbox-write helper's --raw payload is FILE CONTENT, not a shell
+  // command: it legitimately contains > | < ; etc. (reportlab markup, arrows,
+  // pipes in text). spawn() runs without a shell, so the payload can never
+  // redirect or pipe; the helper itself validates the relpath. Only the part
+  // BEFORE --raw (bin + relpath + flags) gets the blocked-fragment check.
+  const rawAt = trimmed.indexOf("--raw");
+  const checkView = unquotedView(rawAt === -1 ? trimmed : trimmed.slice(0, rawAt));
+  const lower = checkView.toLowerCase();
   for (const f of BLOCKED_FRAGMENTS) {
     if (lower.includes(f)) return `запрещённый фрагмент «${f}»`;
   }
@@ -354,17 +405,48 @@ function validateCommand(cmd: string): string | null {
 }
 
 /**
- * Collapse shell-style line continuations (backslash-newline) and bare newlines.
- * The executor model sometimes emits `node \` + newline (or a trailing `\` cut
- * off at the JSON string end), which spawn (no shell) cannot handle. Keeps
- * spaces inside quoted arguments untouched.
+ * Collapse shell-style line continuations (backslash-newline) and bare newlines
+ * OUTSIDE quoted args. Newlines INSIDE quotes must survive: JSON-unescaping
+ * `\n` in the model's `--raw "…"` payload turns it into a real newline, and
+ * flattening it to a space silently corrupts multi-line script content into
+ * one broken line (the PDF run's `import pdfplumber from reportlab …`).
  */
 function normalizeCommand(cmd: string): string {
-  return cmd
-    .replace(/\\\s*\r?\n/g, " ")
-    .replace(/\s*\r?\n/g, " ")
-    .replace(/\\+\s*$/, "")
-    .trim();
+  let out = "";
+  let quote: string | null = null;
+  let i = 0;
+  while (i < cmd.length) {
+    const ch = cmd[i];
+    if (quote) {
+      out += ch;
+      if (ch === "\\" && i + 1 < cmd.length && cmd[i + 1] === quote) {
+        out += cmd[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === "\\" && (i + 1 >= cmd.length || cmd[i + 1] === "\r" || cmd[i + 1] === "\n")) {
+      i += 2;
+      continue;
+    }
+    if (ch === "\r" || ch === "\n") {
+      i += 1;
+      if (!out.endsWith(" ")) out += " ";
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out.replace(/\\+\s*$/, "").trim();
 }
 
 /**
@@ -416,9 +498,36 @@ function splitArgs(cmd: string): string[] {
   return out;
 }
 
+/** Relpath argument of a sandbox-write command, robust to unescaped inner
+ *  quotes in the payload (they would misalign splitArgs' plain arg split). */
+function writeRelPath(cmd: string): string {
+  const m = cmd.match(/sandbox-write\.mjs"\s+"([^"]+)"/);
+  return m ? m[1] : "";
+}
+
+/**
+ * Split a sandbox-write command into argv WITHOUT mangling the --raw payload.
+ * The payload is the LAST argument and may contain real newlines and unescaped
+ * inner quotes (the model rarely escapes them); splitArgs would break it into
+ * junk args. Take everything after `--raw ` verbatim, minus one wrapping quote
+ * char, as the payload.
+ */
+function splitWriteCommand(cmd: string): string[] {
+  const rawIdx = cmd.indexOf("--raw");
+  if (rawIdx === -1) return splitArgs(cmd);
+  const head = splitArgs(cmd.slice(0, rawIdx + "--raw".length));
+  let payload = cmd.slice(rawIdx + "--raw".length).trim();
+  if (payload.length >= 2 && (payload[0] === '"' || payload[0] === "'") && (payload[payload.length - 1] === '"' || payload[payload.length - 1] === "'")) {
+    payload = payload.slice(1, -1);
+  } else if (payload.length >= 1 && (payload[0] === '"' || payload[0] === "'")) {
+    payload = payload.slice(1);
+  }
+  return [...head, payload];
+}
+
 function runSandboxed(cmd: string, cwd: string): Promise<{ ok: boolean; code: number | null; out: string }> {
   return new Promise((resolve) => {
-    const parts = splitArgs(cmd);
+    const parts = cmd.includes("sandbox-write.mjs") ? splitWriteCommand(cmd) : splitArgs(cmd);
     const bin = parts.shift() as string;
     const resolvedBin = bin === "python" || bin === "py" ? process.env.SKILL_PYTHON || "python" : bin === "pip" || bin === "pip3" ? process.env.SKILL_PIP || "pip" : bin;
     const child = spawn(resolvedBin, parts, { cwd, windowsHide: true, env: { ...process.env, PATH: SANDBOX_PATH } });
@@ -468,7 +577,6 @@ export interface ExecuteOptions {
   chatId: string;
 }
 
-const EXEC_RE = /\{[\s\S]*\}/;
 const DONE_RE = /"done"\s*:\s*true/i;
 // Quote-aware fallbacks for malformed JSON: stop at an UNescaped closing quote.
 const RESULT_RE = /"result"\s*:\s*"((?:[^"\\]|\\.)*)"\s*}/;
@@ -478,23 +586,81 @@ function unescapeCmd(s: string): string {
   return s.replace(/\\"/g, '"').replace(/\\\\/g, "\\");
 }
 
-function parseExecReply(text: string): { done: boolean; result?: string; cmd?: string } | null {
-  const match = text.match(EXEC_RE);
-  if (!match) return null;
-  const obj = match[0];
-  try {
-    const parsed = JSON.parse(obj) as { done?: boolean; result?: string; cmd?: string };
-    if (parsed && parsed.done === true) return { done: true, result: parsed.result ?? "" };
-    if (parsed && typeof parsed.cmd === "string") return { done: false, cmd: parsed.cmd };
-  } catch {
-    // fall through to the tolerant regexes (unbalanced quotes / stray text)
+/** Full JSON-string unescape (same table as sandbox-write.mjs's unescapeJson). */
+function jsonUnescapeString(s: string): string {
+  const esc: Record<string, string> = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+  return s
+    .replace(/\\(["\\/bfnrt])/g, (_, c: string) => esc[c] ?? c)
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
+}
+
+/**
+ * Find and parse the first TOP-LEVEL JSON object (brace-balanced, string-aware).
+ * Unlike the old greedy /\{[\s\S]*\}/ this survives object-literal braces inside
+ * --raw content (`{ x: 50 }` in JS code) and trailing prose. Returns null when
+ * there is no balanced object or it isn't valid JSON (then regexes take over).
+ */
+function tryParseJsonObject(text: string): { done?: boolean; result?: string; cmd?: string } | null {
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (inStr) {
+      if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, i + 1)) as { done?: boolean; result?: string; cmd?: string };
+        } catch {
+          return null;
+        }
+      }
+    }
   }
-  if (DONE_RE.test(obj)) {
-    const r = obj.match(RESULT_RE);
+  return null;
+}
+
+function parseExecReply(text: string): { done: boolean; result?: string; cmd?: string } | null {
+  // 1) Balanced top-level JSON object, when present.
+  const obj = tryParseJsonObject(text);
+  if (obj) {
+    if (obj.done === true) return { done: true, result: obj.result ?? "" };
+    if (typeof obj.cmd === "string") return { done: false, cmd: obj.cmd };
+  }
+  // 2) Tolerant regexes over the WHOLE reply — survives a reply truncated
+  //    before the closing brace and free-form prose wrapped around the JSON.
+  if (DONE_RE.test(text)) {
+    const r = text.match(RESULT_RE);
     return { done: true, result: r ? unescapeCmd(r[1]) : "" };
   }
-  const c = obj.match(CMD_RE);
+  const c = text.match(CMD_RE);
   if (c) return { done: false, cmd: unescapeCmd(c[1]) };
+  // 3) Write commands truncated mid-`--raw "…"` (the model hit its output
+  //    cap or cut the JSON string): no closing quote means CMD_RE can't match,
+  //    but for sandbox-write the payload is everything to end-of-reply. The
+  //    payload-aware writer recovers the actual content later.
+  if (text.includes("sandbox-write.mjs") && /"cmd"\s*:\s*"/.test(text)) {
+    const m = text.match(/"cmd"\s*:\s*"([\s\S]*)$/);
+    if (m) {
+      let cmd = jsonUnescapeString(m[1]);
+      if (cmd.endsWith('"}')) cmd = cmd.slice(0, -2);
+      else if (cmd.endsWith('"')) cmd = cmd.slice(0, -1);
+      if (cmd.includes("sandbox-write.mjs")) return { done: false, cmd };
+    }
+  }
   return null;
 }
 
@@ -529,9 +695,10 @@ export async function execute(
     "Отвечай СТРОГО одним JSON-объектом без markdown. Чтобы выполнить команду: {\"cmd\":\"<команда>\",\"explain\":\"<кратко зачем>\"}. Когда задача выполнена: {\"done\":true,\"result\":\"<итог для пользователя: что сделано и путь к файлу>\"}.",
     "Задача УЖЕ дана ниже — не приветствуй, не спрашивай задачу, не описывай окружение. Твой ПЕРВЫЙ ответ — команда, решающая задачу ({\"cmd\":\"...\"}).",
     `Рабочая папка: ${workdir} (все файлы создавай только здесь).`,
-    `Чтобы создать файл (скрипт, данные, результат): node "${WRITE_HELPER}" "<относительный_путь>" --raw "<содержимое>". Содержимое передавай ОДНИМ аргументом с JSON-эскейпами: перенос строки как \\n, кавычки внутри как \\", обратный слэш как \\\\. Путь — только относительный. Затем запускай файл: python "<относительный_путь>". Скрипт должен РЕШАТЬ задачу пользователя, а не быть тестом среды. Пример: задача «вычислить 2**100» → создай work.py с содержимым print(2**100), запусти, и в done.result верни ВЫВОД скрипта.`,
+    `Чтобы создать файл (скрипт, данные, результат): node "${WRITE_HELPER}" "<относительный_путь>" --raw "<содержимое>". Содержимое передавай ОДНИМ аргументом с JSON-эскейпами: перенос строки как \\n, обратный слэш как \\\\. В СОДЕРЖИМОМ используй ТОЛЬКО одинарные кавычки (') для строк Python — двойные кавычки и символы | > < ; в содержимом ЗАПРЕЩЕНЫ (ломают разбор команды). Путь — только относительный. Затем запускай файл: python "<относительный_путь>". Скрипт должен РЕШАТЬ задачу пользователя, а не быть тестом среды. Пример: задача «вычислить 2**100» → создай work.py с содержимым print(2**100), запусти, и в done.result верни ВЫВОД скрипта.`,
     `Скрипты навыка лежат в: ${skill.dir}/scripts/ — вызывай их так: python "${path.join(skill.dir, "scripts", "<файл>")}" <аргументы> (python = ${process.env.SKILL_PYTHON || "python"}).`,
     "Разрешены ТОЛЬКО: python, py, node, pip. Запрещены: git, curl, powershell, cmd, удаление вне рабочей папки, перенаправления, подстановки, точки «..».",
+    "УСТАНОВЛЕННЫЕ Python-библиотеки (используй ТОЛЬКО их): reportlab, pypdf, pdfplumber, pymupdf (fitz), matplotlib, numpy, pandas, PIL, openpyxl, requests. npm-модули (pdf-lib и др.) НЕ установлены — для создания PDF/графики/таблиц пиши Python-скрипты, никогда JS.",
     "КРИТИЧНО: задача пользователя должна быть РЕАЛЬНО решена — создан скрипт, получен вывод, результат проверен. Команды вроде «python --version» — это лишь проверка среды, это НЕ решение. НЕ возвращай {\"done\":true}, пока не получил конкретный итог по запросу пользователя (число, файл, текст ответа).",
     "Если ты создал файл-скрипт — ты ОБЯЗАН затем запустить его (python \"<файл>\"), дождаться вывода и привести этот вывод в done.result. Создание файла без запуска — это НЕ результат.",
     "Вывод каждой команды вернётся тебе следующим сообщением. Максимум " + `${MAX_ROUNDS}` + " команд. Действуй пошагово: сначала изучи скрипты и данные, потом выполняй, потом проверь результат.",
@@ -557,6 +724,12 @@ export async function execute(
   // over) — abort instead of burning all MAX_ROUNDS.
   let lastCommand = "";
   let sameRun = 0;
+  // Rewrite-without-run guard: the PDF failure mode was the model RE-writing
+  // the same file (different --raw content each time, so the exact-command
+  // guard above can't see it) without ever running it. Track the last written
+  // file; 2nd write → nudge to run it, 3rd write → abort as stuck.
+  let lastWrittenFile = "";
+  let sameWrite = 0;
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
     let raw: string;
     try {
@@ -606,6 +779,24 @@ export async function execute(
         continue;
       }
       const artifacts = await collectArtifacts(workdir, before);
+      const requestedFormat = requestedFormatFrom(query);
+      const requestedFormatMissing =
+        requestedFormat &&
+        !(
+          await Promise.all(artifacts.map((a) => isRealDeliverable(workdir, a.name).then((ok) => ok && a.name.toLowerCase().endsWith(`.${requestedFormat}`))))
+        ).some(Boolean);
+      if (requestedFormat && requestedFormatMissing) {
+        runLog(
+          `[R${round + 1}] WRONG-FORMAT: запрошено .${requestedFormat}, созданы: ${artifacts.map((a) => a.name).join(", ") || "(ничего)"}`,
+        );
+        recordLesson(skill.slug, `отдал done без файла запрошенного формата .${requestedFormat}`);
+        messages.push({ role: "assistant", content: raw.slice(0, 1000) });
+        messages.push({
+          role: "user",
+          content: `Пользователь просил результат в формате .${requestedFormat}, но в рабочей папке нет НАСТОЯЩЕГО файла этого формата: есть только ${artifacts.map((a) => a.name).join(", ") || "(файлы не созданы)"}.${requestedFormat === "pdf" ? " Файл .pdf обязан начинаться с магических байтов %PDF-: создавай PDF СКРИПТОМ reportlab (SimpleDocTemplate/build), который при запуске пишет настоящий PDF. НЕ записывай python-код в файл с расширением .pdf и НЕ используй pdfplumber для создания PDF (pdfplumber только читает)." : ""} Создай НАСТОЯЩИЙ файл формата .${requestedFormat} и только потом верни done.`,
+        });
+        continue;
+      }
       const unreported = artifacts.filter((a) => !resultText.toLowerCase().includes(a.name.toLowerCase())).map((a) => a.name);
       let reply = resultText;
       if (unreported.length > 0) {
@@ -619,9 +810,59 @@ export async function execute(
       runLog(`[R${round + 1}] REJECTED: ${err}`);
       recordLesson(skill.slug, `команда отклонена: ${err}`);
       messages.push({ role: "assistant", content: raw.slice(0, 1000) });
-      messages.push({ role: "user", content: `Команда отклонена: ${err}. Придумай другую (только python/py/node/pip).` });
+      const contentHint = /[><|;&]/.test(err)
+        ? " Символы | > < ; запрещены в команде: в содержимом файла используй ТОЛЬКО одинарные кавычки (') и не ставь | > < ; даже в тексте."
+        : "";
+      messages.push({ role: "user", content: `Команда отклонена: ${err}. Придумай другую (только python/py/node/pip).${contentHint}` });
       continue;
     }
+
+    // Rewrite-without-run guard (state declared above the loop): the PDF
+    // failure mode was the model re-writing the same file — different --raw
+    // content every time, so the exact-command guard can't see it — and never
+    // running it. 2nd write → nudge to run, 3rd write → abort as stuck.
+    const cmdParts = splitArgs(cmd);
+    const isWrite = cmd.includes("sandbox-write.mjs");
+    const isRunBin = cmdParts[0] && ["python", "py", "node"].includes(cmdParts[0].toLowerCase());
+    if (isWrite) {
+      const target = writeRelPath(cmd).replace(/\\/g, "/").toLowerCase();
+      if (target) {
+        if (target === lastWrittenFile) sameWrite += 1;
+        else {
+          lastWrittenFile = target;
+          sameWrite = 1;
+        }
+        if (sameWrite >= 3) {
+          runLog(`[R${round + 1}] STUCK: ${lastWrittenFile} переписан ${sameWrite} раз без запуска`);
+          recordLesson(skill.slug, `переписывает файл ${lastWrittenFile} без запуска`);
+          return {
+            ok: false,
+            reply: `Исполнитель зациклился: файл «${lastWrittenFile}» записан ${sameWrite} раза подряд без запуска. Проверьте результат вручную или уточните запрос.`,
+            rounds: round + 1,
+          };
+        }
+        if (sameWrite >= 2) {
+          runLog(`[R${round + 1}] NUDGE-RUN: ${lastWrittenFile} записан, но не запущен`);
+          messages.push({ role: "assistant", content: raw.slice(0, 1000) });
+          messages.push({
+            role: "user",
+            content: `Ты ${sameWrite} раза записал файл «${lastWrittenFile}», но ни разу не запустил его. Запусти его СЕЙЧАС: python "${lastWrittenFile}", дождись вывода, и только после этого, если нужно, меняй содержимое.`,
+          });
+          continue;
+        }
+      }
+    } else if (isRunBin && lastWrittenFile) {
+      const runTarget = (cmdParts[1] ?? "").replace(/\\/g, "/").toLowerCase().split("/").pop() ?? "";
+      const lastBase = lastWrittenFile.split("/").pop() ?? "";
+      if (runTarget && runTarget === lastBase) {
+        lastWrittenFile = "";
+        sameWrite = 0;
+      }
+      if (cmdParts[0].toLowerCase() === "node" && skill.slug === "pdf") {
+        recordLesson(skill.slug, "не используй node/JS: npm-модули (pdf-lib) не установлены — для PDF пиши Python (reportlab/pypdf)");
+      }
+    }
+
     const normCmd = cmd.replace(/\s+/g, " ").trim();
     if (normCmd === lastCommand) sameRun += 1;
     else {
@@ -648,6 +889,25 @@ export async function execute(
   }
 
   runLog(`[exhausted] lastRaw=${lastRaw.slice(0, 150)}`);
+  // The model often produces the real deliverable but never emits {done} (it
+  // keeps polishing). If the requested output format was actually created,
+  // ship it as a success instead of burning the user's work.
+  const fallbackArtifacts = await collectArtifacts(workdir, before);
+  const requestedFormat = requestedFormatFrom(query);
+  const realMatch = (
+    await Promise.all(fallbackArtifacts.map((a) => isRealDeliverable(workdir, a.name).then((ok) => (ok ? a : null))))
+  ).find((a) => a && a.name.toLowerCase().endsWith(`.${requestedFormat}`));
+  if (requestedFormat && realMatch) {
+    const match = realMatch;
+    runLog(`[exhausted→delivered] ${match.name}`);
+    return {
+      ok: true,
+      reply: `Готово: создан файл ${match.name} (${match.size} байт). Исполнитель исчерпал лимит шагов, но требуемый результат получен.`,
+      rounds: MAX_ROUNDS,
+      artifacts: fallbackArtifacts,
+      verified: true,
+    };
+  }
   recordLesson(skill.slug, "исчерпан лимит шагов исполнителя");
   return {
     ok: false,
