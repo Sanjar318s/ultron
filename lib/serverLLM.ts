@@ -132,24 +132,40 @@ async function callProvider(messages: ChatMessage[], p: { id: string; key?: stri
   return content;
 }
 
+/** Result of a completed LLM call: the text plus the provider that served it. */
+export interface CloudResult {
+  text: string;
+  provider: string;
+}
+
 /** Best available model. Falls through providers until one answers. */
-export async function completeCloud(
+export async function completeCloudMeta(
   messages: ChatMessage[],
   opts?: { geminiKey?: string; model?: string; provider?: "gemini" | "ollama" | "groq" },
-): Promise<string> {
+): Promise<CloudResult> {
   let lastError: unknown = null;
   const chain = opts?.provider ? PROVIDERS.filter((p) => p.id === opts.provider) : PROVIDERS;
   for (const p of chain) {
     const key = p.id === "gemini" ? opts?.geminiKey || p.key : p.key;
     if (p.id !== "ollama" && !key) continue;
     try {
-      return await callProvider(messages, { id: p.id, key, model: opts?.model });
+      const text = await callProvider(messages, { id: p.id, key, model: opts?.model });
+      return { text, provider: p.id };
     } catch (err) {
       lastError = err;
       console.warn(`[assistant] ${p.id} failed:`, err);
     }
   }
   throw lastError ?? new Error("no cloud provider available");
+}
+
+/** Legacy string-returning wrapper (kept for all existing callers). */
+export async function completeCloud(
+  messages: ChatMessage[],
+  opts?: { geminiKey?: string; model?: string; provider?: "gemini" | "ollama" | "groq" },
+): Promise<string> {
+  const r = await completeCloudMeta(messages, opts);
+  return r.text;
 }
 
 /** Ask a specific provider (e.g. DeepSeek as the "second advisor"). */

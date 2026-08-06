@@ -16,6 +16,7 @@
 import { resolveSite, siteSearchUrl, findSiteInPhrase } from "@/lib/sites";
 import { isCompoundCommand, musicSearchQuery, splitLaunchChain } from "@/lib/commandSplit";
 import type { MetaAlgorithm } from "@/lib/metaLearning";
+import { matchDateIntent, matchTimeIntent, matchFactQuery } from "@/lib/intentGuards";
 
 export type AssistantAction =
   | { kind: "zoom-in" }
@@ -1538,6 +1539,18 @@ export class AssistantBrain {
       return { handled: true, reply: `Запоминаю фразу «${text}». Скажи, что мне делать или отвечать.` };
     }
 
+    // 5b. Factual/statistical questions → live web search (grounded answer
+    // with sources) instead of hallucinated numbers. Checked LAST so weather,
+    // date/time, explicit «найди …», learn and skill intents all win first.
+    const factQuery = matchFactQuery(text);
+    if (factQuery) {
+      return {
+        handled: true,
+        reply: "Ищу актуальные данные…",
+        action: { kind: "search", query: factQuery, learn: false },
+      };
+    }
+
     // 6. Unknown — let the LLM (if any) take over.
     this.save();
     return { handled: false, reply: "" };
@@ -1915,17 +1928,15 @@ export class AssistantBrain {
           "Команды: «включи жесты», «выключи жесты», «сброс», «приблизь», «отдали», «стоп», «запусти <приложение>» (открою любое из установленных), «открой <сайт>», «какие приложения есть», «найди <запрос>» (поищу в интернете и отвечу), «изучи <тема>» (найду и запомню), «выучи <фраза>» — запомню новое, «учись <что сделать>» — запишу урок по экрану, «изучи <ссылка>» — прочитаю и запомню материал, «навыки» — покажу мои способности и проценты, «навык <имя>» — что умею и чего не хватает, «чего тебе не хватает» — какие знания мне дать, «чему ты научился» — покажу память.",
       };
     }
-    if (/(?:который час|сколько (?:сейчас )?времени|сколько (?:сейчас )?время|какое (?:сейчас )?время|(?<!во )время\b)/.test(text)) {
-      const t = new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
-      return { handled: true, reply: `Сейчас ${t}.` };
+    // Date/time intents only on EXPLICIT question phrases. A bare «дата» is
+    // ignored so «дай мне пример датасета» isn't swallowed with today's date.
+    const timeReply = matchTimeIntent(text);
+    if (timeReply) {
+      return { handled: true, reply: timeReply };
     }
-    if (/какое число|какой день|какая дата|(?:^| )дата(?: |$)|день недели/.test(text)) {
-      const d = new Date().toLocaleDateString("ru-RU", {
-        weekday: "long",
-        day: "numeric",
-        month: "long",
-      });
-      return { handled: true, reply: `Сегодня ${d}.` };
+    const dateReply = matchDateIntent(text);
+    if (dateReply) {
+      return { handled: true, reply: dateReply };
     }
     if (/спасибо|благодарю/.test(text)) {
       return { handled: true, reply: pick(["Всегда к вашим услугам.", "Обращайтесь.", "Рад был помочь."]) };

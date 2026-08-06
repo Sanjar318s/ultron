@@ -7,7 +7,7 @@ import {
   type AssistantBrain,
   type LLMLearnItem,
 } from "@/lib/assistantBrain";
-import { completeCloud, completeWithProvider } from "@/lib/serverLLM";
+import { completeCloud, completeCloudMeta, completeWithProvider } from "@/lib/serverLLM";
 import { isQuotaError, reportFailure, resolveKey, type ResolveResult } from "@/lib/geminiKeys";
 import { getLearnedFacts } from "@/lib/lessonStore";
 import {
@@ -46,6 +46,8 @@ import { N8N_ACTIONS, buildN8nPayload, n8nActionsPrompt } from "@/lib/n8n/config
 import { triggerN8nWebhook } from "@/lib/n8n/client";
 import { startStudy } from "@/lib/studyJobs";
 import { fetchPageContent } from "@/lib/pageVision";
+import { isExplicitTask, composeFinalReply } from "@/lib/intentGuards";
+import { recordProvider } from "@/lib/providerStats";
 
 /**
  * Server-side assistant core (LOCALHOST-only). The Telegram bot POSTs user
@@ -409,6 +411,7 @@ async function executeHandledAction(
         ctx.chatKey,
         ctx.cloudOpts,
       );
+      recordProvider("local", ctx.chatKey);
       return {
         reply: dispatched.reply,
         ...(dispatched.needsApproval ? { needsApproval: dispatched.needsApproval } : {}),
@@ -418,6 +421,7 @@ async function executeHandledAction(
     }
 
     case "search": {
+      recordProvider("search", ctx.chatKey);
       return { reply: await handleSearchAction(brain, action, baseUrl, ctx.cloudOpts) };
     }
 
@@ -780,12 +784,14 @@ export async function POST(req: NextRequest) {
     const systemContent =
       brain.buildSystemPrompt(visibleText, { brief: body?.mode === "browser" }) +
       (catalogList
-        ? `\n\nВНЕШНИЕ НАВЫКИ (SKILL.md):\n${catalogList}\nЕсли запрос — работа с файлами/документами (PDF/XLSX/DOCX/PPTX), системный отчёт, стиль изображения или запуск/написание Python-кода и вычисления — верни action {"type":"run-skill","skill":"<точное имя>"} для подходящего внешнего навыка.`
+        ? `\n\nВНЕШНИЕ НАВЫКИ (SKILL.md):\n${catalogList}\nВерни action {"type":"run-skill","skill":"<точное имя>"} ТОЛЬКО когда запрос — ЯВНАЯ задача с файлами/документами (PDF/XLSX/DOCX/PPTX), системный отчёт, стиль изображения, запуск/написание Python-кода или вычисления, и сформулирован императивно («создай», «сделай», «построй», «рассчитай», «напиши»). Неоднозначные фразы («что это значит?», «это задача», вопросы-уточнения) НЕ запускают навыки — отвечай текстом.`
         : "") +
       (await autonomySystemNote()) +
       (await learnedFactsSystemNote()) +
       n8nActionsPrompt() +
-      `\n\n${await getSystemContext()}`;
+      `\n\n${await getSystemContext()}` +
+      `\n\nПРОЗРАЧНОСТЬ ИСТОЧНИКА: ты НЕ знаешь, какой API-провайдер (Gemini/Ollama/Groq) обрабатывает твой ответ — система укажет источник автоматически. Никогда не утверждай, что ответил через конкретный сервис или что использовал/не использовал Gemini.` +
+      `\n\nТОЧНЫЕ ДАННЫЕ: никогда не выдумывай статистику, цифры, даты и факты об актуальных событиях. Если запрос требует таких данных — верни action {"type":"search","query":"<поисковый запрос>"}. Если данных нет и поиск неуместен — честно скажи, что не знаешь.`;
     const messages = [
       { role: "system" as const, content: systemContent },
       ...history.map((h) => ({
@@ -795,8 +801,11 @@ export async function POST(req: NextRequest) {
       { role: "user" as const, content: visibleText },
     ];
     let result: string;
+    let answerProvider = "ollama";
     try {
-      result = await completeCloud(messages, cloudOpts);
+      const cloudResult = await completeCloudMeta(messages, cloudOpts);
+      result = cloudResult.text;
+      answerProvider = cloudResult.provider;
     } catch (err) {
       // Gemini quota hit → mark the key exhausted so the pool rotates/reports.
       if (gemini.key && isQuotaError(err instanceof Error ? err.message : String(err))) {
@@ -804,6 +813,7 @@ export async function POST(req: NextRequest) {
       }
       throw err;
     }
+    recordProvider(answerProvider, chatKey);
     const parsed = await parseWithRetry(result, messages, cloudOpts);
 
     const reply =
@@ -813,7 +823,9 @@ export async function POST(req: NextRequest) {
 
     const added =
       parsed?.learn && Array.isArray(parsed.learn) ? brain.learnFromLLM(parsed.learn as LLMLearnItem[]) : 0;
-    const finalReply = added > 0 ? `${reply} Запомнил.` : reply;
+    // P5: memory persists to brain.json separately — nothing is appended to
+    // the user-facing text (no more «Запомнил.» noise).
+    const finalReply = composeFinalReply(reply, added);
 
     // LLM proposed an action. Images need the special local/ref pipeline and
     // stay inline; everything else (launch, chain, music-search, weather,
@@ -861,12 +873,19 @@ export async function POST(req: NextRequest) {
       } else {
         const llmAction = normalizeLLMAction(parsed.action);
         if (llmAction) {
-          const executed = await executeHandledAction(brain, llmAction, baseUrl, { chatKey, cloudOpts, userText: text });
-          if (executed.reply) actionReply = executed.reply;
-          if (executed.needsApproval) needsApproval = executed.needsApproval;
-          if (executed.image) image = executed.image;
-          if (executed.files && executed.files.length) files = executed.files;
-          if (executed.verified !== undefined) verified = executed.verified;
+          // P2 gate: a run-skill the LLM proposed must be an EXPLICIT task.
+          // Vague follow-ups («что это значит?», «это задача») must not spawn
+          // PC/sandbox work — the model's plain-text reply stands instead.
+          if (llmAction.kind === "run-skill" && !isExplicitTask(text)) {
+            // Blocked: only the textual reply is shown, nothing executes.
+          } else {
+            const executed = await executeHandledAction(brain, llmAction, baseUrl, { chatKey, cloudOpts, userText: text });
+            if (executed.reply) actionReply = executed.reply;
+            if (executed.needsApproval) needsApproval = executed.needsApproval;
+            if (executed.image) image = executed.image;
+            if (executed.files && executed.files.length) files = executed.files;
+            if (executed.verified !== undefined) verified = executed.verified;
+          }
         }
       }
     }
@@ -936,11 +955,12 @@ export async function POST(req: NextRequest) {
     }
 
     await commitBrain(brain, baseIds);
+    const providerOut = answerProvider ?? (admin ? "server" : "llm");
     return NextResponse.json({
       reply: actionReply ?? finalReply,
       generate,
       image,
-      provider: "server",
+      provider: providerOut,
       needsApproval,
       ...(files && files.length ? { files } : {}),
       ...(verified !== undefined ? { verified } : {}),

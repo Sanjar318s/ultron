@@ -25,7 +25,6 @@ import { runSelfTests } from "./self-test.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
-const DATA_DIR = path.join(ROOT, "data");
 const TMP_LOG = path.join(os.tmpdir(), "opencode");
 
 function loadDotEnv(file) {
@@ -41,6 +40,10 @@ function loadDotEnv(file) {
 }
 loadDotEnv(path.join(__dirname, "..", ".env"));
 loadDotEnv(path.join(__dirname, "..", ".env.local"));
+
+// Separate DATA_DIR per bot instance so two bridges never race over
+// telegram-users.json / settings.json / admin-log.jsonl / stop-ai.
+const DATA_DIR = process.env.BOT_DATA_DIR ? path.resolve(ROOT, process.env.BOT_DATA_DIR) : path.join(ROOT, "data");
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const SERVER = process.env.ULTRON_SERVER ?? "http://localhost:3000";
@@ -850,6 +853,17 @@ async function renderKeys(chatId, owner) {
   if (typeof st.usersFree === "number") {
     lines.push(`<b>Пользователи</b>`);
     lines.push(`• В пуле: ${st.usersFree} свободн., ${st.usersAssigned} выдано, ${st.usersExhausted} исчерпано`);
+  }
+  const today = st?.providerStats?.today ?? null;
+  if (today && typeof today === "object") {
+    const entries = Object.entries(today).filter(([, n]) => n > 0).map(([p, n]) => `${p} — ${n}`);
+    if (entries.length > 0) {
+      lines.push("");
+      lines.push(`<b>Фактический источник ответов (сегодня)</b>`);
+      lines.push(`• ${entries.join("; ")}`);
+      const last = st?.providerStats?.last?.[String(chatId)];
+      if (last) lines.push(`• Ваш последний ответ: <b>${last}</b>`);
+    }
   }
   lines.push("");
   lines.push("Лимиты сбрасываются в полночь по Тихоокеанскому времени.");
@@ -2181,6 +2195,27 @@ async function handleMessage(msg) {
   if (isOwner(msg.from)) {
     const handled = await tryNlAdmin(chatId, msg, text);
     if (handled) return;
+  }
+
+  // P3: honest provider report on request — reads the actual last provider
+  // from /api/keys (server-side factual stats, not the model's guess).
+  if (/через\s+(?:что|какую|какой)\s+(?:ты\s+)?(?:ответил|отвечал|работал|сделал)|каким\s+провайдером|какая\s+модель\s+ответила|какой\s+моделью|через\s+какой\s+(?:api|интерфейс|сервис)/iu.test(text)) {
+    try {
+      const res = await fetch(`${SERVER}/api/keys`, { signal: AbortSignal.timeout(15_000) });
+      const st = await res.json().catch(() => null);
+      const last = st?.providerStats?.last?.[String(chatId)];
+      const today = st?.providerStats?.today ?? {};
+      const total = Object.values(today).reduce((a, b) => a + (b ?? 0), 0);
+      const parts = [`По данным сервера ваш последний ответ обработан через: <b>${last ?? "—"}</b>.`];
+      if (total > 0) {
+        parts.push(`Сегодня: ${Object.entries(today).filter(([, n]) => n > 0).map(([p, n]) => `${p} — ${n}`).join("; ") || "нет данных"}.`);
+      }
+      await sendHtml(chatId, parts.join("\n"));
+      return;
+    } catch {
+      await sendText(chatId, "Не удалось получить статус провайдера (сервер запущен?).");
+      return;
+    }
   }
 
   await chatWithAssistant(chatId, msg, text);

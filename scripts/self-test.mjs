@@ -12,6 +12,13 @@ import {
 import { findSiteInPhrase, resolveSite } from "../lib/sites.ts";
 import { bestMatch, execute as executeSkill, workDirFor } from "../lib/skillCatalog.ts";
 import { N8N_ACTIONS } from "../lib/n8n/config.ts";
+import {
+  isExplicitTask,
+  matchFactQuery,
+  matchDateIntent,
+  matchTimeIntent,
+  composeFinalReply,
+} from "../lib/intentGuards.ts";
 
 /**
  * Self-test suite for the ULTRON PC-control surface.
@@ -122,6 +129,29 @@ export async function runSelfTests({ live = false } = {}) {
     ["n8n ids prefixed", N8N_ACTIONS.every((a) => a.id.startsWith("n8n-"))],
     ["n8n schema object", N8N_ACTIONS.every((a) => a.payloadSchema && typeof a.payloadSchema === "object" && Object.keys(a.payloadSchema).length > 0)],
     ["n8n names non-empty", N8N_ACTIONS.every((a) => typeof a.name === "string" && a.name.trim().length > 0)],
+    // P1: date/time answer ONLY on explicit phrasing (never on «датасет»).
+    ["intent date explicit", typeof matchDateIntent("какое сегодня число") === "string"],
+    ["intent date weekday", typeof matchDateIntent("какой сегодня день недели") === "string"],
+    ["intent date ignores датасет", matchDateIntent("дай мне пример датасета в виде pdf") === null],
+    ["intent date ignores bare дата", matchDateIntent("что такое дата") === null],
+    ["intent time explicit", typeof matchTimeIntent("который час") === "string"],
+    ["intent time ignores phrase", matchTimeIntent("проведу время в интернете") === null],
+    // P2: run-skill gate — imperative task yes, vague follow-up no.
+    ["task explicit создай файл", isExplicitTask("создай файл") === true],
+    ["task explicit напиши скрипт", isExplicitTask("напиши python скрипт который вычислит 2**100") === true],
+    ["task explicit сохрани график", isExplicitTask("сохрани график в png") === true],
+    ["task vague что это значит", isExplicitTask("что это значит") === false],
+    ["task vague это задача", isExplicitTask("это задача") === false],
+    ["task vague объясни код", isExplicitTask("объясни код") === false],
+    // P4: factual questions search, arithmetic does not.
+    ["fact сколько людей на земле", matchFactQuery("сколько людей на земле") !== null],
+    ["fact статистика населения", matchFactQuery("какая статистика населения сейчас") !== null],
+    ["fact курс доллара", matchFactQuery("какой курс доллара сегодня") !== null],
+    ["fact arithmetic 2+2 no search", matchFactQuery("сколько будет 2+2") === null],
+    ["fact greeting no search", matchFactQuery("привет") === null],
+    // P5: final reply carries NO «Запомнил.» noise, artifact tail is separate.
+    ["final reply clean", composeFinalReply("Вот ответ", 3) === "Вот ответ"],
+    ["final reply no suffix", !composeFinalReply("Ответ", 1).includes("Запомнил")],
   ];
   for (const [name, ok] of pureChecks) check(`pure ${name}`, ok);
 
@@ -218,6 +248,26 @@ export async function runSelfTests({ live = false } = {}) {
         outArt.rel.startsWith("data/skill-work/") &&
         !resPy.artifacts?.some((a) => a.name === ".run.log"),
       `artifacts=${JSON.stringify(resPy.artifacts?.map((a) => a.name))}`,
+    );
+
+    // Stuck-loop guard (P2): a mock model that repeats the same command three
+    // times must be aborted with ok:false instead of burning all 8 rounds.
+    const sameCmd = `node "${WRITE_HELPER}" "spin.txt" --raw "x"`;
+    const stepsStuck = [
+      JSON.stringify({ cmd: sameCmd }),
+      JSON.stringify({ cmd: sameCmd }),
+      JSON.stringify({ cmd: sameCmd }),
+      JSON.stringify({ done: true, result: "готово" }),
+    ];
+    let iStuck = 0;
+    const resStuck = await executeSkill(fakeSkill, "задание с зацикливанием", {
+      chatId: skillChat("stuck"),
+      complete: async () => stepsStuck[Math.min(iStuck++, stepsStuck.length - 1)] ?? "{}",
+    });
+    check(
+      "skill stuck-loop abort",
+      resStuck.ok === false && resStuck.rounds === 3 && (resStuck.reply ?? "").includes("зациклился"),
+      `ok=${resStuck.ok} rounds=${resStuck.rounds} reply=${JSON.stringify((resStuck.reply ?? "").slice(0, 80))}`,
     );
   } finally {
     for (const dir of skillDirs) rmSync(dir, { recursive: true, force: true });

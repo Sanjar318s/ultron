@@ -546,6 +546,11 @@ export async function execute(
   runLog(`[start] skill=${skill.slug} query=${query.slice(0, 120)}`);
   let lastRaw = "";
 
+  // Stuck-loop guard: track the last executed command; 3 identical ones in a
+  // row means the model is spinning (e.g. re-listing the same dir over and
+  // over) — abort instead of burning all MAX_ROUNDS.
+  let lastCommand = "";
+  let sameRun = 0;
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
     let raw: string;
     try {
@@ -607,6 +612,20 @@ export async function execute(
       messages.push({ role: "assistant", content: raw.slice(0, 1000) });
       messages.push({ role: "user", content: `Команда отклонена: ${err}. Придумай другую (только python/py/node/pip).` });
       continue;
+    }
+    const normCmd = cmd.replace(/\s+/g, " ").trim();
+    if (normCmd === lastCommand) sameRun += 1;
+    else {
+      sameRun = 1;
+      lastCommand = normCmd;
+    }
+    if (sameRun >= 3) {
+      runLog(`[R${round + 1}] STUCK (${normCmd} ×3): модель зациклилась на одной команде`);
+      return {
+        ok: false,
+        reply: `Исполнитель зациклился на одной и той же команде («${normCmd}» ×3). Проверьте результат вручную или уточните запрос.`,
+        rounds: round + 1,
+      };
     }
     const res = await runSandboxed(cmd, workdir);
     const outTail = res.out.length > OUTPUT_CAP ? `${res.out.slice(-OUTPUT_CAP)}\n…[обрезано]` : res.out;
