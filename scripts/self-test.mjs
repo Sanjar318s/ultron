@@ -19,6 +19,7 @@ import {
   matchTimeIntent,
   composeFinalReply,
 } from "../lib/intentGuards.ts";
+import { PRESET_CHAIN, PRESET_GEMINI_MODEL, MODEL_PRESETS, DEFAULT_PRESET } from "../lib/userSettings.ts";
 
 /**
  * Self-test suite for the ULTRON PC-control surface.
@@ -152,6 +153,16 @@ export async function runSelfTests({ live = false } = {}) {
     // P5: final reply carries NO «Запомнил.» noise, artifact tail is separate.
     ["final reply clean", composeFinalReply("Вот ответ", 3) === "Вот ответ"],
     ["final reply no suffix", !composeFinalReply("Ответ", 1).includes("Запомнил")],
+    // Router presets: preferred chain + model mapping (⚡/🧠/🏠).
+    ["preset local first ollama", PRESET_CHAIN.local[0] === "ollama"],
+    ["preset local falls groq→gemini", JSON.stringify(PRESET_CHAIN.local) === JSON.stringify(["ollama", "groq", "gemini"])],
+    ["preset flash first gemini", PRESET_CHAIN.flash[0] === "gemini"],
+    ["preset flash groq before ollama", PRESET_CHAIN.flash.indexOf("groq") < PRESET_CHAIN.flash.indexOf("ollama")],
+    ["preset pro first gemini", PRESET_CHAIN.pro[0] === "gemini"],
+    ["preset pro ollama before groq", PRESET_CHAIN.pro.indexOf("ollama") < PRESET_CHAIN.pro.indexOf("groq")],
+    ["preset pro model is deep", PRESET_GEMINI_MODEL.pro !== PRESET_GEMINI_MODEL.flash],
+    ["preset default local", DEFAULT_PRESET === "local"],
+    ["preset 3 options", Object.keys(MODEL_PRESETS).length === 3],
   ];
   for (const [name, ok] of pureChecks) check(`pure ${name}`, ok);
 

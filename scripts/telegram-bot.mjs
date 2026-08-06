@@ -642,6 +642,7 @@ function mainMenuKeyboard(owner) {
       { text: "🔑 Статус", callback_data: "cmd:/keys" },
     ],
     [
+      { text: "🧠 Модель ответов", callback_data: "preset:menu" },
       { text: "📖 Изучить", callback_data: "study:menu" },
       { text: "⏳ Незавершённое", callback_data: "study:list" },
     ],
@@ -868,6 +869,47 @@ async function renderKeys(chatId, owner) {
   lines.push("");
   lines.push("Лимиты сбрасываются в полночь по Тихоокеанскому времени.");
   await sendHtml(chatId, lines.join("\n"));
+}
+
+const PRESET_LABEL = {
+  flash: { emoji: "⚡", label: "Быстрый Flash", hint: "молниеносные ответы" },
+  pro: { emoji: "🧠", label: "Глубокий Pro", hint: "максимум качества" },
+  local: { emoji: "🏠", label: "Локальный Ollama", hint: "приватно, без интернета" },
+};
+
+/** Preset selector (⚡/🧠/🏠) — which model the assistant tries first. */
+async function renderPresetMenu(chatId) {
+  let cur = "local";
+  try {
+    const res = await fetch(`${SERVER}/api/settings?chatId=${encodeURIComponent(chatId)}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    const data = await res.json().catch(() => null);
+    if (res.ok && data && data.preset) cur = data.preset;
+  } catch {
+    /* fall through — the selector still renders with the default */
+  }
+  const kb = [
+    ["flash", "pro", "local"].map((id) => {
+      const p = PRESET_LABEL[id];
+      return { text: `${p.emoji} ${p.label}${cur === id ? " ✅" : ""}`, callback_data: `preset:set:${id}` };
+    }),
+  ];
+  kb.push([{ text: "✖ Закрыть", callback_data: "menu:close" }]);
+  const lines = [
+    "🧠 <b>Модель ответов</b>",
+    "",
+    "Какую модель пробовать первой для ваших вопросов:",
+    ...["flash", "pro", "local"].map((id) => `${PRESET_LABEL[id].emoji} <b>${PRESET_LABEL[id].label}</b> — ${PRESET_LABEL[id].hint}${cur === id ? " <i>(сейчас)</i>" : ""}`),
+    "",
+    "<i>Если выбранная модель недоступна, бот переключится на запасную.</i>",
+  ];
+  await apiCall("sendMessage", {
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: kb },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1938,6 +1980,39 @@ async function handleCallback(query) {
     await removeButtons(chatId, query.message?.message_id);
     await sendMenu(chatId, isOwner(fakeFrom));
     return;
+  }
+
+  // Model-preset selector (⚡ Быстрый Flash / 🧠 Глубокий Pro / 🏠 Локальный).
+  if (verb === "preset") {
+    const [sub, ...rest] = data.split(":").slice(1);
+    const arg = rest.join(":");
+    if (!isAllowed(fakeFrom)) {
+      await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: "Только для допущенных." }).catch(() => {});
+      return;
+    }
+    if (sub === "menu") {
+      await renderPresetMenu(chatId);
+      return;
+    }
+    if (sub === "set" && arg) {
+      try {
+        const res = await fetch(`${SERVER}/api/settings`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chatId: String(chatId), preset: arg }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const d = await res.json().catch(() => null);
+        const saved = d?.preset ?? arg;
+        const p = PRESET_LABEL[saved] ?? PRESET_LABEL.local;
+        await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: `${p.emoji} ${p.label} — сохранено` }).catch(() => {});
+      } catch {
+        await apiCall("answerCallbackQuery", { callback_query_id: query.id, text: "Не сохранилось (сервер запущен?)" }).catch(() => {});
+      }
+      await removeButtons(chatId, query.message?.message_id);
+      await renderPresetMenu(chatId);
+      return;
+    }
   }
 
   // Study flow buttons are open to anyone allowed to chat.

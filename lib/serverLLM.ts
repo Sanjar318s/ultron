@@ -9,6 +9,7 @@
 
 import type { ChatMessage } from "./llm/types";
 import { messageText } from "./llm/types";
+import { PRESET_CHAIN, PRESET_GEMINI_MODEL, type ModelPreset } from "./userSettings";
 
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
@@ -138,18 +139,29 @@ export interface CloudResult {
   provider: string;
 }
 
-/** Best available model. Falls through providers until one answers. */
+/**
+ * Best available model. Falls through providers until one answers. A pinned
+ * `provider` forces a single provider; otherwise the per-chat `preset` (⚡/🧠/🏠)
+ * selects the preferred order and the Gemini model; no preset → default chain.
+ */
 export async function completeCloudMeta(
   messages: ChatMessage[],
-  opts?: { geminiKey?: string; model?: string; provider?: "gemini" | "ollama" | "groq" },
+  opts?: { geminiKey?: string; model?: string; provider?: "gemini" | "ollama" | "groq"; preset?: ModelPreset },
 ): Promise<CloudResult> {
   let lastError: unknown = null;
-  const chain = opts?.provider ? PROVIDERS.filter((p) => p.id === opts.provider) : PROVIDERS;
+  const chain = opts?.provider
+    ? PROVIDERS.filter((p) => p.id === opts.provider)
+    : opts?.preset
+      ? PRESET_CHAIN[opts.preset]
+          .map((id) => PROVIDERS.find((p) => p.id === id) ?? { id })
+          .filter((p) => Boolean(p))
+      : PROVIDERS;
+  const model = opts?.model ?? (opts?.preset ? PRESET_GEMINI_MODEL[opts.preset] : undefined);
   for (const p of chain) {
     const key = p.id === "gemini" ? opts?.geminiKey || p.key : p.key;
     if (p.id !== "ollama" && !key) continue;
     try {
-      const text = await callProvider(messages, { id: p.id, key, model: opts?.model });
+      const text = await callProvider(messages, { id: p.id, key, model });
       return { text, provider: p.id };
     } catch (err) {
       lastError = err;
@@ -162,7 +174,7 @@ export async function completeCloudMeta(
 /** Legacy string-returning wrapper (kept for all existing callers). */
 export async function completeCloud(
   messages: ChatMessage[],
-  opts?: { geminiKey?: string; model?: string; provider?: "gemini" | "ollama" | "groq" },
+  opts?: { geminiKey?: string; model?: string; provider?: "gemini" | "ollama" | "groq"; preset?: ModelPreset },
 ): Promise<string> {
   const r = await completeCloudMeta(messages, opts);
   return r.text;

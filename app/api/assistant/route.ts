@@ -48,6 +48,7 @@ import { startStudy } from "@/lib/studyJobs";
 import { fetchPageContent } from "@/lib/pageVision";
 import { isExplicitTask, composeFinalReply } from "@/lib/intentGuards";
 import { recordProvider } from "@/lib/providerStats";
+import { getUserPreset, type ModelPreset } from "@/lib/userSettings";
 
 /**
  * Server-side assistant core (LOCALHOST-only). The Telegram bot POSTs user
@@ -78,7 +79,7 @@ function isLocalRequest(req: NextRequest): boolean {
 }
 
 /** How to call the LLM chain for this request (which Gemini key, if any). */
-export type CloudOpts = { geminiKey?: string; skipGemini?: boolean; model?: string; provider?: "gemini" | "ollama" | "groq" };
+export type CloudOpts = { geminiKey?: string; skipGemini?: boolean; model?: string; provider?: "gemini" | "ollama" | "groq"; preset?: ModelPreset };
 
 /** Stronger model for the skill executor loop (flash-lite derails on the JSON contract). */
 const EXECUTOR_MODEL = "gemini-3.5-flash";
@@ -564,7 +565,11 @@ export async function POST(req: NextRequest) {
   const isOwner = body?.isOwner === true;
   const chatKey = chatId || "anon";
   const gemini: ResolveResult = await resolveKey(chatKey, isOwner);
-  const cloudOpts: CloudOpts = gemini.provider === "gemini" ? { geminiKey: gemini.key } : { skipGemini: true };
+  const preset = getUserPreset(chatKey);
+  const cloudOpts: CloudOpts = {
+    ...(gemini.provider === "gemini" ? { geminiKey: gemini.key } : { skipGemini: true }),
+    preset,
+  };
 
   // Admin control messages from the bot (approve/reject buttons).
   if (body?.action === "approve" && typeof body.id === "string") {
